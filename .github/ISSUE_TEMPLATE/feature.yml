@@ -1,0 +1,26 @@
+name: Feature request
+description: A new handler, endpoint, or capability
+title: 'feat: '
+labels: ['feature']
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What should lictor do? Name the GitHub event if this is a handler.
+    validations:
+      required: true
+  - type: textarea
+    id: rationale
+    attributes:
+      label: Rationale
+      description: Why is this worth adding?
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Implementation notes
+      description: Any details, if already planned — App permissions needed, events to subscribe to.
+    validations:
+      required: false

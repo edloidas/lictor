@@ -1,0 +1,10 @@
+[install]
+# Never auto-install a missing package at runtime — the server resolves from the
+# lockfile or fails to boot.
+auto = "disable"
+# Three days. Nothing is exempt: a fast-moving toolchain package is exactly the
+# kind of dependency a compromised publish would target.
+minimumReleaseAge = 259200
+
+[test]
+coverageSkipTestFiles = true

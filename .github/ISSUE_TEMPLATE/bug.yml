@@ -1,0 +1,57 @@
+name: Bug report
+description: A delivery is rejected, mishandled, or the server misbehaves
+title: 'fix: '
+labels: ['bug']
+body:
+  - type: textarea
+    id: trigger
+    attributes:
+      label: What triggered it
+      description: The event, payload, or request that causes the problem. Redact secrets.
+      placeholder: POST /webhooks/github with X-GitHub-Event=issues, action=opened
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should happen.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happens instead — include the status code and the log lines verbatim.
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      description: Where does the problem show up?
+      options:
+        - Webhook route
+        - Signature verification
+        - Handler dispatch
+        - GitHub API client
+        - Config or startup
+        - Other
+    validations:
+      required: false
+  - type: input
+    id: bun
+    attributes:
+      label: Bun version
+      description: From `bun --version`.
+      placeholder: 1.3.14
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else worth knowing — tunnel in use, App permissions, delivery id.
+    validations:
+      required: false

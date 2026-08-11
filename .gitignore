@@ -1,0 +1,21 @@
+# Secrets — the GitHub App private key and webhook secret live here
+.env
+.env.*
+!.env.example
+*.pem
+
+# Local tooling
+.claude/plans/
+.claude/settings.local.json
+.codex/
+.mcp.json
+.tmp/
+
+# Dependencies
+node_modules/
+
+# Test coverage
+coverage/
+
+# macOS
+.DS_Store
