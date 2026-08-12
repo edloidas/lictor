@@ -6,6 +6,7 @@ import { DeliveryWorker } from './delivery-worker.ts';
 import { AgentExecutor } from './executor/agent-executor.ts';
 import { ProcessRunner } from './executor/process-runner.ts';
 import { GitHubApp } from './github/app.ts';
+import { CapabilityBroker } from './github/capability-broker.ts';
 import { GitHubClient } from './github/client.ts';
 import { Policy } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
@@ -22,8 +23,11 @@ const ExecutorLive = AgentExecutor.DefaultWithoutDependencies.pipe(
 const WorkspaceLive = RepositoryWorkspace.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.merge(ProcessRunner.Default, GitHubApp.Default)),
 );
+const BrokerLive = CapabilityBroker.DefaultWithoutDependencies.pipe(
+  Layer.provide(Layer.mergeAll(GitHubClient.Default, PolicyLive, QueueLive)),
+);
 const ControlLive = ControlPlane.DefaultWithoutDependencies.pipe(
-  Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive)),
+  Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, BrokerLive)),
 );
 const ControlServerLive = ControlServer.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.merge(ConfigLive, ControlLive)),
@@ -40,6 +44,7 @@ const Services = Layer.mergeAll(
   PolicyLive,
   QueueLive,
   WorkspaceLive,
+  BrokerLive,
   ControlLive,
   ControlServerLive,
   WorkerLive,

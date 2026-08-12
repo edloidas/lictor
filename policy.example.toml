@@ -21,6 +21,18 @@ workspaceRoots = ["/absolute/path/to/repositories"]
 [repositories.overrides."edloidas/lictor"]
 workspace = "/absolute/path/to/repositories/lictor"
 
+[limits]
+maxQueueDepth = 10000
+maxJobAgeMinutes = 1440
+
+[limits.costs]
+maxAttempts = 3
+maxDurationMinutes = 30
+
+[repositories.overrides."edloidas/lictor".costs]
+maxAttempts = 3
+maxDurationMinutes = 30
+
 [retention]
 completedDays = 30
 failedDays = 90

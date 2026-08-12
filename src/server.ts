@@ -73,7 +73,10 @@ const webhook = Effect.gen(function* () {
   return HttpServerResponse.empty({ status: 202 });
 }).pipe(
   Effect.catchAll((cause) =>
-    Effect.logError('Rejected delivery', cause).pipe(
+    Effect.logError('Rejected delivery').pipe(
+      Effect.annotateLogs({
+        errorCode: cause._tag === 'QueueError' ? 'WEBHOOK_STORAGE_FAILED' : 'WEBHOOK_INVALID',
+      }),
       Effect.as(HttpServerResponse.empty({ status: cause._tag === 'QueueError' ? 503 : 400 })),
     ),
   ),

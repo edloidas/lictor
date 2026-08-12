@@ -9,6 +9,4 @@ minimumReleaseAge = 259200
 [test]
 coverageSkipTestFiles = true
 
-[test.coverageThreshold]
-lines = 0.5
-functions = 0.5
+coverageThreshold = { line = 0.8, function = 0.8 }

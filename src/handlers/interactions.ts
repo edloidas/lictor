@@ -26,10 +26,13 @@ export const handleInteraction: Handler = (delivery) =>
       return;
     }
     const queue = yield* WorkQueue;
-    const enqueued = yield* queue.enqueue({
-      ...work,
-      ...(repositoryPolicy.execution === 'approval' ? { approvalRequired: true } : {}),
-    });
+    const enqueued = yield* queue.enqueue(
+      {
+        ...work,
+        ...(repositoryPolicy.execution === 'approval' ? { approvalRequired: true } : {}),
+      },
+      policy.maxQueueDepth,
+    );
 
     yield* Effect.logInfo(
       enqueued.inserted ? 'Queued GitHub interaction' : 'Ignored duplicate delivery',

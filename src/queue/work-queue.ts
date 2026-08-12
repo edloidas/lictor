@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Clock, Data, Effect } from 'effect';
 import { LictorConfig } from '../config.ts';
@@ -38,6 +38,7 @@ export type QueuedJob = {
   readonly attempts: number;
   readonly workerId?: string;
   readonly leaseExpiresAt?: number;
+  readonly createdAt: number;
 };
 
 export type QueueCounts = Readonly<Record<JobStatus, number>>;
@@ -57,6 +58,7 @@ type JobRow = {
   readonly payload: string;
   readonly status: JobStatus;
   readonly attempts: number;
+  readonly createdAt: number;
 };
 
 const migrate = (database: Database) => {
@@ -174,9 +176,15 @@ const migrate = (database: Database) => {
 const openDatabase = (path: string) =>
   Effect.try({
     try: () => {
-      if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
+      if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
       const database = new Database(path, { create: true, strict: true });
       migrate(database);
+      if (path !== ':memory:') {
+        chmodSync(path, 0o600);
+        for (const suffix of ['-wal', '-shm']) {
+          if (existsSync(`${path}${suffix}`)) chmodSync(`${path}${suffix}`, 0o600);
+        }
+      }
       return database;
     },
     catch: (cause) => new QueueError({ operation: 'open', cause }),
@@ -193,6 +201,7 @@ const decodeJob = (row: JobRow): QueuedJob => ({
   work: JSON.parse(row.payload) as WorkItem,
   status: row.status,
   attempts: row.attempts,
+  createdAt: row.createdAt,
 });
 
 export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
@@ -353,10 +362,16 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           } | null,
       ).pipe(Effect.map((row) => row?.status));
 
-    const enqueue = (work: WorkItem) =>
+    const enqueue = (work: WorkItem, maxDepth = 10_000) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         return yield* attempt('enqueue', () => {
+          const active = database
+            .query(
+              "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('pending', 'retry', 'interrupted', 'running')",
+            )
+            .get() as { count: number };
+          if (active.count >= maxDepth) throw new Error('QUEUE_DEPTH_LIMIT');
           const result = database
             .query(
               `INSERT INTO jobs
@@ -380,7 +395,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             .transaction(() => {
               const row = database
                 .query(
-                  `SELECT id, payload, status, attempts
+                  `SELECT id, payload, status, attempts, created_at AS createdAt
                FROM jobs
                WHERE status IN ('pending', 'retry', 'interrupted') AND available_at <= ?
                  AND CASE WHEN json_valid(payload)
@@ -737,6 +752,16 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       });
     });
 
+    const backup = (destination: string) =>
+      attempt('back up queue', () => {
+        if (existsSync(destination)) throw new Error('Backup destination already exists');
+        mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+        database.exec('PRAGMA wal_checkpoint(FULL)');
+        database.query('VACUUM INTO ?').run(destination);
+        chmodSync(destination, 0o600);
+        return { path: destination, sizeBytes: statSync(destination).size };
+      });
+
     return {
       receiveDelivery,
       claimDelivery,
@@ -761,6 +786,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       retry: (id: number) => mutateJob(id, 'retry'),
       cancel: (id: number) => mutateJob(id, 'cancel'),
       diagnostics,
+      backup,
       ownerId,
     };
   }),

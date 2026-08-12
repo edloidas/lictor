@@ -32,12 +32,26 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         ),
       );
       const repositoryPolicy = policy.forRepository(job.work.repository);
+      const policyTime = yield* Clock.currentTimeMillis;
+      if (
+        job.attempts > repositoryPolicy.maxAttempts ||
+        policyTime - job.createdAt > policy.maxJobAgeMs
+      ) {
+        yield* queue.fail(job.id, job.attempts, 'POLICY_COST_LIMIT');
+        return true;
+      }
       const execution = workspaces
         .withRepositoryLock(
           job.work.repository,
           Effect.acquireUseRelease(
             workspaces.create(job.id, job.work, repositoryPolicy, policy.workspaceRoots),
-            (workspace) => executor.execute(job.work, workspace.worktreePath),
+            (workspace) =>
+              executor.execute(
+                job.work,
+                workspace.worktreePath,
+                repositoryPolicy.maxDurationMs,
+                job.id,
+              ),
             (workspace, exit) =>
               workspaces
                 .cleanup(workspace, Exit.isFailure(exit))
@@ -85,6 +99,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
           job: job.id,
           attempt: job.attempts,
           error: result.left.message,
+          errorCode: result.left.retryable ? 'EXECUTOR_RETRYABLE' : 'EXECUTOR_FAILED',
           ...(retryAt === undefined ? {} : { retryAt }),
         }),
       );

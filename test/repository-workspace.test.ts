@@ -33,6 +33,8 @@ const policy = (workspace: string, clone: 'allowed' | 'denied' = 'denied'): Repo
   execution: 'automatic',
   clone,
   workspace,
+  maxAttempts: 3,
+  maxDurationMs: 30 * 60 * 1000,
   capabilities: {
     read: true,
     comment: false,
