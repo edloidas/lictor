@@ -9,6 +9,7 @@ import { Effect, Layer, Redacted } from 'effect';
 import { LictorConfig } from './config.ts';
 import { GitHubClient } from './github/client.ts';
 import { registry } from './handlers/index.ts';
+import { Policy } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 import { decodePayload } from './webhook/event.ts';
 import { dispatch } from './webhook/router.ts';
@@ -93,5 +94,6 @@ export const Server = HttpServer.serve(router, HttpMiddleware.logger).pipe(
 export const ServerLive = Server.pipe(
   Layer.provide(GitHubClient.Default),
   Layer.provide(WorkQueue.Default),
+  Layer.provide(Policy.Default),
   Layer.provide(LictorConfig.Default),
 );

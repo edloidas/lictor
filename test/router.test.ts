@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { Effect, Redacted, Ref } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { GitHubClient } from '../src/github/client.ts';
+import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { Delivery } from '../src/webhook/event.ts';
 import { dispatch, type Registry } from '../src/webhook/router.ts';
@@ -10,6 +11,7 @@ import { dispatch, type Registry } from '../src/webhook/router.ts';
 const stubClient = GitHubClient.make({
   forInstallation: () => Effect.die('the router must not reach GitHub'),
 });
+const stubPolicy = Policy.make(Effect.runSync(parsePolicy('')));
 
 const delivery = (event: string, action?: string): Delivery => ({
   event,
@@ -27,6 +29,7 @@ const run = (registry: (log: Ref.Ref<string[]>) => Registry, received: Delivery)
       return yield* Ref.get(log);
     }).pipe(
       Effect.provideService(GitHubClient, stubClient),
+      Effect.provideService(Policy, stubPolicy),
       Effect.provideService(
         LictorConfig,
         LictorConfig.make({
@@ -36,6 +39,7 @@ const run = (registry: (log: Ref.Ref<string[]>) => Registry, received: Delivery)
           trustedSenders: [],
           targetUsers: [],
           databasePath: ':memory:',
+          policyPath: 'policy.toml',
           executor: 'disabled',
           codexModel: 'gpt-5.6-luna',
           agentWorkdir: '.',

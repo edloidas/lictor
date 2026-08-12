@@ -5,6 +5,7 @@ import { Effect, Layer, Logger, Redacted, Schedule } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { AgentExecutor } from '../src/executor/agent-executor.ts';
 import { GitHubClient } from '../src/github/client.ts';
+import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import { Server, WEBHOOK_PATH } from '../src/server.ts';
 import { sign } from '../src/webhook/signature.ts';
@@ -20,6 +21,7 @@ const ConfigLive = Layer.succeed(
     trustedSenders: ['edloidas'],
     targetUsers: ['adiutriel'],
     databasePath: ':memory:',
+    policyPath: 'policy.toml',
     executor: 'disabled',
     codexModel: 'gpt-5.6-luna',
     agentWorkdir: '.',
@@ -46,7 +48,11 @@ const GitHubLive = Layer.succeed(
   GitHubClient,
   GitHubClient.make({ forInstallation: () => Effect.die('pipeline must not call GitHub') }),
 );
-const Services = Layer.mergeAll(ConfigLive, QueueLive, WorkerLive, GitHubLive);
+const PolicyLive = Layer.effect(
+  Policy,
+  parsePolicy('[defaults]\nexecution = "automatic"').pipe(Effect.map(Policy.make)),
+);
+const Services = Layer.mergeAll(ConfigLive, QueueLive, WorkerLive, GitHubLive, PolicyLive);
 const Application = Layer.merge(
   Server,
   Layer.scopedDiscard(Effect.flatMap(Worker, (worker) => Effect.forkScoped(worker.run))),

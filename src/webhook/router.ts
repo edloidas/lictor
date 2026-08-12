@@ -1,6 +1,7 @@
 import { Effect } from 'effect';
 import type { LictorConfig } from '../config.ts';
 import type { GitHubClient } from '../github/client.ts';
+import type { Policy } from '../policy.ts';
 import type { WorkQueue } from '../queue/work-queue.ts';
 import { type Delivery, deliveryKey } from './event.ts';
 
@@ -11,7 +12,7 @@ import { type Delivery, deliveryKey } from './event.ts';
  */
 export type Handler = (
   delivery: Delivery,
-) => Effect.Effect<void, never, GitHubClient | LictorConfig | WorkQueue>;
+) => Effect.Effect<void, never, GitHubClient | LictorConfig | Policy | WorkQueue>;
 
 /**
  * Handlers are keyed by `X-GitHub-Event`, optionally narrowed with the payload
@@ -26,7 +27,9 @@ export type Registry = Readonly<Record<string, Handler>>;
  */
 export const dispatch =
   (registry: Registry) =>
-  (delivery: Delivery): Effect.Effect<void, never, GitHubClient | LictorConfig | WorkQueue> =>
+  (
+    delivery: Delivery,
+  ): Effect.Effect<void, never, GitHubClient | LictorConfig | Policy | WorkQueue> =>
     Effect.gen(function* () {
       const key = deliveryKey(delivery);
       const handler = registry[key] ?? registry[delivery.event];

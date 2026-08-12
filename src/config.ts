@@ -13,6 +13,15 @@ const loginList = (name: string) =>
     ]),
   );
 
+const positiveInteger = (name: string, fallback: number, maximum: number) =>
+  Config.integer(name).pipe(
+    Config.withDefault(fallback),
+    Config.validate({
+      message: `${name} must be between 1 and ${maximum}`,
+      validation: (value) => value >= 1 && value <= maximum,
+    }),
+  );
+
 /**
  * Environment-backed configuration. Bun loads `.env` automatically, so nothing
  * here needs a dotenv shim — see `.env.example` for the expected keys.
@@ -37,28 +46,35 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       databasePath: yield* Config.string('LICTOR_DATABASE_PATH').pipe(
         Config.withDefault('.lictor/lictor.sqlite'),
       ),
+      policyPath: yield* Config.string('LICTOR_POLICY_PATH').pipe(
+        Config.withDefault('.lictor/policy.toml'),
+      ),
       executor: yield* Config.literal(
         'codex',
         'disabled',
-      )('LICTOR_EXECUTOR').pipe(Config.withDefault('codex' as const)),
+      )('LICTOR_EXECUTOR').pipe(Config.withDefault('disabled' as const)),
       codexModel: yield* Config.string('LICTOR_CODEX_MODEL').pipe(
         Config.withDefault('gpt-5.6-luna'),
       ),
       agentWorkdir: yield* Config.string('LICTOR_AGENT_WORKDIR').pipe(
         Config.withDefault(process.cwd()),
       ),
-      executorTimeoutMs: yield* Config.integer('LICTOR_EXECUTOR_TIMEOUT_MS').pipe(
-        Config.withDefault(30 * 60 * 1000),
+      executorTimeoutMs: yield* positiveInteger(
+        'LICTOR_EXECUTOR_TIMEOUT_MS',
+        30 * 60 * 1000,
+        24 * 60 * 60 * 1000,
       ),
-      executorOutputBytes: yield* Config.integer('LICTOR_EXECUTOR_OUTPUT_BYTES').pipe(
-        Config.withDefault(256 * 1024),
+      executorOutputBytes: yield* positiveInteger(
+        'LICTOR_EXECUTOR_OUTPUT_BYTES',
+        256 * 1024,
+        10 * 1024 * 1024,
       ),
-      workerPollMs: yield* Config.integer('LICTOR_WORKER_POLL_MS').pipe(Config.withDefault(1000)),
-      workerMaxAttempts: yield* Config.integer('LICTOR_WORKER_MAX_ATTEMPTS').pipe(
-        Config.withDefault(3),
-      ),
-      workerRetryBaseMs: yield* Config.integer('LICTOR_WORKER_RETRY_BASE_MS').pipe(
-        Config.withDefault(30_000),
+      workerPollMs: yield* positiveInteger('LICTOR_WORKER_POLL_MS', 1000, 60_000),
+      workerMaxAttempts: yield* positiveInteger('LICTOR_WORKER_MAX_ATTEMPTS', 3, 100),
+      workerRetryBaseMs: yield* positiveInteger(
+        'LICTOR_WORKER_RETRY_BASE_MS',
+        30_000,
+        24 * 60 * 60 * 1000,
       ),
     };
   }),

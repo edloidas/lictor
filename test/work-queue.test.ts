@@ -16,6 +16,7 @@ const config = (databasePath: string) =>
     trustedSenders: ['edloidas'],
     targetUsers: ['adiutriel'],
     databasePath,
+    policyPath: 'policy.toml',
     executor: 'disabled',
     codexModel: 'gpt-5.6-luna',
     agentWorkdir: '.',

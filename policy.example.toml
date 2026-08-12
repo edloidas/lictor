@@ -1,0 +1,26 @@
+[defaults]
+execution = "automatic"
+clone = "allowed"
+
+[defaults.capabilities]
+read = true
+comment = true
+issues = true
+branches = true
+pullRequests = true
+merge = false
+forcePush = false
+deleteBranches = false
+scripts = []
+
+[repositories]
+allow = []
+deny = []
+workspaceRoots = ["/absolute/path/to/repositories"]
+
+[repositories.overrides."edloidas/lictor"]
+workspace = "/absolute/path/to/repositories/lictor"
+
+[retention]
+completedDays = 30
+failedDays = 90

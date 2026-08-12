@@ -1,5 +1,6 @@
 import { Effect } from 'effect';
 import { LictorConfig } from '../config.ts';
+import { Policy } from '../policy.ts';
 import { WorkQueue } from '../queue/work-queue.ts';
 import { qualifyDelivery, supportsInteraction } from '../webhook/qualification.ts';
 import type { Handler } from '../webhook/router.ts';
@@ -16,6 +17,14 @@ export const handleInteraction: Handler = (delivery) =>
     const config = yield* LictorConfig;
     const work = yield* qualifyDelivery(delivery, config);
     if (work === undefined) return;
+    const policy = yield* Policy;
+    const repositoryPolicy = policy.forRepository(work.repository);
+    if (!repositoryPolicy.accepted || repositoryPolicy.execution !== 'automatic') {
+      yield* Effect.logInfo('Dropped interaction denied by repository policy').pipe(
+        Effect.annotateLogs({ delivery: work.deliveryId, repository: work.repository }),
+      );
+      return;
+    }
     const queue = yield* WorkQueue;
     const enqueued = yield* queue.enqueue(work);
 

@@ -4,11 +4,13 @@ import { LictorConfig, port } from './config.ts';
 import { AgentExecutor } from './executor/agent-executor.ts';
 import { ProcessRunner } from './executor/process-runner.ts';
 import { GitHubClient } from './github/client.ts';
+import { Policy } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 import { Server } from './server.ts';
 import { Worker } from './worker.ts';
 
 const ConfigLive = LictorConfig.Default;
+const PolicyLive = Policy.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
 const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
 const ExecutorLive = AgentExecutor.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.merge(ConfigLive, ProcessRunner.Default)),
@@ -16,7 +18,13 @@ const ExecutorLive = AgentExecutor.DefaultWithoutDependencies.pipe(
 const WorkerLive = Worker.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, ExecutorLive)),
 );
-const Services = Layer.mergeAll(ConfigLive, GitHubClient.Default, QueueLive, WorkerLive);
+const Services = Layer.mergeAll(
+  ConfigLive,
+  GitHubClient.Default,
+  PolicyLive,
+  QueueLive,
+  WorkerLive,
+);
 const Application = Layer.merge(
   Server,
   Layer.scopedDiscard(
