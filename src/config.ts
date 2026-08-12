@@ -33,6 +33,10 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       trustedSenders: yield* loginList('GITHUB_TRUSTED_SENDERS'),
       /** GitHub users whose assignments and mentions may create work. */
       targetUsers: yield* loginList('GITHUB_TARGET_USERS'),
+      /** Local SQLite file used for durable work. */
+      databasePath: yield* Config.string('LICTOR_DATABASE_PATH').pipe(
+        Config.withDefault('.lictor/lictor.sqlite'),
+      ),
     };
   }),
 }) {}

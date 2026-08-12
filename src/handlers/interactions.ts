@@ -1,5 +1,6 @@
 import { Effect } from 'effect';
 import { LictorConfig } from '../config.ts';
+import { WorkQueue } from '../queue/work-queue.ts';
 import { qualifyDelivery, supportsInteraction } from '../webhook/qualification.ts';
 import type { Handler } from '../webhook/router.ts';
 
@@ -15,9 +16,14 @@ export const handleInteraction: Handler = (delivery) =>
     const config = yield* LictorConfig;
     const work = yield* qualifyDelivery(delivery, config);
     if (work === undefined) return;
+    const queue = yield* WorkQueue;
+    const enqueued = yield* queue.enqueue(work);
 
-    yield* Effect.logInfo('Qualified GitHub interaction').pipe(
+    yield* Effect.logInfo(
+      enqueued.inserted ? 'Queued GitHub interaction' : 'Ignored duplicate delivery',
+    ).pipe(
       Effect.annotateLogs({
+        job: enqueued.jobId,
         delivery: work.deliveryId,
         repository: work.repository,
         sender: work.sender,
@@ -28,8 +34,11 @@ export const handleInteraction: Handler = (delivery) =>
     );
   }).pipe(
     Effect.catchAll((error) =>
-      Effect.logWarning('Dropped malformed interaction payload', error).pipe(
-        Effect.annotateLogs({ delivery: delivery.id, event: delivery.event }),
-      ),
+      Effect.logWarning(
+        error._tag === 'QueueError'
+          ? 'Could not queue GitHub interaction'
+          : 'Dropped malformed interaction payload',
+        error,
+      ).pipe(Effect.annotateLogs({ delivery: delivery.id, event: delivery.event })),
     ),
   );

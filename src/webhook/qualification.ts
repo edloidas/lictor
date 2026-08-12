@@ -6,12 +6,15 @@ const Subject = Schema.Struct({
   number: Schema.Number,
   title: Schema.String,
   html_url: Schema.String,
+  updated_at: Schema.String,
   body: Schema.optionalWith(Schema.String, { nullable: true }),
   pull_request: Schema.optional(Schema.Unknown),
 });
 const Comment = Schema.Struct({
   html_url: Schema.String,
   body: Schema.optionalWith(Schema.String, { nullable: true }),
+  updated_at: Schema.optional(Schema.String),
+  submitted_at: Schema.optional(Schema.String),
 });
 const BodyChange = Schema.Struct({
   body: Schema.optional(
@@ -42,6 +45,7 @@ export type WorkReason = 'assigned' | 'mentioned' | 'review_requested';
 
 export type WorkItem = {
   readonly deliveryId: string;
+  readonly interactionId: string;
   readonly event: string;
   readonly action: string;
   readonly repository: string;
@@ -180,9 +184,21 @@ export const qualifyDelivery = (
         delivery.event.startsWith('pull_request') ||
         payload.issue?.pull_request !== undefined;
       const context = payload.comment ?? payload.review;
+      const interactionId = JSON.stringify([
+        delivery.event,
+        payload.action,
+        payload.repository.full_name,
+        isPullRequest ? 'pull_request' : 'issue',
+        subject.number,
+        context?.html_url ?? subject.html_url,
+        context?.updated_at ?? context?.submitted_at ?? subject.updated_at,
+        [...matched].sort(),
+        [...reasons].sort(),
+      ]);
 
       return {
         deliveryId: delivery.id,
+        interactionId,
         event: delivery.event,
         action: payload.action,
         repository: payload.repository.full_name,
