@@ -22,6 +22,7 @@ const TestServer = ServerLive.pipe(
           ['GITHUB_APP_ID', '1'],
           ['GITHUB_PRIVATE_KEY', 'unused-by-these-routes'],
           ['GITHUB_WEBHOOK_SECRET', secret],
+          ['LICTOR_DATABASE_PATH', ':memory:'],
         ]),
       ),
     ),
@@ -37,6 +38,7 @@ const deliver = (options: {
   readonly body: string;
   readonly signature?: string;
   readonly event?: string;
+  readonly deliveryId?: string | null;
 }) =>
   Effect.gen(function* () {
     const client = yield* HttpClient.HttpClient;
@@ -44,7 +46,9 @@ const deliver = (options: {
 
     if (options.signature !== undefined) headers['x-hub-signature-256'] = options.signature;
     if (options.event !== undefined) headers['x-github-event'] = options.event;
-    headers['x-github-delivery'] = 'test-delivery';
+    if (options.deliveryId !== null) {
+      headers['x-github-delivery'] = options.deliveryId ?? 'test-delivery';
+    }
 
     return yield* client.execute(
       HttpClientRequest.post(WEBHOOK_PATH).pipe(
@@ -102,6 +106,19 @@ describe('POST /webhooks/github', () => {
 
   it('rejects a signed delivery with no event header', async () => {
     const response = await serve(deliver({ body: pingBody, signature: sign(pingBody, secret) }));
+
+    expect(response.status).toBe(400);
+  });
+
+  it('rejects a signed delivery with no delivery id', async () => {
+    const response = await serve(
+      deliver({
+        body: pingBody,
+        signature: sign(pingBody, secret),
+        event: 'ping',
+        deliveryId: null,
+      }),
+    );
 
     expect(response.status).toBe(400);
   });

@@ -8,6 +8,7 @@ const subject = {
   number: 17,
   title: 'Keep the queue moving',
   html_url: 'https://github.com/edloidas/lictor/issues/17',
+  updated_at: '2026-08-12T12:00:00Z',
 };
 
 const delivery = (
@@ -41,6 +42,8 @@ describe('qualifyDelivery', () => {
 
     expect(Either.getOrThrow(result)).toEqual({
       deliveryId: 'delivery-1',
+      interactionId:
+        '["issues","assigned","edloidas/lictor","issue",17,"https://github.com/edloidas/lictor/issues/17","2026-08-12T12:00:00Z",["adiutriel"],["assigned"]]',
       event: 'issues',
       action: 'assigned',
       repository: 'edloidas/lictor',

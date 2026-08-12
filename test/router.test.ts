@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { Effect, Redacted, Ref } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { GitHubClient } from '../src/github/client.ts';
+import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { Delivery } from '../src/webhook/event.ts';
 import { dispatch, type Registry } from '../src/webhook/router.ts';
 
@@ -34,6 +35,18 @@ const run = (registry: (log: Ref.Ref<string[]>) => Registry, received: Delivery)
           webhookSecret: Redacted.make('unused'),
           trustedSenders: [],
           targetUsers: [],
+          databasePath: ':memory:',
+        }),
+      ),
+      Effect.provideService(
+        WorkQueue,
+        WorkQueue.make({
+          enqueue: () => Effect.die('the router must not reach the queue'),
+          claim: Effect.die('the router must not reach the queue'),
+          complete: () => Effect.die('the router must not reach the queue'),
+          fail: () => Effect.die('the router must not reach the queue'),
+          recoverStale: () => Effect.die('the router must not reach the queue'),
+          counts: Effect.die('the router must not reach the queue'),
         }),
       ),
     ),

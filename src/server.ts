@@ -9,6 +9,7 @@ import { Effect, Layer, Redacted } from 'effect';
 import { LictorConfig } from './config.ts';
 import { GitHubClient } from './github/client.ts';
 import { registry } from './handlers/index.ts';
+import { WorkQueue } from './queue/work-queue.ts';
 import { decodePayload } from './webhook/event.ts';
 import { dispatch } from './webhook/router.ts';
 import {
@@ -47,7 +48,8 @@ const webhook = Effect.gen(function* () {
   }
 
   const event = request.headers[EVENT_HEADER];
-  if (event === undefined) {
+  const deliveryId = request.headers[DELIVERY_HEADER];
+  if (event === undefined || deliveryId === undefined) {
     return HttpServerResponse.empty({ status: 400 });
   }
 
@@ -58,7 +60,7 @@ const webhook = Effect.gen(function* () {
   const payload = yield* decodePayload(json);
   const delivery = {
     event,
-    id: request.headers[DELIVERY_HEADER] ?? '(unknown)',
+    id: deliveryId,
     payload,
     raw: json,
   };
@@ -87,5 +89,6 @@ export const router = HttpRouter.empty.pipe(
 export const ServerLive = HttpServer.serve(router, HttpMiddleware.logger).pipe(
   HttpServer.withLogAddress,
   Layer.provide(GitHubClient.Default),
+  Layer.provide(WorkQueue.Default),
   Layer.provide(LictorConfig.Default),
 );

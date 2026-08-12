@@ -10,6 +10,7 @@
 .codex/
 .mcp.json
 .tmp/
+.lictor/
 
 # Dependencies
 node_modules/
