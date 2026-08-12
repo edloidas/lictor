@@ -1,9 +1,13 @@
 import { Database } from 'bun:sqlite';
-import { mkdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Clock, Data, Effect } from 'effect';
 import { LictorConfig } from '../config.ts';
 import type { WorkItem } from '../webhook/qualification.ts';
+
+const WORKER_LEASE_MS = 60_000;
+const DAEMON_LEASE_MS = 30_000;
 
 export type InboxStatus = 'pending' | 'processing' | 'completed' | 'failed';
 
@@ -18,13 +22,22 @@ export type InboxDelivery = ReceivedDelivery & {
   readonly attempts: number;
 };
 
-export type JobStatus = 'completed' | 'failed' | 'interrupted' | 'pending' | 'retry' | 'running';
+export type JobStatus =
+  | 'completed'
+  | 'dead_letter'
+  | 'failed'
+  | 'interrupted'
+  | 'pending'
+  | 'retry'
+  | 'running';
 
 export type QueuedJob = {
   readonly id: number;
   readonly work: WorkItem;
   readonly status: JobStatus;
   readonly attempts: number;
+  readonly workerId?: string;
+  readonly leaseExpiresAt?: number;
 };
 
 export type QueueCounts = Readonly<Record<JobStatus, number>>;
@@ -45,8 +58,8 @@ const migrate = (database: Database) => {
   database.exec('PRAGMA journal_mode = WAL');
   database.exec('PRAGMA foreign_keys = ON');
   const version = database.query('PRAGMA user_version').get() as { user_version: number };
-  if (version.user_version === 2) return;
-  if (version.user_version > 2) {
+  if (version.user_version === 3) return;
+  if (version.user_version > 3) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -58,7 +71,7 @@ const migrate = (database: Database) => {
         delivery_id TEXT NOT NULL UNIQUE,
         interaction_id TEXT NOT NULL UNIQUE,
         payload TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'retry', 'interrupted', 'completed', 'failed')),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'retry', 'interrupted', 'completed', 'failed', 'dead_letter')),
         attempts INTEGER NOT NULL DEFAULT 0,
         available_at INTEGER NOT NULL,
         claimed_at INTEGER,
@@ -68,7 +81,9 @@ const migrate = (database: Database) => {
         interrupted_at INTEGER,
         last_error TEXT,
         created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        worker_id TEXT,
+        lease_expires_at INTEGER
       );
       CREATE INDEX jobs_claimable ON jobs(status, available_at, id);
       CREATE TABLE attempts (
@@ -96,7 +111,46 @@ const migrate = (database: Database) => {
         last_error TEXT
       );
       CREATE INDEX IF NOT EXISTS deliveries_claimable ON deliveries(status, received_at);
-      PRAGMA user_version = 2;
+    `);
+    if (version.user_version > 0 && version.user_version < 3) {
+      database.exec(`
+        ALTER TABLE jobs RENAME TO jobs_v2;
+        DROP INDEX IF EXISTS jobs_claimable;
+        CREATE TABLE jobs (
+          id INTEGER PRIMARY KEY,
+          delivery_id TEXT NOT NULL UNIQUE,
+          interaction_id TEXT NOT NULL UNIQUE,
+          payload TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'retry', 'interrupted', 'completed', 'failed', 'dead_letter')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          available_at INTEGER NOT NULL,
+          claimed_at INTEGER,
+          completed_at INTEGER,
+          failed_at INTEGER,
+          retry_at INTEGER,
+          interrupted_at INTEGER,
+          last_error TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          worker_id TEXT,
+          lease_expires_at INTEGER
+        );
+        INSERT INTO jobs (id, delivery_id, interaction_id, payload, status, attempts, available_at,
+          claimed_at, completed_at, failed_at, retry_at, interrupted_at, last_error, created_at, updated_at)
+          SELECT id, delivery_id, interaction_id, payload, status, attempts, available_at,
+          claimed_at, completed_at, failed_at, retry_at, interrupted_at, last_error, created_at, updated_at FROM jobs_v2;
+        DROP TABLE jobs_v2;
+      `);
+    }
+    database.exec(`
+      CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs(status, available_at, id);
+      CREATE TABLE IF NOT EXISTS daemon_owner (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        owner_id TEXT NOT NULL,
+        heartbeat_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
+      PRAGMA user_version = 3;
     `);
   })();
 };
@@ -132,22 +186,60 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       Effect.sync(() => connection.close()),
     );
     const startupTime = yield* Clock.currentTimeMillis;
+    const ownerId = randomUUID();
+    yield* Effect.acquireRelease(
+      attempt('claim daemon ownership', () => {
+        const result = database
+          .query(
+            `INSERT INTO daemon_owner (singleton, owner_id, heartbeat_at, expires_at)
+             VALUES (1, ?, ?, ?)
+             ON CONFLICT(singleton) DO UPDATE SET owner_id = excluded.owner_id,
+               heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at
+             WHERE daemon_owner.expires_at < ?`,
+          )
+          .run(ownerId, startupTime, startupTime + DAEMON_LEASE_MS, startupTime);
+        if (result.changes !== 1) throw new Error('Another Lictor daemon owns this database');
+      }),
+      () =>
+        attempt('release daemon ownership', () => {
+          const now = Date.now();
+          database.transaction(() => {
+            database
+              .query(
+                `UPDATE attempts SET status = 'interrupted', finished_at = ?, error = 'daemon stopped'
+                 WHERE status = 'running' AND job_id IN
+                   (SELECT id FROM jobs WHERE status = 'running' AND worker_id = ?)`,
+              )
+              .run(now, ownerId);
+            database
+              .query(
+                `UPDATE jobs SET status = 'interrupted', available_at = ?, claimed_at = NULL,
+                   worker_id = NULL, lease_expires_at = NULL, interrupted_at = ?,
+                   last_error = 'daemon stopped', updated_at = ?
+                 WHERE status = 'running' AND worker_id = ?`,
+              )
+              .run(now, now, now, ownerId);
+            database.query('DELETE FROM daemon_owner WHERE owner_id = ?').run(ownerId);
+          })();
+        }).pipe(Effect.orElseSucceed(() => undefined)),
+    );
     const startupRecovered = yield* attempt('recover startup jobs', () =>
       database.transaction(() => {
         database
           .query(
             `UPDATE attempts SET status = 'interrupted', finished_at = ?, error = 'process restarted'
-             WHERE status = 'running'`,
+             WHERE status = 'running' AND job_id IN
+               (SELECT id FROM jobs WHERE status = 'running' AND lease_expires_at < ?)`,
           )
-          .run(startupTime);
+          .run(startupTime, startupTime);
         return database
           .query(
             `UPDATE jobs
              SET status = 'interrupted', available_at = ?, claimed_at = NULL,
                  interrupted_at = ?, last_error = 'process restarted', updated_at = ?
-             WHERE status = 'running'`,
+             WHERE status = 'running' AND lease_expires_at < ?`,
           )
-          .run(startupTime, startupTime, startupTime).changes;
+          .run(startupTime, startupTime, startupTime, startupTime).changes;
       })(),
     );
     if (Number(startupRecovered) > 0) {
@@ -264,41 +356,94 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         });
       });
 
-    const claim = Effect.gen(function* () {
-      const now = yield* Clock.currentTimeMillis;
-      return yield* attempt('claim', () =>
-        database
-          .transaction(() => {
-            const row = database
-              .query(
-                `SELECT id, payload, status, attempts
+    const claimFor = (workerId: string) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        return yield* attempt('claim', () =>
+          database
+            .transaction(() => {
+              const row = database
+                .query(
+                  `SELECT id, payload, status, attempts
                FROM jobs
                WHERE status IN ('pending', 'retry', 'interrupted') AND available_at <= ?
                ORDER BY available_at, id
                LIMIT 1`,
-              )
-              .get(now) as JobRow | null;
-            if (row === null) return undefined;
+                )
+                .get(now) as JobRow | null;
+              if (row === null) return undefined;
 
-            const attemptNumber = row.attempts + 1;
-            database
-              .query(
-                `UPDATE jobs
-               SET status = 'running', attempts = ?, claimed_at = ?, updated_at = ?
+              const attemptNumber = row.attempts + 1;
+              if (attemptNumber > config.workerMaxAttempts) {
+                database
+                  .query(
+                    `UPDATE jobs SET status = 'dead_letter', failed_at = ?, updated_at = ?,
+                     last_error = 'attempt limit exhausted' WHERE id = ?`,
+                  )
+                  .run(now, now, row.id);
+                return undefined;
+              }
+              let decoded: QueuedJob;
+              try {
+                decoded = decodeJob({ ...row, status: 'running', attempts: attemptNumber });
+              } catch {
+                database
+                  .query(
+                    `UPDATE jobs SET status = 'dead_letter', failed_at = ?, updated_at = ?,
+                     last_error = 'invalid stored payload' WHERE id = ?`,
+                  )
+                  .run(now, now, row.id);
+                return undefined;
+              }
+              database
+                .query(
+                  `UPDATE jobs
+               SET status = 'running', attempts = ?, claimed_at = ?, updated_at = ?,
+                   worker_id = ?, lease_expires_at = ?
                WHERE id = ?`,
-              )
-              .run(attemptNumber, now, now, row.id);
-            database
-              .query(
-                `INSERT INTO attempts (job_id, number, status, started_at)
+                )
+                .run(attemptNumber, now, now, workerId, now + WORKER_LEASE_MS, row.id);
+              database
+                .query(
+                  `INSERT INTO attempts (job_id, number, status, started_at)
                VALUES (?, ?, 'running', ?)`,
-              )
-              .run(row.id, attemptNumber, now);
+                )
+                .run(row.id, attemptNumber, now);
 
-            return decodeJob({ ...row, status: 'running', attempts: attemptNumber });
-          })
-          .immediate(),
-      );
+              return {
+                ...decoded,
+                workerId,
+                leaseExpiresAt: now + WORKER_LEASE_MS,
+              };
+            })
+            .immediate(),
+        );
+      });
+    const claim = claimFor(ownerId);
+
+    const heartbeat = (jobId: number, attemptNumber: number, workerId: string) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        yield* attempt('renew job lease', () => {
+          const result = database
+            .query(
+              `UPDATE jobs SET lease_expires_at = ?, updated_at = ?
+               WHERE id = ? AND status = 'running' AND attempts = ? AND worker_id = ?`,
+            )
+            .run(now + WORKER_LEASE_MS, now, jobId, attemptNumber, workerId);
+          if (result.changes !== 1)
+            throw new Error(`Job ${jobId} attempt ${attemptNumber} is stale`);
+        });
+      });
+
+    const heartbeatDaemon = Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      yield* attempt('renew daemon ownership', () => {
+        const result = database
+          .query('UPDATE daemon_owner SET heartbeat_at = ?, expires_at = ? WHERE owner_id = ?')
+          .run(now, now + DAEMON_LEASE_MS, ownerId);
+        if (result.changes !== 1) throw new Error('Daemon ownership was lost');
+      });
     });
 
     const complete = (jobId: number, attemptNumber: number, output: string) =>
@@ -370,17 +515,18 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               .query(
                 `UPDATE attempts SET status = 'interrupted', finished_at = ?, error = 'worker interrupted'
                  WHERE status = 'running' AND job_id IN
-                   (SELECT id FROM jobs WHERE status = 'running' AND claimed_at < ?)`,
+                   (SELECT id FROM jobs WHERE status = 'running' AND lease_expires_at < ?)`,
               )
               .run(now, olderThan);
             return database
               .query(
                 `UPDATE jobs
-                 SET status = 'interrupted', available_at = ?, claimed_at = NULL,
+                 SET status = CASE WHEN attempts >= ? THEN 'dead_letter' ELSE 'interrupted' END,
+                     available_at = ?, claimed_at = NULL, worker_id = NULL, lease_expires_at = NULL,
                      interrupted_at = ?, last_error = 'worker interrupted', updated_at = ?
-                 WHERE status = 'running' AND claimed_at < ?`,
+                 WHERE status = 'running' AND lease_expires_at < ?`,
               )
-              .run(now, now, now, olderThan).changes;
+              .run(config.workerMaxAttempts, now, now, now, olderThan).changes;
           })(),
         );
       });
@@ -393,6 +539,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         interrupted: 0,
         completed: 0,
         failed: 0,
+        dead_letter: 0,
       };
       const rows = database
         .query('SELECT status, COUNT(*) AS count FROM jobs GROUP BY status')
@@ -400,6 +547,20 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       for (const row of rows) result[row.status] = row.count;
       return result;
     });
+
+    const maintenance = (completedBefore: number, failedBefore: number) =>
+      attempt('maintain queue', () => {
+        const completed = database
+          .query("DELETE FROM jobs WHERE status = 'completed' AND completed_at < ?")
+          .run(completedBefore).changes;
+        const failed = database
+          .query("DELETE FROM jobs WHERE status IN ('failed', 'dead_letter') AND failed_at < ?")
+          .run(failedBefore).changes;
+        database.exec('PRAGMA wal_checkpoint(PASSIVE)');
+        const sizeBytes =
+          config.databasePath === ':memory:' ? 0 : statSync(config.databasePath).size;
+        return { completed: Number(completed), failed: Number(failed), sizeBytes };
+      });
 
     return {
       receiveDelivery,
@@ -409,10 +570,15 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       deliveryStatus,
       enqueue,
       claim,
+      claimFor,
+      heartbeat,
+      heartbeatDaemon,
       complete,
       fail,
       recoverStale,
       counts,
+      maintenance,
+      ownerId,
     };
   }),
   dependencies: [LictorConfig.Default],
