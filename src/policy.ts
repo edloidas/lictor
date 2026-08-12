@@ -15,11 +15,16 @@ const Capabilities = Schema.Struct({
   deleteBranches: Schema.optional(Schema.Boolean),
   scripts: Schema.optional(Schema.Array(Schema.String)),
 });
+const Costs = Schema.Struct({
+  maxAttempts: Schema.optional(Schema.Number),
+  maxDurationMinutes: Schema.optional(Schema.Number),
+});
 const RepositoryOverride = Schema.Struct({
   execution: Schema.optional(Execution),
   clone: Schema.optional(Clone),
   workspace: Schema.optional(Schema.String),
   capabilities: Schema.optional(Capabilities),
+  costs: Schema.optional(Costs),
 });
 const PolicyDocument = Schema.Struct({
   defaults: Schema.optional(
@@ -43,6 +48,13 @@ const PolicyDocument = Schema.Struct({
       failedDays: Schema.optional(Schema.Number),
     }),
   ),
+  limits: Schema.optional(
+    Schema.Struct({
+      maxQueueDepth: Schema.optional(Schema.Number),
+      maxJobAgeMinutes: Schema.optional(Schema.Number),
+      costs: Schema.optional(Costs),
+    }),
+  ),
 });
 
 type PolicyDocument = Schema.Schema.Type<typeof PolicyDocument>;
@@ -55,6 +67,8 @@ export type RepositoryPolicy = {
   readonly clone: 'allowed' | 'denied';
   readonly workspace?: string;
   readonly capabilities: Capabilities;
+  readonly maxAttempts: number;
+  readonly maxDurationMs: number;
 };
 
 export class PolicyError extends Data.TaggedError('PolicyError')<{
@@ -114,10 +128,25 @@ const positiveDays = (value: number | undefined, fallback: number, name: string)
   return resolved;
 };
 
+const positiveLimit = (
+  value: number | undefined,
+  fallback: number,
+  maximum: number,
+  name: string,
+) => {
+  const resolved = value ?? fallback;
+  if (!Number.isInteger(resolved) || resolved < 1 || resolved > maximum) {
+    throw new PolicyError({ message: `${name} must be an integer between 1 and ${maximum}` });
+  }
+  return resolved;
+};
+
 export type AutomationPolicy = {
   readonly workspaceRoots: readonly string[];
   readonly completedRetentionDays: number;
   readonly failedRetentionDays: number;
+  readonly maxQueueDepth: number;
+  readonly maxJobAgeMs: number;
   readonly forRepository: (repository: string) => RepositoryPolicy;
 };
 
@@ -128,6 +157,14 @@ const makePolicy = (document: PolicyDocument): AutomationPolicy => {
   const deny = (repositories?.deny ?? []).map(validatePattern);
   const workspaceRoots = (repositories?.workspaceRoots ?? []).map(safeAbsolutePath);
   const overrides = new Map<string, Schema.Schema.Type<typeof RepositoryOverride>>();
+  const defaultCosts = document.limits?.costs;
+  const defaultMaxAttempts = positiveLimit(defaultCosts?.maxAttempts, 3, 100, 'costs.maxAttempts');
+  const defaultMaxDurationMinutes = positiveLimit(
+    defaultCosts?.maxDurationMinutes,
+    30,
+    24 * 60,
+    'costs.maxDurationMinutes',
+  );
   for (const [name, override] of Object.entries(repositories?.overrides ?? {})) {
     const canonical = canonicalRepository(name);
     if (!exactRepository.test(canonical)) {
@@ -144,6 +181,13 @@ const makePolicy = (document: PolicyDocument): AutomationPolicy => {
         });
       }
     }
+    positiveLimit(override.costs?.maxAttempts, defaultMaxAttempts, 100, 'costs.maxAttempts');
+    positiveLimit(
+      override.costs?.maxDurationMinutes,
+      defaultMaxDurationMinutes,
+      24 * 60,
+      'costs.maxDurationMinutes',
+    );
     overrides.set(canonical, override);
   }
 
@@ -169,6 +213,19 @@ const makePolicy = (document: PolicyDocument): AutomationPolicy => {
         ? {}
         : { workspace: safeAbsolutePath(override.workspace) }),
       capabilities,
+      maxAttempts: positiveLimit(
+        override?.costs?.maxAttempts,
+        defaultMaxAttempts,
+        100,
+        'costs.maxAttempts',
+      ),
+      maxDurationMs:
+        positiveLimit(
+          override?.costs?.maxDurationMinutes,
+          defaultMaxDurationMinutes,
+          24 * 60,
+          'costs.maxDurationMinutes',
+        ) * 60_000,
     };
   };
 
@@ -180,6 +237,19 @@ const makePolicy = (document: PolicyDocument): AutomationPolicy => {
       'retention.completedDays',
     ),
     failedRetentionDays: positiveDays(document.retention?.failedDays, 90, 'retention.failedDays'),
+    maxQueueDepth: positiveLimit(
+      document.limits?.maxQueueDepth,
+      10_000,
+      1_000_000,
+      'limits.maxQueueDepth',
+    ),
+    maxJobAgeMs:
+      positiveLimit(
+        document.limits?.maxJobAgeMinutes,
+        24 * 60,
+        30 * 24 * 60,
+        'limits.maxJobAgeMinutes',
+      ) * 60_000,
     forRepository,
   };
 };

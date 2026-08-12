@@ -1,7 +1,7 @@
 <h1 align="center">Lictor</h1>
 
 <p align="center">
-A lictor for your agent: watches GitHub, hands work.
+A local GitHub automation daemon that gives Codex durable, policy-scoped work.
 </p>
 
 <p align="center">
@@ -10,237 +10,191 @@ A lictor for your agent: watches GitHub, hands work.
   <a href="https://bun.sh/"><img src="https://img.shields.io/badge/bun-%E2%89%A5%201.3.14-fbf0df" alt="Bun >= 1.3.14"></a>
 </p>
 
-Lictor listens for GitHub App webhooks, verifies each delivery, and queues
-trusted interactions for a local coding agent. It is a local process — you run
-it on your own machine and expose only the webhook through a tunnel.
+Lictor verifies GitHub App webhooks, commits each delivery to SQLite before
+acknowledging it, and runs qualifying work in an isolated repository worktree.
+GitHub credentials stay in the daemon; agent GitHub operations pass through a
+job-scoped, audited capability broker.
 
+```text
+GitHub -> tunnel -> webhook -> durable inbox -> policy -> queue
+                                                       |
+                                              isolated worktree
+                                                       |
+                                             Codex + broker tools
 ```
-GitHub ──delivery──▶ tunnel ──▶ POST /webhooks/github
-                                    │
-                          verify HMAC over raw body
-                                    │
-                     qualify + enqueue ─┴─ 202 Accepted
-                                    │
-                       SQLite ──▶ Codex worker
-```
-
-## Contents
-
-- [Requirements](#requirements) · [Setup](#setup) — [GitHub App](#create-a-github-app) · [Environment](#environment) · [Tunnel](#expose-it-to-github)
-- [Running](#running) · [Endpoints](#endpoints)
-- [Writing a handler](#writing-a-handler) · [Calling the GitHub API](#calling-the-github-api)
-- [Design notes](#design-notes) — [Why 202](#why-202-and-not-200) · [Raw body](#why-the-raw-body)
-- [Development](#development) · [Contributing](#contributing) · [License](#license)
 
 ## Requirements
 
-[Bun](https://bun.sh) ≥ 1.3.14 (`.bun-version` pins the exact version) and a
-tunnel — [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
-is what `bun tunnel` expects, but ngrok or [smee](https://smee.io) work equally
-well.
+- Bun 1.3.14 or newer
+- a GitHub App installed on each managed repository
+- the Codex CLI, authenticated on the daemon machine
+- a tunnel such as `cloudflared` for the public webhook route
 
-## Setup
+Only `POST /webhooks/github` and the minimal `GET /health` liveness endpoint
+are public. Readiness and management use an owner-only local Unix socket.
 
-### Create a GitHub App
-
-[Settings → Developer settings → GitHub Apps → New GitHub App](https://github.com/settings/apps/new).
-
-1. **Webhook URL** — leave a placeholder for now; you will paste the tunnel URL
-   once it is running.
-2. **Webhook secret** — generate one and keep it:
-
-   ```bash
-   openssl rand -hex 32
-   ```
-
-3. **Permissions** — grant only what your handlers need. Reading issues and
-   pull requests is enough to start.
-4. **Subscribe to events** — pick the events you intend to handle. Anything you
-   subscribe to but do not register a handler for is logged and dropped.
-5. Create the App, then **generate a private key** and download the `.pem`.
-6. **Install the App** on the repositories it should watch.
-
-### Environment
-
-Copy `.env.example` to `.env` and fill it in. Bun loads `.env` on its own — no
-dotenv package involved, and `.env` is gitignored.
-
-| Variable                | Required | Description                                                   |
-| ----------------------- | -------- | ------------------------------------------------------------- |
-| `GITHUB_APP_ID`         | yes      | Numeric App ID from the App settings page                     |
-| `GITHUB_WEBHOOK_SECRET` | yes      | The secret you set on the App                                 |
-| `GITHUB_PRIVATE_KEY`    | yes      | Contents of the downloaded `.pem`                             |
-| `GITHUB_TRUSTED_SENDERS` | yes     | Comma-separated users whose activity may create work          |
-| `GITHUB_TARGET_USERS`   | yes      | Comma-separated users whose interactions count                |
-| `PORT`                  | no       | Port to bind, default `3000`                                  |
-| `LICTOR_DATABASE_PATH`  | no       | SQLite queue path, default `.lictor/lictor.sqlite`             |
-| `LICTOR_EXECUTOR`       | no       | `codex` (default) or `disabled`                                |
-| `LICTOR_CODEX_MODEL`    | no       | Codex model, default `gpt-5.6-luna`                            |
-| `LICTOR_AGENT_WORKDIR`  | no       | Workspace Codex may modify, default current directory          |
-
-> [!TIP]
-> A PEM pasted into a single-line `.env` value must have its newlines escaped as
-> `\n`, or the whole value wrapped in double quotes. Lictor un-escapes `\n`
-> before handing the key to `node:crypto`, which rejects escaped newlines with
-> an error that names neither the cause nor the fix.
-
-### Expose it to GitHub
-
-GitHub cannot reach `localhost`. Start a tunnel and point the App's webhook URL
-at it:
+## Start safely
 
 ```bash
-bun tunnel   # cloudflared tunnel --url http://localhost:3000
+cp .env.example .env
+mkdir -p .lictor
+cp policy.example.toml .lictor/policy.toml
+bun install
+bun run start
 ```
 
-Set the App's **Webhook URL** to `<tunnel-url>/webhooks/github`. GitHub sends a
-`ping` immediately; the bundled handler logs `Webhook reachable`, which confirms
-the tunnel, the secret, and the route all line up.
+The example environment starts with `LICTOR_EXECUTOR=disabled`, empty trusted
+principals, and no implicit GitHub mutation authority. This lets you verify App
+authentication, webhook signatures, durable receipt, and policy loading before
+Codex can claim work.
 
-## Running
+Create the GitHub App with a webhook secret, download its private key, install
+it on the repositories you intend to manage, and subscribe only to the issue,
+pull-request, review, and comment events you use. Point its webhook URL at:
+
+```text
+https://<your-tunnel>/webhooks/github
+```
+
+Start the tunnel with `bun tunnel`. A GitHub `ping` confirms the route and
+signature configuration.
+
+## Activate repository policy
+
+Edit `.lictor/policy.toml` before enabling execution. Absolute workspace roots
+are mandatory; explicit repository paths must resolve beneath one of them.
+
+```toml
+[defaults]
+execution = "approval"
+clone = "denied"
+
+[repositories]
+allow = ["edloidas/*"]
+deny = []
+workspaceRoots = ["/srv/lictor/repositories"]
+
+[repositories.overrides."edloidas/lictor"]
+execution = "automatic"
+clone = "allowed"
+workspace = "/srv/lictor/repositories/edloidas/lictor"
+
+[repositories.overrides."edloidas/lictor".capabilities]
+read = true
+comment = true
+issues = true
+branches = true
+pullRequests = true
+merge = false
+```
+
+When cloning is allowed, Lictor mints a short-lived installation token and
+passes it to Git without storing it in the remote URL or credential store.
+Existing clones are accepted only when their canonical path stays inside an
+allowed root and `origin` matches the delivery repository.
+
+Run a policy check before activation:
 
 ```bash
-bun dev         # watch mode — restarts on save
-bun run start   # one-shot
+bun cli policy.check edloidas/lictor
 ```
 
-Install and authenticate the Codex CLI before enabling execution. Set
-`LICTOR_EXECUTOR=disabled` to verify webhook ingestion and retain queued work
-without claiming it. Re-enable the executor and restart Lictor to process the
-pending queue.
+Then set `GITHUB_TRUSTED_SENDERS`, `GITHUB_TARGET_USERS`, and
+`LICTOR_EXECUTOR=codex` in `.env`, and restart the daemon.
 
-Lictor logs every queue transition with its job and attempt number. On startup,
-`Work queue ready` includes counts for pending, running, retry, interrupted,
-completed, and failed work. The SQLite file contains normalized metadata and
-agent output; protect and back it up like any other local application state.
+## Operate the daemon
 
-## Qualified interactions
-
-Lictor creates work only when the webhook sender appears in
-`GITHUB_TRUSTED_SENDERS` and a configured target is:
-
-- assigned to an issue or pull request;
-- requested to review a pull request; or
-- newly mentioned in an issue, pull request, review, or comment.
-
-Edited bodies trigger work only for mentions introduced by that edit. Matching
-is case-insensitive and exact, so `@adiutriel-bot` does not match `adiutriel`.
-Raw bodies and comments are neither stored nor passed to Codex; the worker sends
-bounded subject metadata and URLs, then lets Codex retrieve the current GitHub
-context with the credentials available in its environment.
-
-GitHub delivery IDs and a stable interaction identity make redelivery
-idempotent. If local ingestion fails, redeliver the event from the GitHub App's
-Advanced page. API polling and PAT-backed reconciliation are intentionally not
-part of this release.
-
-## Endpoints
-
-| Method | Path               | Response                                                     |
-| ------ | ------------------ | ------------------------------------------------------------ |
-| `GET`  | `/health`          | `200 ok`                                                     |
-| `POST` | `/webhooks/github` | `202` accepted · `401` bad or missing signature · `400` malformed |
-
-Rejections are deliberately uninformative: a caller that fails verification
-learns only that it failed, never which check rejected it.
-
-## Writing a handler
-
-A handler takes a `Delivery` and returns an `Effect` that cannot fail — it runs
-detached from the request, so there is nothing left to report an error to.
-Recover inside the handler and log what you swallowed.
-
-```typescript
-// src/handlers/issue-opened.ts
-import { Effect } from 'effect';
-import type { Handler } from '../webhook/router.ts';
-
-export const handleIssueOpened: Handler = (delivery) =>
-  Effect.logInfo('Issue opened').pipe(
-    Effect.annotateLogs({
-      repository: delivery.payload.repository?.full_name ?? '(none)',
-    }),
-  );
+```bash
+bun cli status
+bun cli job.list
+bun cli job.show 42
+bun cli job.approve 42
+bun cli job.retry 42
+bun cli job.cancel 42
+bun cli repository.list
+bun cli repository.inspect edloidas/lictor
+bun cli prune
+bun cli backup /secure/backups/lictor-$(date +%F).sqlite
 ```
 
-Register it in `src/handlers/index.ts`:
+Add `--json` to any command for automation. The CLI communicates only through
+the daemon socket; it never opens SQLite. Mutations are state-checked,
+idempotent, and written to the audit log.
 
-```typescript
-export const registry: Registry = {
-  ping: handlePing,
-  'issues.opened': handleIssueOpened,
-};
+`status` reports queue counts, the daemon heartbeat, oldest active job,
+executor mode, database size, and available disk. Jobs that exhaust their
+attempt budget or contain corrupt durable data move to `dead_letter` instead of
+blocking later work.
+
+## Retention, backup, and recovery
+
+Completed jobs are retained for 30 days and failed or dead-letter jobs for 90
+days by default. Change these windows in the policy:
+
+```toml
+[retention]
+completedDays = 30
+failedDays = 90
 ```
 
-Keys are the `X-GitHub-Event` name, optionally narrowed with the payload action.
-`issues.opened` wins over `issues` for the same delivery, and `issues` catches
-every action you did not name.
+`bun cli prune` applies the configured windows and checkpoints the WAL. The
+`backup` command uses SQLite's online backup path after a full WAL checkpoint,
+then creates the destination with mode `0600`.
 
-The shared envelope — `action`, `installation`, `repository`, `sender` — is
-already decoded. For anything event-specific, decode the payload again against
-your own `Schema`.
+To restore:
 
-## Calling the GitHub API
+1. Stop Lictor and confirm no daemon owns the database.
+2. Preserve the current database, `-wal`, and `-shm` files as one recovery set.
+3. Copy the verified backup to `LICTOR_DATABASE_PATH` and set mode `0600`.
+4. Start Lictor and run `bun cli status` before re-enabling execution.
 
-`GitHubClient.forInstallation` hands back an `HttpClient` already carrying an
-installation token, the API base URL, and the version pin:
+Never restore by replacing only the live main database while the daemon is
+running. SQLite state and its WAL must be treated as one consistency boundary.
 
-```typescript
-import { Effect } from 'effect';
-import { GitHubClient } from '../github/client.ts';
-import type { Handler } from '../webhook/router.ts';
+## Failure guarantees and limits
 
-export const handleIssueOpened: Handler = (delivery) =>
-  Effect.gen(function* () {
-    const installation = delivery.payload.installation?.id;
-    if (installation === undefined) return;
+- `202 Accepted` means the exact signed delivery is durably committed.
+- Storage failure returns `503`, leaving GitHub responsible for redelivery.
+- Duplicate delivery and interaction identities are idempotent.
+- One daemon owns the database; worker attempts use renewable fenced leases.
+- Expired work is retried within its attempt budget, then dead-lettered.
+- Queue depth, job age, per-repository attempts, and execution duration are
+  policy limits, not prompt instructions.
+- Codex receives an allowlisted environment without App keys, webhook secrets,
+  installation tokens, or ambient `gh` credentials.
+- Logs use stable error codes and omit raw payloads, parse values, credentials,
+  and agent stderr.
 
-    const github = yield* GitHubClient;
-    const client = yield* github.forInstallation(installation);
+The public request body limit defaults to 1 MiB. Configure operational limits
+in policy:
 
-    yield* client.get(`/repos/${delivery.payload.repository?.full_name}/issues`);
-  }).pipe(Effect.catchAll((error) => Effect.logError('Handler failed', error)));
+```toml
+[limits]
+maxQueueDepth = 10000
+maxJobAgeMinutes = 1440
+
+[limits.costs]
+maxAttempts = 3
+maxDurationMinutes = 30
 ```
 
-Tokens are cached per installation and renewed five minutes before they expire,
-so a busy repository does not spend a round trip per delivery.
-
-## Design notes
-
-### Why 202, and not 200
-
-GitHub marks a delivery failed if the endpoint takes longer than 10 seconds, and
-agent work is not bounded by that. The route verifies, decodes, forks the
-ingestion handler with `Effect.forkDaemon`, and acks — so the ack means
-*accepted*, not finished. Qualified work is persisted in SQLite before Codex
-claims it. A crash between the acknowledgement and that insert is recovered by
-manually replaying GitHub's retained delivery.
-
-### Why the raw body
-
-The HMAC covers the exact bytes GitHub sent. Parsing the JSON and
-re-serializing it changes key order and whitespace, which changes the digest —
-so verification reads `request.text` and always runs before parsing. A body that
-is not even JSON is rejected as `401`, not `400`: an unsigned caller learns
-nothing about how far it got.
+Repository overrides may tighten `costs`. Global executor configuration remains
+an upper bound, so a repository cannot expand machine-wide authority.
 
 ## Development
 
 ```bash
-bun install     # also installs the pre-commit hook
-bun check:fix   # typecheck + biome check --write (lint, format, import sort)
-bun test        # full suite — no network, every suite stubs GitHub
-bun validate    # full gate: check + coverage
+bun check:fix
+bun test
+bun validate
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and
-[CLAUDE.md](CLAUDE.md) for the constraints that are not lintable.
+Tests run without network access and replace GitHub/process boundaries. The
+validation gate enforces type checking, Biome, the complete test suite, and
+80% line/function coverage thresholds.
 
-## Contributing
-
-Bug reports and pull requests are welcome — open an
-[issue](https://github.com/edloidas/lictor/issues) first for anything larger
-than a fix.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution conventions and
+[CLAUDE.md](CLAUDE.md) for architecture constraints.
 
 ## License
 

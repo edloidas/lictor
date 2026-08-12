@@ -61,12 +61,16 @@ const run = <A, E>(
       workspaceRoots: ['/tmp'],
       completedRetentionDays: 30,
       failedRetentionDays: 90,
+      maxQueueDepth: 1000,
+      maxJobAgeMs: 86_400_000,
       forRepository: (repository) => ({
         repository,
         accepted: true,
         execution: 'automatic',
         clone: 'denied',
         workspace: '/tmp/lictor',
+        maxAttempts: 3,
+        maxDurationMs: 30 * 60 * 1000,
         capabilities: {
           read: true,
           comment: false,

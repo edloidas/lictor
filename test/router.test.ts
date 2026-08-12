@@ -78,6 +78,7 @@ const run = (registry: (log: Ref.Ref<string[]>) => Registry, received: Delivery)
           retry: () => Effect.die('the router must not reach the queue'),
           cancel: () => Effect.die('the router must not reach the queue'),
           diagnostics: Effect.die('the router must not reach the queue'),
+          backup: () => Effect.die('the router must not reach the queue'),
           ownerId: '00000000-0000-0000-0000-000000000000',
         }),
       ),

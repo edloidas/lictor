@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Clock, Effect, Layer, Redacted } from 'effect';
@@ -152,6 +152,18 @@ describe('WorkQueue', () => {
     );
     expect(result.claimed).toBeUndefined();
     expect(result.counts.pending).toBe(1);
+  });
+
+  it('rejects enqueue when the configured queue depth is exhausted', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(work('depth-1'), 1);
+        return yield* Effect.flip(queue.enqueue(work('depth-2'), 1));
+      }),
+    );
+    expect(result.operation).toBe('enqueue');
+    expect((result.cause as Error).message).toBe('QUEUE_DEPTH_LIMIT');
   });
 
   it('completes a claimed job', async () => {
@@ -402,6 +414,32 @@ describe('WorkQueue', () => {
       expect(result.report.completed).toBeGreaterThanOrEqual(1);
       expect(result.report.sizeBytes).toBeGreaterThan(0);
       expect(result.counts.completed).toBe(0);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('creates an owner-only WAL-consistent backup that SQLite can restore', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-backup-'));
+    const path = join(directory, 'queue.sqlite');
+    const backupPath = join(directory, 'backup', 'lictor.sqlite');
+    try {
+      const report = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* queue.enqueue(work('delivery-backup'));
+            return yield* queue.backup(backupPath);
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+      const restored = new Database(backupPath, { readonly: true });
+      const jobs = restored.query('SELECT COUNT(*) AS count FROM jobs').get() as { count: number };
+      restored.close();
+      expect(report.sizeBytes).toBeGreaterThan(0);
+      expect(jobs.count).toBe(1);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      expect(statSync(backupPath).mode & 0o777).toBe(0o600);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

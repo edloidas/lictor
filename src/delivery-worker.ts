@@ -32,7 +32,7 @@ export class DeliveryWorker extends Effect.Service<DeliveryWorker>()('DeliveryWo
         Effect.catchAllCause((cause) =>
           Cause.isInterruptedOnly(cause)
             ? Effect.interrupt
-            : queue.finishDelivery(stored.id, 'failed', String(cause)),
+            : queue.finishDelivery(stored.id, 'failed', 'DELIVERY_PROCESSING_FAILED'),
         ),
       );
       return true;

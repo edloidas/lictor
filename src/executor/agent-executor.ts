@@ -50,7 +50,12 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
     const config = yield* LictorConfig;
     const processes = yield* ProcessRunner;
 
-    const execute = (work: WorkItem, workdir = config.agentWorkdir) => {
+    const execute = (
+      work: WorkItem,
+      workdir = config.agentWorkdir,
+      timeoutMs = config.executorTimeoutMs,
+      jobId?: number,
+    ) => {
       if (config.executor === 'disabled') {
         return Effect.fail(
           new ExecutorError({ message: 'Agent execution is disabled', retryable: false }),
@@ -67,6 +72,19 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
             'never',
             '--model',
             config.codexModel,
+            ...(jobId === undefined
+              ? []
+              : [
+                  '-c',
+                  'mcp_servers.lictor.command="bun"',
+                  '-c',
+                  `mcp_servers.lictor.args=${JSON.stringify([
+                    'src/github/mcp-client.ts',
+                    config.controlSocketPath,
+                    String(jobId),
+                    Buffer.from(JSON.stringify(work)).toString('base64url'),
+                  ])}`,
+                ]),
             '--sandbox',
             'workspace-write',
             '--approve-for-me',
@@ -76,7 +94,7 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
           ],
           cwd: workdir,
           input: `${buildPrompt(work)}\n\nReturn only JSON matching {"status":"completed|needs_input|rejected|failed","summary":"bounded summary","artifacts":["relative/path"]}.`,
-          timeoutMs: config.executorTimeoutMs,
+          timeoutMs: Math.min(timeoutMs, config.executorTimeoutMs),
           outputLimitBytes: config.executorOutputBytes,
           env: {
             PATH: process.env.PATH ?? '/usr/bin:/bin',

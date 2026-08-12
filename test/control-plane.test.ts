@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { Effect, Layer, Redacted } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { ControlPlane, type ControlRequest, ControlServer } from '../src/control/control-plane.ts';
+import { CapabilityBroker } from '../src/github/capability-broker.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/webhook/qualification.ts';
@@ -82,8 +83,16 @@ describe('local control plane', () => {
       parsePolicy('[defaults]\nexecution = "approval"').pipe(Effect.map(Policy.make)),
     );
     const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
+    const BrokerLive = Layer.succeed(
+      CapabilityBroker,
+      CapabilityBroker.make({
+        callTool: () => Effect.die('unused'),
+        handleMcp: () => Effect.die('unused'),
+        listTools: [],
+      }),
+    );
     const PlaneLive = ControlPlane.DefaultWithoutDependencies.pipe(
-      Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive)),
+      Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, BrokerLive)),
     );
     const ServerLive = ControlServer.DefaultWithoutDependencies.pipe(
       Layer.provide(Layer.merge(ConfigLive, PlaneLive)),

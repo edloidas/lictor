@@ -25,9 +25,13 @@ describe('repository automation policy', () => {
         deleteBranches: false,
         scripts: [],
       },
+      maxAttempts: 3,
+      maxDurationMs: 30 * 60 * 1000,
     });
     expect(policy.completedRetentionDays).toBe(30);
     expect(policy.failedRetentionDays).toBe(90);
+    expect(policy.maxQueueDepth).toBe(10_000);
+    expect(policy.maxJobAgeMs).toBe(24 * 60 * 60 * 1000);
   });
 
   test('applies case-insensitive allow patterns with deny precedence', async () => {
@@ -119,6 +123,8 @@ execution = "automatic"
     ],
     ['fractional retention', '[retention]\ncompletedDays = 1.5'],
     ['excessive retention', '[retention]\nfailedDays = 3651'],
+    ['invalid queue limit', '[limits]\nmaxQueueDepth = 0'],
+    ['invalid repository cost', '[limits.costs]\nmaxDurationMinutes = 0'],
   ])('rejects %s', async (_name, source) => {
     const exit = await Effect.runPromiseExit(parsePolicy(source));
     expect(exit._tag).toBe('Failure');

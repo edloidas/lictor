@@ -2,8 +2,10 @@ import { chmodSync, mkdirSync, statfsSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Clock, Data, Effect } from 'effect';
 import { LictorConfig } from '../config.ts';
+import { CapabilityBroker } from '../github/capability-broker.ts';
 import { Policy } from '../policy.ts';
 import { WorkQueue } from '../queue/work-queue.ts';
+import type { WorkItem } from '../webhook/qualification.ts';
 
 export class ControlError extends Data.TaggedError('ControlError')<{
   readonly code: string;
@@ -33,6 +35,7 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
     const config = yield* LictorConfig;
     const policy = yield* Policy;
     const queue = yield* WorkQueue;
+    const broker = yield* CapabilityBroker;
 
     const mutate = (action: 'approve' | 'cancel' | 'retry', id: number) =>
       Effect.gen(function* () {
@@ -116,6 +119,39 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
               now - policy.failedRetentionDays * 86_400_000,
             );
           }
+          case 'backup': {
+            const destination = args[0];
+            if (destination === undefined) {
+              return yield* new ControlError({
+                code: 'CONTROL_BACKUP_PATH_REQUIRED',
+                message: 'A backup destination is required',
+              });
+            }
+            return yield* queue.backup(destination);
+          }
+          case 'capability.mcp': {
+            const jobId = yield* positiveId(args[0]);
+            const work = yield* Effect.try({
+              try: () =>
+                JSON.parse(Buffer.from(args[1] ?? '', 'base64url').toString('utf8')) as WorkItem,
+              catch: (cause) =>
+                new ControlError({
+                  code: 'CONTROL_CAPABILITY_CONTEXT_INVALID',
+                  message: 'Invalid capability context',
+                  cause,
+                }),
+            });
+            const mcp = yield* Effect.try({
+              try: () => JSON.parse(args[2] ?? '') as Parameters<typeof broker.handleMcp>[2],
+              catch: (cause) =>
+                new ControlError({
+                  code: 'CONTROL_CAPABILITY_REQUEST_INVALID',
+                  message: 'Invalid MCP request',
+                  cause,
+                }),
+            });
+            return yield* broker.handleMcp(jobId, work, mcp);
+          }
           default:
             return yield* new ControlError({
               code: 'CONTROL_COMMAND_UNKNOWN',
@@ -125,7 +161,7 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
       });
     return { execute };
   }),
-  dependencies: [LictorConfig.Default, Policy.Default, WorkQueue.Default],
+  dependencies: [LictorConfig.Default, Policy.Default, WorkQueue.Default, CapabilityBroker.Default],
 }) {}
 
 export class ControlServer extends Effect.Service<ControlServer>()('ControlServer', {

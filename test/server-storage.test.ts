@@ -55,6 +55,7 @@ const queue = (receiveDelivery: QueueService['receiveDelivery']) =>
     retry: () => Effect.die('unused'),
     cancel: () => Effect.die('unused'),
     diagnostics: Effect.die('unused'),
+    backup: () => Effect.die('unused'),
     ownerId: '00000000-0000-0000-0000-000000000000',
   });
 
