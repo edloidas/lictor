@@ -37,6 +37,29 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       databasePath: yield* Config.string('LICTOR_DATABASE_PATH').pipe(
         Config.withDefault('.lictor/lictor.sqlite'),
       ),
+      executor: yield* Config.literal(
+        'codex',
+        'disabled',
+      )('LICTOR_EXECUTOR').pipe(Config.withDefault('codex' as const)),
+      codexModel: yield* Config.string('LICTOR_CODEX_MODEL').pipe(
+        Config.withDefault('gpt-5.6-luna'),
+      ),
+      agentWorkdir: yield* Config.string('LICTOR_AGENT_WORKDIR').pipe(
+        Config.withDefault(process.cwd()),
+      ),
+      executorTimeoutMs: yield* Config.integer('LICTOR_EXECUTOR_TIMEOUT_MS').pipe(
+        Config.withDefault(30 * 60 * 1000),
+      ),
+      executorOutputBytes: yield* Config.integer('LICTOR_EXECUTOR_OUTPUT_BYTES').pipe(
+        Config.withDefault(256 * 1024),
+      ),
+      workerPollMs: yield* Config.integer('LICTOR_WORKER_POLL_MS').pipe(Config.withDefault(1000)),
+      workerMaxAttempts: yield* Config.integer('LICTOR_WORKER_MAX_ATTEMPTS').pipe(
+        Config.withDefault(3),
+      ),
+      workerRetryBaseMs: yield* Config.integer('LICTOR_WORKER_RETRY_BASE_MS').pipe(
+        Config.withDefault(30_000),
+      ),
     };
   }),
 }) {}

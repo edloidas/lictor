@@ -16,6 +16,14 @@ const config = (databasePath: string) =>
     trustedSenders: ['edloidas'],
     targetUsers: ['adiutriel'],
     databasePath,
+    executor: 'disabled',
+    codexModel: 'gpt-5.6-luna',
+    agentWorkdir: '.',
+    executorTimeoutMs: 1000,
+    executorOutputBytes: 1024,
+    workerPollMs: 10,
+    workerMaxAttempts: 3,
+    workerRetryBaseMs: 100,
   });
 
 const queueLayer = (databasePath = ':memory:') =>

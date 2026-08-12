@@ -85,9 +85,12 @@ export const router = HttpRouter.empty.pipe(
   HttpRouter.post(WEBHOOK_PATH, webhook),
 );
 
-/** The running server, minus its platform — `main.ts` supplies that. */
-export const ServerLive = HttpServer.serve(router, HttpMiddleware.logger).pipe(
+export const Server = HttpServer.serve(router, HttpMiddleware.logger).pipe(
   HttpServer.withLogAddress,
+);
+
+/** Self-contained server layer for route tests and embedding without a worker. */
+export const ServerLive = Server.pipe(
   Layer.provide(GitHubClient.Default),
   Layer.provide(WorkQueue.Default),
   Layer.provide(LictorConfig.Default),
