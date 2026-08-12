@@ -78,7 +78,7 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
               ? Effect.succeed(result.stdout)
               : Effect.fail(
                   new ExecutorError({
-                    message: `Codex exited with ${result.exitCode}: ${result.stderr}`,
+                    message: `Codex exited with status ${result.exitCode}`,
                     retryable: true,
                   }),
                 ),

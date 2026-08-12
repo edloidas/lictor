@@ -19,7 +19,15 @@ const WorkerLive = Worker.DefaultWithoutDependencies.pipe(
 const Services = Layer.mergeAll(ConfigLive, GitHubClient.Default, QueueLive, WorkerLive);
 const Application = Layer.merge(
   Server,
-  Layer.scopedDiscard(Effect.flatMap(Worker, (worker) => Effect.forkScoped(worker.run))),
+  Layer.scopedDiscard(
+    Effect.gen(function* () {
+      const queue = yield* WorkQueue;
+      const counts = yield* queue.counts;
+      yield* Effect.logInfo('Work queue ready').pipe(Effect.annotateLogs(counts));
+      const worker = yield* Worker;
+      yield* Effect.forkScoped(worker.run);
+    }),
+  ),
 ).pipe(Layer.provide(Services));
 
 const Main = Layer.unwrapEffect(

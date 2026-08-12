@@ -39,3 +39,12 @@ local process behind a tunnel and neither is expected to absorb load.
   installation.
 - Grant the App the narrowest permission set the handlers actually need.
   Installation tokens inherit the App's permissions in full.
+- Treat `LICTOR_AGENT_WORKDIR` as a security boundary. Codex receives
+  workspace-write access there; do not point it at a home directory or a folder
+  containing unrelated credentials.
+- Keep `GITHUB_TRUSTED_SENDERS` narrow. Target matching decides relevance, but
+  the sender list decides whose GitHub prose may trigger local agent work.
+- Protect `.lictor/lictor.sqlite`: it stores issue metadata, execution errors,
+  and bounded agent output. It does not store raw webhook bodies or comments.
+- `LICTOR_EXECUTOR=disabled` is the safe mode for validating a new webhook or
+  allowlist. Work remains pending until execution is re-enabled.

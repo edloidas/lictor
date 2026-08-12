@@ -138,7 +138,7 @@ describe('AgentExecutor', () => {
     );
 
     expect(error.retryable).toBe(true);
-    expect(error.message).toContain('temporary failure');
+    expect(error.message).toBe('Codex exited with status 2');
   });
 
   it('fails permanently without spawning when execution is disabled', async () => {
