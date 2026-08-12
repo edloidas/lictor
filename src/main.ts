@@ -1,6 +1,7 @@
 import { BunHttpServer, BunRuntime } from '@effect/platform-bun';
 import { Clock, Effect, Layer } from 'effect';
 import { LictorConfig, port } from './config.ts';
+import { ControlPlane, ControlServer } from './control/control-plane.ts';
 import { DeliveryWorker } from './delivery-worker.ts';
 import { AgentExecutor } from './executor/agent-executor.ts';
 import { ProcessRunner } from './executor/process-runner.ts';
@@ -21,6 +22,12 @@ const ExecutorLive = AgentExecutor.DefaultWithoutDependencies.pipe(
 const WorkspaceLive = RepositoryWorkspace.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.merge(ProcessRunner.Default, GitHubApp.Default)),
 );
+const ControlLive = ControlPlane.DefaultWithoutDependencies.pipe(
+  Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive)),
+);
+const ControlServerLive = ControlServer.DefaultWithoutDependencies.pipe(
+  Layer.provide(Layer.merge(ConfigLive, ControlLive)),
+);
 const WorkerLive = Worker.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, ExecutorLive, WorkspaceLive)),
 );
@@ -33,6 +40,8 @@ const Services = Layer.mergeAll(
   PolicyLive,
   QueueLive,
   WorkspaceLive,
+  ControlLive,
+  ControlServerLive,
   WorkerLive,
   DeliveryWorkerLive,
 );
@@ -42,6 +51,10 @@ const Application = Layer.merge(
     Effect.gen(function* () {
       const queue = yield* WorkQueue;
       const policy = yield* Policy;
+      const control = yield* ControlServer;
+      yield* Effect.logInfo('Local control socket ready').pipe(
+        Effect.annotateLogs({ path: control.path }),
+      );
       const counts = yield* queue.counts;
       yield* Effect.logInfo('Work queue ready').pipe(Effect.annotateLogs(counts));
       const worker = yield* Worker;

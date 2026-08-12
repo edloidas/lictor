@@ -41,6 +41,11 @@ export type QueuedJob = {
 };
 
 export type QueueCounts = Readonly<Record<JobStatus, number>>;
+export type JobDetails = QueuedJob & {
+  readonly lastError?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+};
 
 export class QueueError extends Data.TaggedError('QueueError')<{
   readonly operation: string;
@@ -624,6 +629,114 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           }[],
       );
 
+    const listJobs = (limit = 100) =>
+      attempt('list jobs', () => {
+        const rows = database
+          .query(
+            `SELECT id, payload, status, attempts, last_error AS lastError,
+               created_at AS createdAt, updated_at AS updatedAt
+             FROM jobs ORDER BY id DESC LIMIT ?`,
+          )
+          .all(Math.max(1, Math.min(1000, limit))) as readonly (JobRow & {
+          readonly lastError: string | null;
+          readonly createdAt: number;
+          readonly updatedAt: number;
+        })[];
+        return rows.flatMap((row) => {
+          try {
+            return [
+              {
+                ...decodeJob(row),
+                ...(row.lastError === null ? {} : { lastError: row.lastError }),
+                createdAt: row.createdAt,
+                updatedAt: row.updatedAt,
+              } satisfies JobDetails,
+            ];
+          } catch {
+            return [];
+          }
+        });
+      });
+
+    const job = (id: number) =>
+      listJobs(1000).pipe(Effect.map((jobs) => jobs.find((item) => item.id === id)));
+
+    const mutateJob = (id: number, action: 'approve' | 'cancel' | 'retry') =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        return yield* attempt(`${action} job`, () =>
+          database.transaction(() => {
+            const row = database.query('SELECT payload, status FROM jobs WHERE id = ?').get(id) as {
+              payload: string;
+              status: JobStatus;
+            } | null;
+            if (row === null) return false;
+            if (action === 'approve') {
+              const payload = JSON.parse(row.payload) as WorkItem;
+              if (payload.approvalRequired !== true || row.status !== 'pending') return false;
+              const { approvalRequired: _removed, ...approved } = payload;
+              return (
+                database
+                  .query(
+                    "UPDATE jobs SET payload = ?, updated_at = ? WHERE id = ? AND status = 'pending'",
+                  )
+                  .run(JSON.stringify(approved), now, id).changes === 1
+              );
+            }
+            if (action === 'retry') {
+              if (row.status !== 'failed' && row.status !== 'dead_letter') return false;
+              return (
+                database
+                  .query(
+                    `UPDATE jobs SET status = 'retry', available_at = ?, failed_at = NULL,
+                   retry_at = ?, last_error = NULL, updated_at = ? WHERE id = ?`,
+                  )
+                  .run(now, now, now, id).changes === 1
+              );
+            }
+            if (!['pending', 'retry', 'interrupted', 'running'].includes(row.status)) return false;
+            database
+              .query(
+                `UPDATE attempts SET status = 'interrupted', finished_at = ?, error = 'canceled by operator'
+               WHERE job_id = ? AND status = 'running'`,
+              )
+              .run(now, id);
+            return (
+              database
+                .query(
+                  `UPDATE jobs SET status = 'failed', failed_at = ?, worker_id = NULL,
+                 lease_expires_at = NULL, last_error = 'canceled by operator', updated_at = ? WHERE id = ?`,
+                )
+                .run(now, now, id).changes === 1
+            );
+          })(),
+        );
+      });
+
+    const diagnostics = Effect.gen(function* () {
+      const jobCounts = yield* counts;
+      return yield* attempt('queue diagnostics', () => {
+        const oldest = database
+          .query(
+            `SELECT MIN(created_at) AS createdAt FROM jobs
+           WHERE status IN ('pending', 'retry', 'interrupted', 'running')`,
+          )
+          .get() as { createdAt: number | null };
+        const daemon = database
+          .query(
+            'SELECT owner_id AS ownerId, heartbeat_at AS heartbeatAt FROM daemon_owner WHERE singleton = 1',
+          )
+          .get() as { ownerId: string; heartbeatAt: number } | null;
+        return {
+          counts: jobCounts,
+          oldestJobAt: oldest.createdAt,
+          workerHeartbeatAt: daemon?.heartbeatAt,
+          databaseSizeBytes:
+            config.databasePath === ':memory:' ? 0 : statSync(config.databasePath).size,
+        };
+      });
+    });
+
     return {
       receiveDelivery,
       claimDelivery,
@@ -642,6 +755,12 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       maintenance,
       recordAudit,
       auditLog,
+      listJobs,
+      job,
+      approve: (id: number) => mutateJob(id, 'approve'),
+      retry: (id: number) => mutateJob(id, 'retry'),
+      cancel: (id: number) => mutateJob(id, 'cancel'),
+      diagnostics,
       ownerId,
     };
   }),

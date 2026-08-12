@@ -32,6 +32,7 @@ const config = (executor: 'codex' | 'disabled' = 'codex') =>
     targetUsers: ['adiutriel'],
     databasePath: ':memory:',
     policyPath: 'policy.toml',
+    controlSocketPath: '/tmp/lictor.sock',
     webhookMaxBytes: 1024,
     executor,
     codexModel: 'gpt-5.6-luna',

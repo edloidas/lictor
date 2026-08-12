@@ -20,6 +20,7 @@
     "prepare": "git rev-parse --git-dir > /dev/null 2>&1 && git config core.hooksPath .githooks || exit 0",
     "dev": "bun --watch src/main.ts",
     "start": "bun src/main.ts",
+    "cli": "bun src/cli.ts",
     "tunnel": "cloudflared tunnel --url http://localhost:3000",
     "typecheck": "tsc --noEmit",
     "lint": "biome lint .",

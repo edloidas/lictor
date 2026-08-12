@@ -34,6 +34,7 @@ const config = (maxAttempts = 3) =>
     targetUsers: ['adiutriel'],
     databasePath: ':memory:',
     policyPath: 'policy.toml',
+    controlSocketPath: '/tmp/lictor.sock',
     webhookMaxBytes: 1024,
     executor: 'disabled',
     codexModel: 'gpt-5.6-luna',
