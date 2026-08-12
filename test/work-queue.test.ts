@@ -17,6 +17,7 @@ const config = (databasePath: string) =>
     targetUsers: ['adiutriel'],
     databasePath,
     policyPath: 'policy.toml',
+    controlSocketPath: '/tmp/lictor.sock',
     webhookMaxBytes: 1024,
     executor: 'disabled',
     codexModel: 'gpt-5.6-luna',

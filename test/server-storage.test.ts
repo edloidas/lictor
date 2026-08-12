@@ -17,6 +17,7 @@ const config = LictorConfig.make({
   targetUsers: [],
   databasePath: ':memory:',
   policyPath: 'policy.toml',
+  controlSocketPath: '/tmp/lictor.sock',
   webhookMaxBytes: 1024,
   executor: 'disabled',
   codexModel: 'gpt-5.6-luna',
@@ -48,6 +49,12 @@ const queue = (receiveDelivery: QueueService['receiveDelivery']) =>
     maintenance: () => Effect.die('unused'),
     recordAudit: () => Effect.die('unused'),
     auditLog: () => Effect.die('unused'),
+    listJobs: () => Effect.die('unused'),
+    job: () => Effect.die('unused'),
+    approve: () => Effect.die('unused'),
+    retry: () => Effect.die('unused'),
+    cancel: () => Effect.die('unused'),
+    diagnostics: Effect.die('unused'),
     ownerId: '00000000-0000-0000-0000-000000000000',
   });
 

@@ -49,6 +49,9 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       policyPath: yield* Config.string('LICTOR_POLICY_PATH').pipe(
         Config.withDefault('.lictor/policy.toml'),
       ),
+      controlSocketPath: yield* Config.string('LICTOR_SOCKET_PATH').pipe(
+        Config.withDefault('.lictor/lictor.sock'),
+      ),
       webhookMaxBytes: yield* positiveInteger(
         'LICTOR_WEBHOOK_MAX_BYTES',
         1024 * 1024,

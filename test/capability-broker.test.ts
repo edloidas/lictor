@@ -35,6 +35,7 @@ const ConfigLive = Layer.succeed(
     targetUsers: [],
     databasePath: ':memory:',
     policyPath: 'unused',
+    controlSocketPath: '/tmp/lictor.sock',
     webhookMaxBytes: 1024,
     executor: 'disabled',
     codexModel: 'gpt-5.6-luna',

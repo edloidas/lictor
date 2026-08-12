@@ -24,6 +24,7 @@ const ConfigLive = Layer.succeed(
     targetUsers: ['adiutriel'],
     databasePath: ':memory:',
     policyPath: 'policy.toml',
+    controlSocketPath: '/tmp/lictor.sock',
     webhookMaxBytes: 1024 * 1024,
     executor: 'disabled',
     codexModel: 'gpt-5.6-luna',
