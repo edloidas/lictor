@@ -291,7 +291,7 @@ describe('WorkQueue', () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
     const database = new Database(path, { create: true });
-    database.exec('PRAGMA user_version = 3');
+    database.exec('PRAGMA user_version = 5');
     database.close();
 
     try {

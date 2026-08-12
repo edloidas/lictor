@@ -69,6 +69,8 @@ const run = (registry: (log: Ref.Ref<string[]>) => Registry, received: Delivery)
           recoverStale: () => Effect.die('the router must not reach the queue'),
           counts: Effect.die('the router must not reach the queue'),
           maintenance: () => Effect.die('the router must not reach the queue'),
+          recordAudit: () => Effect.die('the router must not reach the queue'),
+          auditLog: () => Effect.die('the router must not reach the queue'),
           ownerId: '00000000-0000-0000-0000-000000000000',
         }),
       ),

@@ -46,6 +46,8 @@ const queue = (receiveDelivery: QueueService['receiveDelivery']) =>
     recoverStale: () => Effect.die('unused'),
     counts: Effect.die('unused'),
     maintenance: () => Effect.die('unused'),
+    recordAudit: () => Effect.die('unused'),
+    auditLog: () => Effect.die('unused'),
     ownerId: '00000000-0000-0000-0000-000000000000',
   });
 
