@@ -26,6 +26,7 @@ const InteractionPayload = Schema.Struct({
   action: Schema.String,
   sender: Actor,
   repository: Schema.Struct({ full_name: Schema.String }),
+  installation: Schema.optional(Schema.Struct({ id: Schema.Number })),
   issue: Schema.optional(Subject),
   pull_request: Schema.optional(Subject),
   comment: Schema.optional(Comment),
@@ -49,6 +50,7 @@ export type WorkItem = {
   readonly event: string;
   readonly action: string;
   readonly repository: string;
+  readonly installationId?: number;
   readonly sender: string;
   readonly targets: readonly string[];
   readonly reasons: readonly WorkReason[];
@@ -202,6 +204,7 @@ export const qualifyDelivery = (
         event: delivery.event,
         action: payload.action,
         repository: payload.repository.full_name,
+        ...(payload.installation === undefined ? {} : { installationId: payload.installation.id }),
         sender,
         targets: [...matched].sort(),
         reasons: [...reasons].sort(),

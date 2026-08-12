@@ -27,6 +27,7 @@ const delivery = (
     action,
     sender: { login: 'edloidas' },
     repository: { full_name: 'edloidas/lictor' },
+    installation: { id: 42 },
     ...raw,
   },
 });
@@ -47,6 +48,7 @@ describe('qualifyDelivery', () => {
       event: 'issues',
       action: 'assigned',
       repository: 'edloidas/lictor',
+      installationId: 42,
       sender: 'edloidas',
       targets: ['adiutriel'],
       reasons: ['assigned'],
