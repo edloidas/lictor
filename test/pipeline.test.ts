@@ -11,6 +11,7 @@ import { WorkQueue } from '../src/queue/work-queue.ts';
 import { Server, WEBHOOK_PATH } from '../src/server.ts';
 import { sign } from '../src/webhook/signature.ts';
 import { Worker } from '../src/worker.ts';
+import { RepositoryWorkspace } from '../src/workspace/repository-workspace.ts';
 
 const secret = 'pipeline-secret';
 const ConfigLive = Layer.succeed(
@@ -40,11 +41,11 @@ const ExecutorLive = Layer.succeed(
   AgentExecutor,
   AgentExecutor.make({
     enabled: true,
-    execute: () => Effect.sync(() => ++executionCount).pipe(Effect.as('agent completed')),
+    execute: () =>
+      Effect.sync(() => ++executionCount).pipe(
+        Effect.as({ status: 'completed' as const, summary: 'agent completed' }),
+      ),
   }),
-);
-const WorkerLive = Worker.DefaultWithoutDependencies.pipe(
-  Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, ExecutorLive)),
 );
 const GitHubLive = Layer.succeed(
   GitHubClient,
@@ -53,6 +54,22 @@ const GitHubLive = Layer.succeed(
 const PolicyLive = Layer.effect(
   Policy,
   parsePolicy('[defaults]\nexecution = "automatic"').pipe(Effect.map(Policy.make)),
+);
+const WorkspaceLive = Layer.succeed(
+  RepositoryWorkspace,
+  RepositoryWorkspace.make({
+    create: (_jobId, work) =>
+      Effect.succeed({
+        repository: work.repository,
+        clonePath: process.cwd(),
+        worktreePath: process.cwd(),
+      }),
+    cleanup: () => Effect.void,
+    withRepositoryLock: <A, E, R>(_repository: string, effect: Effect.Effect<A, E, R>) => effect,
+  }),
+);
+const WorkerLive = Worker.DefaultWithoutDependencies.pipe(
+  Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, ExecutorLive, PolicyLive, WorkspaceLive)),
 );
 const DeliveryWorkerLive = DeliveryWorker.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, GitHubLive, PolicyLive)),
@@ -64,6 +81,7 @@ const Services = Layer.mergeAll(
   DeliveryWorkerLive,
   GitHubLive,
   PolicyLive,
+  WorkspaceLive,
 );
 const Application = Layer.mergeAll(
   Server,

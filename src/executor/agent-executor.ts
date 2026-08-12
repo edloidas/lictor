@@ -1,4 +1,4 @@
-import { Data, Effect } from 'effect';
+import { Data, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
 import type { WorkItem } from '../webhook/qualification.ts';
 import { ProcessRunner } from './process-runner.ts';
@@ -8,6 +8,13 @@ export class ExecutorError extends Data.TaggedError('ExecutorError')<{
   readonly retryable: boolean;
   readonly cause?: unknown;
 }> {}
+
+const ExecutorResult = Schema.Struct({
+  status: Schema.Literal('completed', 'needs_input', 'rejected', 'failed'),
+  summary: Schema.String,
+  artifacts: Schema.optional(Schema.Array(Schema.String)),
+});
+export type ExecutorResult = Schema.Schema.Type<typeof ExecutorResult>;
 
 const bounded = (value: string, max: number): string =>
   Buffer.from(value)
@@ -43,7 +50,7 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
     const config = yield* LictorConfig;
     const processes = yield* ProcessRunner;
 
-    const execute = (work: WorkItem) => {
+    const execute = (work: WorkItem, workdir = config.agentWorkdir) => {
       if (config.executor === 'disabled') {
         return Effect.fail(
           new ExecutorError({ message: 'Agent execution is disabled', retryable: false }),
@@ -64,18 +71,43 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
             'workspace-write',
             '--approve-for-me',
             '--cd',
-            config.agentWorkdir,
+            workdir,
             '-',
           ],
-          cwd: config.agentWorkdir,
-          input: buildPrompt(work),
+          cwd: workdir,
+          input: `${buildPrompt(work)}\n\nReturn only JSON matching {"status":"completed|needs_input|rejected|failed","summary":"bounded summary","artifacts":["relative/path"]}.`,
           timeoutMs: config.executorTimeoutMs,
           outputLimitBytes: config.executorOutputBytes,
+          env: {
+            PATH: process.env.PATH ?? '/usr/bin:/bin',
+            HOME: process.env.HOME ?? workdir,
+            LANG: process.env.LANG ?? 'C.UTF-8',
+            ...(process.env.CODEX_HOME === undefined ? {} : { CODEX_HOME: process.env.CODEX_HOME }),
+          },
         })
         .pipe(
           Effect.flatMap((result) =>
             result.exitCode === 0
-              ? Effect.succeed(result.stdout)
+              ? Effect.try({
+                  try: () => JSON.parse(result.stdout) as unknown,
+                  catch: (cause) =>
+                    new ExecutorError({
+                      message: 'Codex returned a malformed result',
+                      retryable: false,
+                      cause,
+                    }),
+                }).pipe(
+                  Effect.flatMap(Schema.decodeUnknown(ExecutorResult)),
+                  Effect.map((value) => ({
+                    ...value,
+                    summary: bounded(value.summary, 4096),
+                    ...(value.artifacts === undefined
+                      ? {}
+                      : {
+                          artifacts: value.artifacts.slice(0, 50).map((path) => bounded(path, 512)),
+                        }),
+                  })),
+                )
               : Effect.fail(
                   new ExecutorError({
                     message: `Codex exited with status ${result.exitCode}`,
@@ -84,7 +116,7 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                 ),
           ),
           Effect.mapError((cause) =>
-            cause._tag === 'ExecutorError'
+            cause instanceof ExecutorError
               ? cause
               : new ExecutorError({
                   message: cause.message,

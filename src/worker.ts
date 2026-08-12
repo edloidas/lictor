@@ -1,13 +1,17 @@
-import { Clock, Effect } from 'effect';
+import { Clock, Effect, Exit } from 'effect';
 import { LictorConfig } from './config.ts';
 import { AgentExecutor, ExecutorError } from './executor/agent-executor.ts';
+import { Policy } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
+import { RepositoryWorkspace } from './workspace/repository-workspace.ts';
 
 export class Worker extends Effect.Service<Worker>()('Worker', {
   effect: Effect.gen(function* () {
     const config = yield* LictorConfig;
     const executor = yield* AgentExecutor;
     const queue = yield* WorkQueue;
+    const policy = yield* Policy;
+    const workspaces = yield* RepositoryWorkspace;
 
     const runOnce = Effect.gen(function* () {
       if (!executor.enabled) return false;
@@ -27,9 +31,43 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
             new ExecutorError({ message: 'Worker lease renewal failed', retryable: true, cause }),
         ),
       );
-      const result = yield* Effect.either(Effect.raceFirst(executor.execute(job.work), keepLease));
+      const repositoryPolicy = policy.forRepository(job.work.repository);
+      const execution = workspaces
+        .withRepositoryLock(
+          job.work.repository,
+          Effect.acquireUseRelease(
+            workspaces.create(job.id, job.work, repositoryPolicy, policy.workspaceRoots),
+            (workspace) => executor.execute(job.work, workspace.worktreePath),
+            (workspace, exit) =>
+              workspaces
+                .cleanup(workspace, Exit.isFailure(exit))
+                .pipe(
+                  Effect.catchAll((cause) =>
+                    Effect.logError('Workspace cleanup failed').pipe(
+                      Effect.annotateLogs({ job: job.id, error: cause.message }),
+                    ),
+                  ),
+                ),
+          ),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            cause instanceof ExecutorError
+              ? cause
+              : new ExecutorError({
+                  message: 'Could not prepare or clean up the isolated workspace',
+                  retryable: true,
+                  cause,
+                }),
+          ),
+        );
+      const result = yield* Effect.either(Effect.raceFirst(execution, keepLease));
       if (result._tag === 'Right') {
-        yield* queue.complete(job.id, job.attempts, result.right);
+        if (result.right.status === 'failed') {
+          yield* queue.fail(job.id, job.attempts, result.right.summary);
+          return true;
+        }
+        yield* queue.complete(job.id, job.attempts, JSON.stringify(result.right));
         yield* Effect.logInfo('Completed queued work').pipe(
           Effect.annotateLogs({ job: job.id, attempt: job.attempts }),
         );
@@ -66,5 +104,11 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
 
     return { runOnce, run };
   }),
-  dependencies: [LictorConfig.Default, AgentExecutor.Default, WorkQueue.Default],
+  dependencies: [
+    LictorConfig.Default,
+    AgentExecutor.Default,
+    WorkQueue.Default,
+    Policy.Default,
+    RepositoryWorkspace.Default,
+  ],
 }) {}

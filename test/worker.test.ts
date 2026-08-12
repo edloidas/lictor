@@ -2,9 +2,11 @@ import { describe, expect, it } from 'bun:test';
 import { Effect, Layer, Redacted } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { AgentExecutor, ExecutorError } from '../src/executor/agent-executor.ts';
+import { Policy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/webhook/qualification.ts';
 import { Worker } from '../src/worker.ts';
+import { RepositoryWorkspace } from '../src/workspace/repository-workspace.ts';
 
 const work: WorkItem = {
   deliveryId: 'delivery-1',
@@ -52,8 +54,47 @@ const run = <A, E>(
   const ConfigLive = Layer.succeed(LictorConfig, config(maxAttempts));
   const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
   const ExecutorLive = Layer.succeed(AgentExecutor, AgentExecutor.make({ enabled, execute }));
+  const PolicyLive = Layer.succeed(
+    Policy,
+    Policy.make({
+      workspaceRoots: ['/tmp'],
+      completedRetentionDays: 30,
+      failedRetentionDays: 90,
+      forRepository: (repository) => ({
+        repository,
+        accepted: true,
+        execution: 'automatic',
+        clone: 'denied',
+        workspace: '/tmp/lictor',
+        capabilities: {
+          read: true,
+          comment: false,
+          issues: false,
+          branches: false,
+          pullRequests: false,
+          merge: false,
+          forcePush: false,
+          deleteBranches: false,
+          scripts: [],
+        },
+      }),
+    }),
+  );
+  const WorkspaceLive = Layer.succeed(
+    RepositoryWorkspace,
+    RepositoryWorkspace.make({
+      create: () =>
+        Effect.succeed({
+          repository: work.repository,
+          clonePath: '/tmp/lictor',
+          worktreePath: '/tmp/lictor-job',
+        }),
+      cleanup: () => Effect.void,
+      withRepositoryLock: <A, E, R>(_repository: string, effect: Effect.Effect<A, E, R>) => effect,
+    }),
+  );
   const WorkerLive = Worker.DefaultWithoutDependencies.pipe(
-    Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, ExecutorLive)),
+    Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, ExecutorLive, PolicyLive, WorkspaceLive)),
   );
 
   return Effect.runPromise(
@@ -73,7 +114,7 @@ describe('Worker.runOnce', () => {
         const worked = yield* worker.runOnce;
         return { worked, counts: yield* queue.counts };
       }),
-      () => Effect.succeed('done'),
+      () => Effect.succeed({ status: 'completed', summary: 'done' }),
     );
 
     expect(result.worked).toBe(true);

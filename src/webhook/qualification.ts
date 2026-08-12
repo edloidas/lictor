@@ -51,6 +51,7 @@ export type WorkItem = {
   readonly action: string;
   readonly repository: string;
   readonly installationId?: number;
+  readonly approvalRequired?: boolean;
   readonly sender: string;
   readonly targets: readonly string[];
   readonly reasons: readonly WorkReason[];
