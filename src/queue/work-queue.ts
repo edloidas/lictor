@@ -58,8 +58,8 @@ const migrate = (database: Database) => {
   database.exec('PRAGMA journal_mode = WAL');
   database.exec('PRAGMA foreign_keys = ON');
   const version = database.query('PRAGMA user_version').get() as { user_version: number };
-  if (version.user_version === 3) return;
-  if (version.user_version > 3) {
+  if (version.user_version === 4) return;
+  if (version.user_version > 4) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -150,7 +150,18 @@ const migrate = (database: Database) => {
         heartbeat_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL
       );
-      PRAGMA user_version = 3;
+      CREATE TABLE IF NOT EXISTS capability_audit (
+        id INTEGER PRIMARY KEY,
+        job_id INTEGER NOT NULL,
+        repository TEXT NOT NULL,
+        installation_id INTEGER,
+        capability TEXT NOT NULL,
+        input TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS capability_audit_job ON capability_audit(job_id, id);
+      PRAGMA user_version = 4;
     `);
   })();
 };
@@ -565,6 +576,54 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         return { completed: Number(completed), failed: Number(failed), sizeBytes };
       });
 
+    const recordAudit = (entry: {
+      readonly jobId: number;
+      readonly repository: string;
+      readonly installationId?: number;
+      readonly capability: string;
+      readonly input: string;
+      readonly outcome: string;
+    }) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        yield* attempt('record capability audit', () => {
+          database
+            .query(
+              `INSERT INTO capability_audit
+                (job_id, repository, installation_id, capability, input, outcome, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              entry.jobId,
+              entry.repository,
+              entry.installationId ?? null,
+              entry.capability,
+              entry.input,
+              entry.outcome,
+              now,
+            );
+        });
+      });
+
+    const auditLog = (jobId: number) =>
+      attempt(
+        'list capability audit',
+        () =>
+          database
+            .query(
+              `SELECT repository, installation_id AS installationId, capability, input, outcome,
+                 created_at AS createdAt FROM capability_audit WHERE job_id = ? ORDER BY id`,
+            )
+            .all(jobId) as readonly {
+            readonly repository: string;
+            readonly installationId: number | null;
+            readonly capability: string;
+            readonly input: string;
+            readonly outcome: string;
+            readonly createdAt: number;
+          }[],
+      );
+
     return {
       receiveDelivery,
       claimDelivery,
@@ -581,6 +640,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       recoverStale,
       counts,
       maintenance,
+      recordAudit,
+      auditLog,
       ownerId,
     };
   }),
