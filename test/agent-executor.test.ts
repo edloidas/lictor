@@ -88,7 +88,12 @@ describe('AgentExecutor', () => {
         const runner = ProcessRunner.make({
           run: (input) =>
             Ref.set(observed, input).pipe(
-              Effect.as({ exitCode: 0, stdout: 'completed', stderr: '', outputTruncated: false }),
+              Effect.as({
+                exitCode: 0,
+                stdout: '{"status":"completed","summary":"completed"}',
+                stderr: '',
+                outputTruncated: false,
+              }),
             ),
         });
         const output = yield* Effect.promise(() =>
@@ -101,7 +106,7 @@ describe('AgentExecutor', () => {
       }),
     );
 
-    expect(request.output).toBe('completed');
+    expect(request.output).toEqual({ status: 'completed', summary: 'completed' });
     expect(request.request?.command).toEqual([
       'codex',
       'exec',
@@ -118,6 +123,9 @@ describe('AgentExecutor', () => {
       '-',
     ]);
     expect(request.request?.input).toContain('$(touch /tmp/nope)');
+    expect(request.request?.env).not.toHaveProperty('GITHUB_PRIVATE_KEY');
+    expect(request.request?.env).not.toHaveProperty('GITHUB_WEBHOOK_SECRET');
+    expect(request.request?.env).not.toHaveProperty('GH_TOKEN');
   });
 
   it('maps a nonzero Codex exit to a retryable executor failure', async () => {
@@ -156,5 +164,23 @@ describe('AgentExecutor', () => {
     );
 
     expect(error).toMatchObject({ retryable: false, message: 'Agent execution is disabled' });
+  });
+
+  it('rejects malformed structured output without exposing stderr', async () => {
+    const runner = ProcessRunner.make({
+      run: () =>
+        Effect.succeed({
+          exitCode: 0,
+          stdout: 'not-json',
+          stderr: 'GITHUB_PRIVATE_KEY=must-not-surface',
+          outputTruncated: false,
+        }),
+    });
+    const error = await runWith(
+      Effect.flatMap(AgentExecutor, (agent) => Effect.flip(agent.execute(work))),
+      runner,
+    );
+    expect(error.message).toBe('Codex returned a malformed result');
+    expect(String(error)).not.toContain('must-not-surface');
   });
 });

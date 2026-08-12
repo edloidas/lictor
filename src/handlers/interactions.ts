@@ -19,14 +19,17 @@ export const handleInteraction: Handler = (delivery) =>
     if (work === undefined) return;
     const policy = yield* Policy;
     const repositoryPolicy = policy.forRepository(work.repository);
-    if (!repositoryPolicy.accepted || repositoryPolicy.execution !== 'automatic') {
+    if (!repositoryPolicy.accepted || repositoryPolicy.execution === 'denied') {
       yield* Effect.logInfo('Dropped interaction denied by repository policy').pipe(
         Effect.annotateLogs({ delivery: work.deliveryId, repository: work.repository }),
       );
       return;
     }
     const queue = yield* WorkQueue;
-    const enqueued = yield* queue.enqueue(work);
+    const enqueued = yield* queue.enqueue({
+      ...work,
+      ...(repositoryPolicy.execution === 'approval' ? { approvalRequired: true } : {}),
+    });
 
     yield* Effect.logInfo(
       enqueued.inserted ? 'Queued GitHub interaction' : 'Ignored duplicate delivery',

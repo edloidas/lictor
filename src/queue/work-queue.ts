@@ -367,6 +367,9 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                   `SELECT id, payload, status, attempts
                FROM jobs
                WHERE status IN ('pending', 'retry', 'interrupted') AND available_at <= ?
+                 AND CASE WHEN json_valid(payload)
+                   THEN COALESCE(json_extract(payload, '$.approvalRequired'), 0)
+                   ELSE 0 END = 0
                ORDER BY available_at, id
                LIMIT 1`,
                 )

@@ -141,6 +141,18 @@ describe('WorkQueue', () => {
     expect(result.empty).toBeUndefined();
   });
 
+  it('keeps approval-required jobs pending and unclaimable', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue({ ...work('approval'), approvalRequired: true });
+        return { claimed: yield* queue.claim, counts: yield* queue.counts };
+      }),
+    );
+    expect(result.claimed).toBeUndefined();
+    expect(result.counts.pending).toBe(1);
+  });
+
   it('completes a claimed job', async () => {
     const counts = await run(
       Effect.gen(function* () {
