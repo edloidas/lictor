@@ -6,6 +6,7 @@ export type ProcessRequest = {
   readonly input: string;
   readonly timeoutMs: number;
   readonly outputLimitBytes: number;
+  readonly env?: Readonly<Record<string, string>>;
 };
 
 export type ProcessResult = {
@@ -72,6 +73,7 @@ export class ProcessRunner extends Effect.Service<ProcessRunner>()('ProcessRunne
               stdin: new Blob([request.input]),
               stdout: 'pipe',
               stderr: 'pipe',
+              ...(request.env === undefined ? {} : { env: request.env }),
             }),
           catch: (cause) => new ProcessError({ message: 'Could not start process', cause }),
         }),
