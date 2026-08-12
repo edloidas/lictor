@@ -1,6 +1,7 @@
 import { BunHttpServer, BunRuntime } from '@effect/platform-bun';
 import { Effect, Layer } from 'effect';
 import { LictorConfig, port } from './config.ts';
+import { DeliveryWorker } from './delivery-worker.ts';
 import { AgentExecutor } from './executor/agent-executor.ts';
 import { ProcessRunner } from './executor/process-runner.ts';
 import { GitHubClient } from './github/client.ts';
@@ -18,12 +19,16 @@ const ExecutorLive = AgentExecutor.DefaultWithoutDependencies.pipe(
 const WorkerLive = Worker.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, ExecutorLive)),
 );
+const DeliveryWorkerLive = DeliveryWorker.DefaultWithoutDependencies.pipe(
+  Layer.provide(Layer.mergeAll(ConfigLive, GitHubClient.Default, PolicyLive, QueueLive)),
+);
 const Services = Layer.mergeAll(
   ConfigLive,
   GitHubClient.Default,
   PolicyLive,
   QueueLive,
   WorkerLive,
+  DeliveryWorkerLive,
 );
 const Application = Layer.merge(
   Server,
@@ -34,6 +39,8 @@ const Application = Layer.merge(
       yield* Effect.logInfo('Work queue ready').pipe(Effect.annotateLogs(counts));
       const worker = yield* Worker;
       yield* Effect.forkScoped(worker.run);
+      const deliveryWorker = yield* DeliveryWorker;
+      yield* Effect.forkScoped(deliveryWorker.run);
     }),
   ),
 ).pipe(Layer.provide(Services));

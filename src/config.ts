@@ -49,6 +49,11 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       policyPath: yield* Config.string('LICTOR_POLICY_PATH').pipe(
         Config.withDefault('.lictor/policy.toml'),
       ),
+      webhookMaxBytes: yield* positiveInteger(
+        'LICTOR_WEBHOOK_MAX_BYTES',
+        1024 * 1024,
+        10 * 1024 * 1024,
+      ),
       executor: yield* Config.literal(
         'codex',
         'disabled',

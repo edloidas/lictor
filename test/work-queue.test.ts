@@ -17,6 +17,7 @@ const config = (databasePath: string) =>
     targetUsers: ['adiutriel'],
     databasePath,
     policyPath: 'policy.toml',
+    webhookMaxBytes: 1024,
     executor: 'disabled',
     codexModel: 'gpt-5.6-luna',
     agentWorkdir: '.',
@@ -53,6 +54,45 @@ const work = (deliveryId: string): WorkItem => ({
 });
 
 describe('WorkQueue', () => {
+  it('persists a delivery once and claims it exactly once', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const delivery = { id: 'delivery-1', event: 'issues', body: '{"action":"opened"}' };
+        const first = yield* queue.receiveDelivery(delivery);
+        const duplicate = yield* queue.receiveDelivery(delivery);
+        const claimed = yield* queue.claimDelivery;
+        const empty = yield* queue.claimDelivery;
+        return { first, duplicate, claimed, empty };
+      }),
+    );
+
+    expect(result.first.inserted).toBe(true);
+    expect(result.duplicate.inserted).toBe(false);
+    expect(result.claimed).toMatchObject({ id: 'delivery-1', status: 'processing', attempts: 1 });
+    expect(result.empty).toBeUndefined();
+  });
+
+  it('records completed and failed delivery processing', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.receiveDelivery({ id: 'completed', event: 'ping', body: '{}' });
+        yield* queue.claimDelivery;
+        yield* queue.finishDelivery('completed', 'completed');
+        yield* queue.receiveDelivery({ id: 'failed', event: 'issues', body: '{}' });
+        yield* queue.claimDelivery;
+        yield* queue.finishDelivery('failed', 'failed', 'invalid payload');
+        return {
+          completed: yield* queue.deliveryStatus('completed'),
+          failed: yield* queue.deliveryStatus('failed'),
+        };
+      }),
+    );
+
+    expect(result).toEqual({ completed: 'completed', failed: 'failed' });
+  });
+
   it('enqueues a delivery once and returns its existing job for duplicates', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -205,11 +245,41 @@ describe('WorkQueue', () => {
     }
   });
 
+  it('recovers a processing delivery when reopening a file database', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-inbox-'));
+    const path = join(directory, 'queue.sqlite');
+
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* queue.receiveDelivery({ id: 'delivery-1', event: 'ping', body: '{}' });
+            yield* queue.claimDelivery;
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      const recovered = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            return yield* queue.claimDelivery;
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(recovered).toMatchObject({ id: 'delivery-1', attempts: 2, status: 'processing' });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('refuses a database created by a newer queue schema', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
     const database = new Database(path, { create: true });
-    database.exec('PRAGMA user_version = 2');
+    database.exec('PRAGMA user_version = 3');
     database.close();
 
     try {

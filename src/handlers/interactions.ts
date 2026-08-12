@@ -41,13 +41,4 @@ export const handleInteraction: Handler = (delivery) =>
         subject: `${work.subject.kind}#${work.subject.number}`,
       }),
     );
-  }).pipe(
-    Effect.catchAll((error) =>
-      Effect.logWarning(
-        error._tag === 'QueueError'
-          ? 'Could not queue GitHub interaction'
-          : 'Dropped malformed interaction payload',
-        error,
-      ).pipe(Effect.annotateLogs({ delivery: delivery.id, event: delivery.event })),
-    ),
-  );
+  });

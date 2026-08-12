@@ -8,11 +8,9 @@ import {
 import { Effect, Layer, Redacted } from 'effect';
 import { LictorConfig } from './config.ts';
 import { GitHubClient } from './github/client.ts';
-import { registry } from './handlers/index.ts';
 import { Policy } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 import { decodePayload } from './webhook/event.ts';
-import { dispatch } from './webhook/router.ts';
 import {
   DELIVERY_HEADER,
   EVENT_HEADER,
@@ -33,6 +31,11 @@ const webhook = Effect.gen(function* () {
   const config = yield* LictorConfig;
   const request = yield* HttpServerRequest.HttpServerRequest;
 
+  const contentLength = Number(request.headers['content-length']);
+  if (Number.isFinite(contentLength) && contentLength > config.webhookMaxBytes) {
+    return HttpServerResponse.empty({ status: 413 });
+  }
+
   // ! Raw bytes, not `request.json`. The HMAC covers exactly what GitHub sent,
   // ! and re-serializing a parsed payload changes key order and whitespace.
   const body = yield* request.text;
@@ -48,6 +51,10 @@ const webhook = Effect.gen(function* () {
     return HttpServerResponse.empty({ status: 401 });
   }
 
+  if (new TextEncoder().encode(body).byteLength > config.webhookMaxBytes) {
+    return HttpServerResponse.empty({ status: 413 });
+  }
+
   const event = request.headers[EVENT_HEADER];
   const deliveryId = request.headers[DELIVERY_HEADER];
   if (event === undefined || deliveryId === undefined) {
@@ -59,24 +66,15 @@ const webhook = Effect.gen(function* () {
   // ! on a body that is merely malformed.
   const json = yield* Effect.try(() => JSON.parse(body) as unknown);
   const payload = yield* decodePayload(json);
-  const delivery = {
-    event,
-    id: deliveryId,
-    payload,
-    raw: json,
-  };
-
-  // ! Detached on purpose. GitHub gives a webhook 10 seconds before it records
-  // ! the delivery as failed, and handler work is not bounded by that. The
-  // ! delivery is durable on GitHub's side and replayable by id, so acking
-  // ! before the work finishes loses nothing we cannot re-request.
-  yield* Effect.forkDaemon(dispatch(registry)(delivery));
+  void payload;
+  const queue = yield* WorkQueue;
+  yield* queue.receiveDelivery({ id: deliveryId, event, body });
 
   return HttpServerResponse.empty({ status: 202 });
 }).pipe(
   Effect.catchAll((cause) =>
-    Effect.logError('Malformed delivery', cause).pipe(
-      Effect.as(HttpServerResponse.empty({ status: 400 })),
+    Effect.logError('Rejected delivery', cause).pipe(
+      Effect.as(HttpServerResponse.empty({ status: cause._tag === 'QueueError' ? 503 : 400 })),
     ),
   ),
 );

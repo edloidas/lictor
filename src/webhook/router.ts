@@ -1,18 +1,21 @@
-import { Effect } from 'effect';
+import { Effect, type ParseResult } from 'effect';
 import type { LictorConfig } from '../config.ts';
 import type { GitHubClient } from '../github/client.ts';
 import type { Policy } from '../policy.ts';
-import type { WorkQueue } from '../queue/work-queue.ts';
+import type { QueueError, WorkQueue } from '../queue/work-queue.ts';
 import { type Delivery, deliveryKey } from './event.ts';
+import type { MalformedInteraction } from './qualification.ts';
 
 /**
- * A handler must not fail: it runs detached from the request that triggered it,
- * so there is nothing left to report an error to. Recover inside the handler and
- * log what you swallowed.
+ * Handler failures are recorded by the durable delivery worker.
  */
 export type Handler = (
   delivery: Delivery,
-) => Effect.Effect<void, never, GitHubClient | LictorConfig | Policy | WorkQueue>;
+) => Effect.Effect<
+  void,
+  MalformedInteraction | ParseResult.ParseError | QueueError,
+  GitHubClient | LictorConfig | Policy | WorkQueue
+>;
 
 /**
  * Handlers are keyed by `X-GitHub-Event`, optionally narrowed with the payload
@@ -29,7 +32,11 @@ export const dispatch =
   (registry: Registry) =>
   (
     delivery: Delivery,
-  ): Effect.Effect<void, never, GitHubClient | LictorConfig | Policy | WorkQueue> =>
+  ): Effect.Effect<
+    void,
+    MalformedInteraction | ParseResult.ParseError | QueueError,
+    GitHubClient | LictorConfig | Policy | WorkQueue
+  > =>
     Effect.gen(function* () {
       const key = deliveryKey(delivery);
       const handler = registry[key] ?? registry[delivery.event];
