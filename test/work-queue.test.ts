@@ -179,7 +179,7 @@ describe('WorkQueue', () => {
         yield* queue.enqueue(work('delivery-1'));
         yield* queue.claim;
         const now = yield* Clock.currentTimeMillis;
-        const recovered = yield* queue.recoverStale(now + 1);
+        const recovered = yield* queue.recoverStale(now + 60_001);
         const retried = yield* queue.claim;
         return { recovered, retried, counts: yield* queue.counts };
       }),
@@ -198,7 +198,7 @@ describe('WorkQueue', () => {
         yield* queue.enqueue(work('delivery-1'));
         const stale = yield* queue.claim;
         const now = yield* Clock.currentTimeMillis;
-        yield* queue.recoverStale(now + 1);
+        yield* queue.recoverStale(now + 60_001);
         const current = yield* queue.claim;
         const staleResult = yield* Effect.either(
           queue.complete(stale?.id ?? -1, stale?.attempts ?? -1, 'stale'),
@@ -295,6 +295,100 @@ describe('WorkQueue', () => {
       );
 
       expect(exit._tag).toBe('Failure');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a second live daemon owner for one database', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-owner-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      const exit = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* WorkQueue;
+            return yield* Effect.exit(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))));
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+      expect(String(exit)).toContain('claim daemon ownership');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('dead-letters an expired claim at the attempt limit', async () => {
+    const counts = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.enqueue(work('delivery-dead'));
+          const claimed = yield* queue.claim;
+          yield* queue.recoverStale((claimed?.leaseExpiresAt ?? 0) + 1);
+          return yield* queue.counts;
+        }).pipe(
+          Effect.provide(
+            WorkQueue.DefaultWithoutDependencies.pipe(
+              Layer.provide(
+                Layer.succeed(LictorConfig, { ...config(':memory:'), workerMaxAttempts: 1 }),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(counts.dead_letter).toBe(1);
+  });
+
+  it('dead-letters a corrupt stored payload without wedging the queue', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-poison-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      const counts = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* Effect.sync(() => {
+              const writer = new Database(path);
+              writer
+                .query(
+                  `INSERT INTO jobs (delivery_id, interaction_id, payload, status, available_at, created_at, updated_at)
+                   VALUES ('poison', 'poison', '{', 'pending', 0, 0, 0)`,
+                )
+                .run();
+              writer.close();
+            });
+            expect(yield* queue.claim).toBeUndefined();
+            return yield* queue.counts;
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+      expect(counts.dead_letter).toBe(1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('prunes completed jobs at the retention boundary and reports size', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-maintenance-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* queue.enqueue(work('delivery-prune'));
+            const job = yield* queue.claim;
+            yield* queue.complete(job?.id ?? -1, job?.attempts ?? -1, 'done');
+            const report = yield* queue.maintenance(Date.now() + 1, Date.now() + 1);
+            return { report, counts: yield* queue.counts };
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+      expect(result.report.completed).toBeGreaterThanOrEqual(1);
+      expect(result.report.sizeBytes).toBeGreaterThan(0);
+      expect(result.counts.completed).toBe(0);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

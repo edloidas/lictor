@@ -1,5 +1,5 @@
 import { BunHttpServer, BunRuntime } from '@effect/platform-bun';
-import { Effect, Layer } from 'effect';
+import { Clock, Effect, Layer } from 'effect';
 import { LictorConfig, port } from './config.ts';
 import { DeliveryWorker } from './delivery-worker.ts';
 import { AgentExecutor } from './executor/agent-executor.ts';
@@ -35,10 +35,32 @@ const Application = Layer.merge(
   Layer.scopedDiscard(
     Effect.gen(function* () {
       const queue = yield* WorkQueue;
+      const policy = yield* Policy;
       const counts = yield* queue.counts;
       yield* Effect.logInfo('Work queue ready').pipe(Effect.annotateLogs(counts));
       const worker = yield* Worker;
       yield* Effect.forkScoped(worker.run);
+      yield* Effect.forkScoped(
+        Effect.forever(
+          Effect.gen(function* () {
+            yield* Effect.sleep('10 seconds');
+            yield* queue.heartbeatDaemon;
+            yield* queue.recoverStale(yield* Clock.currentTimeMillis);
+          }),
+        ),
+      );
+      yield* Effect.forkScoped(
+        Effect.forever(
+          Effect.gen(function* () {
+            yield* Effect.sleep('1 hour');
+            const now = yield* Clock.currentTimeMillis;
+            yield* queue.maintenance(
+              now - policy.completedRetentionDays * 86_400_000,
+              now - policy.failedRetentionDays * 86_400_000,
+            );
+          }),
+        ),
+      );
       const deliveryWorker = yield* DeliveryWorker;
       yield* Effect.forkScoped(deliveryWorker.run);
     }),

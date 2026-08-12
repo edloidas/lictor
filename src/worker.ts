@@ -1,6 +1,6 @@
 import { Clock, Effect } from 'effect';
 import { LictorConfig } from './config.ts';
-import { AgentExecutor } from './executor/agent-executor.ts';
+import { AgentExecutor, ExecutorError } from './executor/agent-executor.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 
 export class Worker extends Effect.Service<Worker>()('Worker', {
@@ -17,7 +17,17 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         Effect.annotateLogs({ job: job.id, attempt: job.attempts }),
       );
 
-      const result = yield* Effect.either(executor.execute(job.work));
+      const keepLease = Effect.forever(
+        Effect.sleep('30 seconds').pipe(
+          Effect.zipRight(queue.heartbeat(job.id, job.attempts, job.workerId ?? queue.ownerId)),
+        ),
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ExecutorError({ message: 'Worker lease renewal failed', retryable: true, cause }),
+        ),
+      );
+      const result = yield* Effect.either(Effect.raceFirst(executor.execute(job.work), keepLease));
       if (result._tag === 'Right') {
         yield* queue.complete(job.id, job.attempts, result.right);
         yield* Effect.logInfo('Completed queued work').pipe(

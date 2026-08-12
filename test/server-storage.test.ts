@@ -38,10 +38,15 @@ const queue = (receiveDelivery: QueueService['receiveDelivery']) =>
     deliveryStatus: () => Effect.die('unused'),
     enqueue: () => Effect.die('unused'),
     claim: Effect.die('unused'),
+    claimFor: () => Effect.die('unused'),
+    heartbeat: () => Effect.die('unused'),
+    heartbeatDaemon: Effect.die('unused'),
     complete: () => Effect.die('unused'),
     fail: () => Effect.die('unused'),
     recoverStale: () => Effect.die('unused'),
     counts: Effect.die('unused'),
+    maintenance: () => Effect.die('unused'),
+    ownerId: '00000000-0000-0000-0000-000000000000',
   });
 
 const request = Effect.gen(function* () {
