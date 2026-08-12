@@ -104,7 +104,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       Effect.sync(() => connection.close()),
     );
     const startupTime = yield* Clock.currentTimeMillis;
-    yield* attempt('recover startup jobs', () =>
+    const startupRecovered = yield* attempt('recover startup jobs', () =>
       database.transaction(() => {
         database
           .query(
@@ -112,16 +112,21 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
              WHERE status = 'running'`,
           )
           .run(startupTime);
-        database
+        return database
           .query(
             `UPDATE jobs
              SET status = 'interrupted', available_at = ?, claimed_at = NULL,
                  interrupted_at = ?, last_error = 'process restarted', updated_at = ?
              WHERE status = 'running'`,
           )
-          .run(startupTime, startupTime, startupTime);
+          .run(startupTime, startupTime, startupTime).changes;
       })(),
     );
+    if (Number(startupRecovered) > 0) {
+      yield* Effect.logWarning('Recovered interrupted work').pipe(
+        Effect.annotateLogs({ interrupted: Number(startupRecovered) }),
+      );
+    }
 
     const enqueue = (work: WorkItem) =>
       Effect.gen(function* () {

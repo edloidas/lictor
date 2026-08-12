@@ -13,6 +13,9 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       if (!executor.enabled) return false;
       const job = yield* queue.claim;
       if (job === undefined) return false;
+      yield* Effect.logInfo('Claimed queued work').pipe(
+        Effect.annotateLogs({ job: job.id, attempt: job.attempts }),
+      );
 
       const result = yield* Effect.either(executor.execute(job.work));
       if (result._tag === 'Right') {
