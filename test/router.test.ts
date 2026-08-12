@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { Effect, Ref } from 'effect';
+import { Effect, Redacted, Ref } from 'effect';
+import { LictorConfig } from '../src/config.ts';
 import { GitHubClient } from '../src/github/client.ts';
 import type { Delivery } from '../src/webhook/event.ts';
 import { dispatch, type Registry } from '../src/webhook/router.ts';
@@ -13,6 +14,7 @@ const delivery = (event: string, action?: string): Delivery => ({
   event,
   id: 'd-1',
   payload: action === undefined ? {} : { action },
+  raw: action === undefined ? {} : { action },
 });
 
 /** Runs a dispatch and reports which registry keys fired, in order. */
@@ -22,7 +24,19 @@ const run = (registry: (log: Ref.Ref<string[]>) => Registry, received: Delivery)
       const log = yield* Ref.make<string[]>([]);
       yield* dispatch(registry(log))(received);
       return yield* Ref.get(log);
-    }).pipe(Effect.provideService(GitHubClient, stubClient)),
+    }).pipe(
+      Effect.provideService(GitHubClient, stubClient),
+      Effect.provideService(
+        LictorConfig,
+        LictorConfig.make({
+          appId: '1',
+          privateKey: Redacted.make('unused'),
+          webhookSecret: Redacted.make('unused'),
+          trustedSenders: [],
+          targetUsers: [],
+        }),
+      ),
+    ),
   );
 
 const record = (log: Ref.Ref<string[]>, label: string) => () =>
