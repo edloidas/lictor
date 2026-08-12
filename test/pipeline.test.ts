@@ -3,6 +3,7 @@ import { HttpClient, HttpClientRequest } from '@effect/platform';
 import { BunHttpServer } from '@effect/platform-bun';
 import { Effect, Layer, Logger, Redacted, Schedule } from 'effect';
 import { LictorConfig } from '../src/config.ts';
+import { DeliveryWorker } from '../src/delivery-worker.ts';
 import { AgentExecutor } from '../src/executor/agent-executor.ts';
 import { GitHubClient } from '../src/github/client.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
@@ -22,6 +23,7 @@ const ConfigLive = Layer.succeed(
     targetUsers: ['adiutriel'],
     databasePath: ':memory:',
     policyPath: 'policy.toml',
+    webhookMaxBytes: 1024 * 1024,
     executor: 'disabled',
     codexModel: 'gpt-5.6-luna',
     agentWorkdir: '.',
@@ -52,10 +54,21 @@ const PolicyLive = Layer.effect(
   Policy,
   parsePolicy('[defaults]\nexecution = "automatic"').pipe(Effect.map(Policy.make)),
 );
-const Services = Layer.mergeAll(ConfigLive, QueueLive, WorkerLive, GitHubLive, PolicyLive);
-const Application = Layer.merge(
+const DeliveryWorkerLive = DeliveryWorker.DefaultWithoutDependencies.pipe(
+  Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, GitHubLive, PolicyLive)),
+);
+const Services = Layer.mergeAll(
+  ConfigLive,
+  QueueLive,
+  WorkerLive,
+  DeliveryWorkerLive,
+  GitHubLive,
+  PolicyLive,
+);
+const Application = Layer.mergeAll(
   Server,
   Layer.scopedDiscard(Effect.flatMap(Worker, (worker) => Effect.forkScoped(worker.run))),
+  Layer.scopedDiscard(Effect.flatMap(DeliveryWorker, (worker) => Effect.forkScoped(worker.run))),
 ).pipe(Layer.provide(Services));
 const TestApp = Layer.merge(Application, QueueLive).pipe(
   Layer.provide(BunHttpServer.layerTest),
@@ -103,6 +116,18 @@ describe('webhook-to-agent pipeline', () => {
                 'x-hub-signature-256': sign(body, secret),
               }),
               HttpClientRequest.bodyText(body, 'application/json'),
+            ),
+          );
+          const pingBody = JSON.stringify({ zen: 'durable ping', repository: null });
+          yield* client.execute(
+            HttpClientRequest.post(WEBHOOK_PATH).pipe(
+              HttpClientRequest.setHeaders({
+                'content-type': 'application/json',
+                'x-github-event': 'ping',
+                'x-github-delivery': 'pipeline-ping',
+                'x-hub-signature-256': sign(pingBody, secret),
+              }),
+              HttpClientRequest.bodyText(pingBody, 'application/json'),
             ),
           );
           const counts = yield* queue.counts.pipe(

@@ -32,6 +32,7 @@ const config = (maxAttempts = 3) =>
     targetUsers: ['adiutriel'],
     databasePath: ':memory:',
     policyPath: 'policy.toml',
+    webhookMaxBytes: 1024,
     executor: 'disabled',
     codexModel: 'gpt-5.6-luna',
     agentWorkdir: '.',

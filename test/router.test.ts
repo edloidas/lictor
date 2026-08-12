@@ -40,6 +40,7 @@ const run = (registry: (log: Ref.Ref<string[]>) => Registry, received: Delivery)
           targetUsers: [],
           databasePath: ':memory:',
           policyPath: 'policy.toml',
+          webhookMaxBytes: 1024,
           executor: 'disabled',
           codexModel: 'gpt-5.6-luna',
           agentWorkdir: '.',
@@ -53,6 +54,11 @@ const run = (registry: (log: Ref.Ref<string[]>) => Registry, received: Delivery)
       Effect.provideService(
         WorkQueue,
         WorkQueue.make({
+          receiveDelivery: () => Effect.die('the router must not receive deliveries'),
+          claimDelivery: Effect.die('the router must not claim deliveries'),
+          finishDelivery: () => Effect.die('the router must not finish deliveries'),
+          retryDelivery: () => Effect.die('the router must not retry deliveries'),
+          deliveryStatus: () => Effect.die('the router must not inspect deliveries'),
           enqueue: () => Effect.die('the router must not reach the queue'),
           claim: Effect.die('the router must not reach the queue'),
           complete: () => Effect.die('the router must not reach the queue'),

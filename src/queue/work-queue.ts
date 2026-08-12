@@ -5,6 +5,19 @@ import { Clock, Data, Effect } from 'effect';
 import { LictorConfig } from '../config.ts';
 import type { WorkItem } from '../webhook/qualification.ts';
 
+export type InboxStatus = 'pending' | 'processing' | 'completed' | 'failed';
+
+export type ReceivedDelivery = {
+  readonly id: string;
+  readonly event: string;
+  readonly body: string;
+};
+
+export type InboxDelivery = ReceivedDelivery & {
+  readonly status: InboxStatus;
+  readonly attempts: number;
+};
+
 export type JobStatus = 'completed' | 'failed' | 'interrupted' | 'pending' | 'retry' | 'running';
 
 export type QueuedJob = {
@@ -32,13 +45,14 @@ const migrate = (database: Database) => {
   database.exec('PRAGMA journal_mode = WAL');
   database.exec('PRAGMA foreign_keys = ON');
   const version = database.query('PRAGMA user_version').get() as { user_version: number };
-  if (version.user_version === 1) return;
-  if (version.user_version > 1) {
+  if (version.user_version === 2) return;
+  if (version.user_version > 2) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
   database.transaction(() => {
-    database.exec(`
+    if (version.user_version === 0)
+      database.exec(`
       CREATE TABLE jobs (
         id INTEGER PRIMARY KEY,
         delivery_id TEXT NOT NULL UNIQUE,
@@ -68,7 +82,21 @@ const migrate = (database: Database) => {
         output TEXT,
         UNIQUE(job_id, number)
       );
-      PRAGMA user_version = 1;
+    `);
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS deliveries (
+        id TEXT PRIMARY KEY,
+        event TEXT NOT NULL,
+        body TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        received_at INTEGER NOT NULL,
+        claimed_at INTEGER,
+        processed_at INTEGER,
+        last_error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS deliveries_claimable ON deliveries(status, received_at);
+      PRAGMA user_version = 2;
     `);
   })();
 };
@@ -127,6 +155,95 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         Effect.annotateLogs({ interrupted: Number(startupRecovered) }),
       );
     }
+
+    yield* attempt('recover startup deliveries', () =>
+      database
+        .query(
+          `UPDATE deliveries SET status = 'pending', claimed_at = NULL,
+             last_error = 'process restarted' WHERE status = 'processing'`,
+        )
+        .run(),
+    );
+
+    const receiveDelivery = (delivery: ReceivedDelivery) =>
+      Effect.gen(function* () {
+        if (new TextEncoder().encode(delivery.body).byteLength > config.webhookMaxBytes) {
+          return yield* new QueueError({
+            operation: 'receive delivery',
+            cause: new Error('Delivery body exceeds configured maximum'),
+          });
+        }
+        const now = yield* Clock.currentTimeMillis;
+        return yield* attempt('receive delivery', () => {
+          const result = database
+            .query(
+              `INSERT INTO deliveries (id, event, body, status, received_at)
+               VALUES (?, ?, ?, 'pending', ?)
+               ON CONFLICT(id) DO NOTHING`,
+            )
+            .run(delivery.id, delivery.event, delivery.body, now);
+          return { inserted: result.changes === 1 } as const;
+        });
+      });
+
+    const claimDelivery = Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      return yield* attempt('claim delivery', () =>
+        database
+          .transaction(() => {
+            const row = database
+              .query(
+                `SELECT id, event, body, status, attempts FROM deliveries
+                 WHERE status = 'pending' ORDER BY received_at, id LIMIT 1`,
+              )
+              .get() as InboxDelivery | null;
+            if (row === null) return undefined;
+            const attempts = row.attempts + 1;
+            database
+              .query(
+                `UPDATE deliveries SET status = 'processing', attempts = ?, claimed_at = ?
+                 WHERE id = ? AND status = 'pending'`,
+              )
+              .run(attempts, now, row.id);
+            return { ...row, status: 'processing' as const, attempts };
+          })
+          .immediate(),
+      );
+    });
+
+    const finishDelivery = (id: string, status: 'completed' | 'failed', error?: string) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        yield* attempt('finish delivery', () => {
+          const result = database
+            .query(
+              `UPDATE deliveries SET status = ?, processed_at = ?, last_error = ?
+               WHERE id = ? AND status = 'processing'`,
+            )
+            .run(status, now, error ?? null, id);
+          if (result.changes !== 1) throw new Error(`Delivery ${id} is not processing`);
+        });
+      });
+
+    const retryDelivery = (id: string, error: string) =>
+      attempt('retry delivery', () => {
+        const result = database
+          .query(
+            `UPDATE deliveries SET status = 'pending', claimed_at = NULL, last_error = ?
+             WHERE id = ? AND status = 'processing'`,
+          )
+          .run(error, id);
+        if (result.changes !== 1) throw new Error(`Delivery ${id} is not processing`);
+      });
+
+    const deliveryStatus = (id: string) =>
+      attempt(
+        'inspect delivery',
+        () =>
+          database.query('SELECT status FROM deliveries WHERE id = ?').get(id) as {
+            readonly status: InboxStatus;
+          } | null,
+      ).pipe(Effect.map((row) => row?.status));
 
     const enqueue = (work: WorkItem) =>
       Effect.gen(function* () {
@@ -284,7 +401,19 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       return result;
     });
 
-    return { enqueue, claim, complete, fail, recoverStale, counts };
+    return {
+      receiveDelivery,
+      claimDelivery,
+      finishDelivery,
+      retryDelivery,
+      deliveryStatus,
+      enqueue,
+      claim,
+      complete,
+      fail,
+      recoverStale,
+      counts,
+    };
   }),
   dependencies: [LictorConfig.Default],
 }) {}
