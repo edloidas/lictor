@@ -60,6 +60,7 @@ const webhook = Effect.gen(function* () {
     event,
     id: request.headers[DELIVERY_HEADER] ?? '(unknown)',
     payload,
+    raw: json,
   };
 
   // ! Detached on purpose. GitHub gives a webhook 10 seconds before it records

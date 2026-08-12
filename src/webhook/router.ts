@@ -1,4 +1,5 @@
 import { Effect } from 'effect';
+import type { LictorConfig } from '../config.ts';
 import type { GitHubClient } from '../github/client.ts';
 import { type Delivery, deliveryKey } from './event.ts';
 
@@ -7,7 +8,9 @@ import { type Delivery, deliveryKey } from './event.ts';
  * so there is nothing left to report an error to. Recover inside the handler and
  * log what you swallowed.
  */
-export type Handler = (delivery: Delivery) => Effect.Effect<void, never, GitHubClient>;
+export type Handler = (
+  delivery: Delivery,
+) => Effect.Effect<void, never, GitHubClient | LictorConfig>;
 
 /**
  * Handlers are keyed by `X-GitHub-Event`, optionally narrowed with the payload
@@ -22,7 +25,7 @@ export type Registry = Readonly<Record<string, Handler>>;
  */
 export const dispatch =
   (registry: Registry) =>
-  (delivery: Delivery): Effect.Effect<void, never, GitHubClient> =>
+  (delivery: Delivery): Effect.Effect<void, never, GitHubClient | LictorConfig> =>
     Effect.gen(function* () {
       const key = deliveryKey(delivery);
       const handler = registry[key] ?? registry[delivery.event];

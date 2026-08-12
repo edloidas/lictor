@@ -36,6 +36,8 @@ export type Delivery = {
   /** Value of `X-GitHub-Delivery`, the UUID GitHub replays by. */
   readonly id: string;
   readonly payload: WebhookPayload;
+  /** Verified JSON retained for event-specific schema decoding. */
+  readonly raw: unknown;
 };
 
 /** `issues.opened`-style key, or the bare event name when there is no action. */

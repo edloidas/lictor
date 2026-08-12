@@ -1,5 +1,18 @@
 import { Config, Effect } from 'effect';
 
+const loginList = (name: string) =>
+  Config.string(name).pipe(
+    Config.withDefault(''),
+    Config.map((value) => [
+      ...new Set(
+        value
+          .split(',')
+          .map((login) => login.trim().toLowerCase())
+          .filter(Boolean),
+      ),
+    ]),
+  );
+
 /**
  * Environment-backed configuration. Bun loads `.env` automatically, so nothing
  * here needs a dotenv shim — see `.env.example` for the expected keys.
@@ -16,6 +29,10 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       privateKey: yield* Config.redacted('GITHUB_PRIVATE_KEY'),
       /** Shared secret GitHub signs each delivery with. */
       webhookSecret: yield* Config.redacted('GITHUB_WEBHOOK_SECRET'),
+      /** GitHub users whose activity may create work. Empty trusts nobody. */
+      trustedSenders: yield* loginList('GITHUB_TRUSTED_SENDERS'),
+      /** GitHub users whose assignments and mentions may create work. */
+      targetUsers: yield* loginList('GITHUB_TARGET_USERS'),
     };
   }),
 }) {}

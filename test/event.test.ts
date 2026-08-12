@@ -60,6 +60,7 @@ describe('deliveryKey', () => {
     event: 'issues',
     id: 'd-1',
     payload,
+    raw: payload,
   });
 
   it('joins the event and action', () => {
