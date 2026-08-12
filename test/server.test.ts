@@ -23,6 +23,7 @@ const TestServer = ServerLive.pipe(
           ['GITHUB_PRIVATE_KEY', 'unused-by-these-routes'],
           ['GITHUB_WEBHOOK_SECRET', secret],
           ['LICTOR_DATABASE_PATH', ':memory:'],
+          ['LICTOR_POLICY_PATH', 'policy.example.toml'],
         ]),
       ),
     ),

@@ -31,6 +31,7 @@ const config = (maxAttempts = 3) =>
     trustedSenders: ['edloidas'],
     targetUsers: ['adiutriel'],
     databasePath: ':memory:',
+    policyPath: 'policy.toml',
     executor: 'disabled',
     codexModel: 'gpt-5.6-luna',
     agentWorkdir: '.',

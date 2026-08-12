@@ -31,6 +31,7 @@ const config = (executor: 'codex' | 'disabled' = 'codex') =>
     trustedSenders: ['edloidas'],
     targetUsers: ['adiutriel'],
     databasePath: ':memory:',
+    policyPath: 'policy.toml',
     executor,
     codexModel: 'gpt-5.6-luna',
     agentWorkdir: '/tmp/lictor-workspace',
