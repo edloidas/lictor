@@ -149,6 +149,42 @@ describe('RepositoryWorkspace', () => {
     }
   });
 
+  it('rejects a symlinked worktree root before Git writes through it', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'lictor-workspace-'));
+    const outside = mkdtempSync(join(tmpdir(), 'lictor-outside-'));
+    const owner = join(root, 'edloidas');
+    const clone = join(owner, 'lictor');
+    mkdirSync(clone, { recursive: true });
+    symlinkSync(outside, join(owner, '.lictor-worktrees'));
+    try {
+      const exit = await Effect.runPromiseExit(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const manager = yield* RepositoryWorkspace;
+            return yield* manager.create(10, work, policy(clone), [root]);
+          }).pipe(
+            Effect.provide(
+              service((request) =>
+                Effect.succeed({
+                  exitCode: 0,
+                  stdout: request.command.includes('get-url')
+                    ? 'https://github.com/edloidas/lictor.git\n'
+                    : '',
+                  stderr: '',
+                  outputTruncated: false,
+                }),
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(String(exit)).toContain('WORKSPACE_CREATE_FAILED');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   it('does not clone when policy denies it', async () => {
     const root = mkdtempSync(join(tmpdir(), 'lictor-workspace-'));
     try {

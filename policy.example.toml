@@ -14,7 +14,7 @@ deleteBranches = false
 scripts = []
 
 [repositories]
-allow = []
+allow = ["edloidas/lictor"]
 deny = []
 workspaceRoots = ["/absolute/path/to/repositories"]
 

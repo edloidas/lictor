@@ -1,4 +1,4 @@
-import { Clock, Effect, Exit } from 'effect';
+import { Clock, Effect, Exit, Ref } from 'effect';
 import { LictorConfig } from './config.ts';
 import { AgentExecutor, ExecutorError } from './executor/agent-executor.ts';
 import { Policy } from './policy.ts';
@@ -15,14 +15,14 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
 
     const runOnce = Effect.gen(function* () {
       if (!executor.enabled) return false;
-      const job = yield* queue.claim;
+      const job = yield* queue.claimFor(queue.ownerId, policy.maxJobAgeMs);
       if (job === undefined) return false;
       yield* Effect.logInfo('Claimed queued work').pipe(
         Effect.annotateLogs({ job: job.id, attempt: job.attempts }),
       );
 
       const keepLease = Effect.forever(
-        Effect.sleep('30 seconds').pipe(
+        Effect.sleep('1 second').pipe(
           Effect.zipRight(queue.heartbeat(job.id, job.attempts, job.workerId ?? queue.ownerId)),
         ),
       ).pipe(
@@ -34,27 +34,45 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       const repositoryPolicy = policy.forRepository(job.work.repository);
       const policyTime = yield* Clock.currentTimeMillis;
       if (
+        !repositoryPolicy.accepted ||
+        repositoryPolicy.execution === 'denied' ||
+        (repositoryPolicy.execution === 'approval' && job.work.approvalRequired !== false) ||
         job.attempts > repositoryPolicy.maxAttempts ||
         policyTime - job.createdAt > policy.maxJobAgeMs
       ) {
         yield* queue.fail(job.id, job.attempts, 'POLICY_COST_LIMIT');
         return true;
       }
+      const retainWorkspace = yield* Ref.make(false);
       const execution = workspaces
         .withRepositoryLock(
           job.work.repository,
           Effect.acquireUseRelease(
             workspaces.create(job.id, job.work, repositoryPolicy, policy.workspaceRoots),
             (workspace) =>
-              executor.execute(
-                job.work,
-                workspace.worktreePath,
-                repositoryPolicy.maxDurationMs,
-                job.id,
-              ),
+              executor
+                .execute(
+                  job.work,
+                  workspace.worktreePath,
+                  repositoryPolicy.maxDurationMs,
+                  job.id,
+                  job.attempts,
+                  job.workerId,
+                )
+                .pipe(
+                  Effect.tap((result) =>
+                    result.status === 'failed' && job.attempts < repositoryPolicy.maxAttempts
+                      ? Ref.set(retainWorkspace, true)
+                      : Effect.void,
+                  ),
+                ),
             (workspace, exit) =>
-              workspaces
-                .cleanup(workspace, Exit.isFailure(exit))
+              Ref.get(retainWorkspace)
+                .pipe(
+                  Effect.flatMap((retain) =>
+                    workspaces.cleanup(workspace, retain || Exit.isFailure(exit)),
+                  ),
+                )
                 .pipe(
                   Effect.catchAll((cause) =>
                     Effect.logError('Workspace cleanup failed').pipe(
@@ -77,8 +95,13 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         );
       const result = yield* Effect.either(Effect.raceFirst(execution, keepLease));
       if (result._tag === 'Right') {
-        if (result.right.status === 'failed') {
-          yield* queue.fail(job.id, job.attempts, result.right.summary);
+        if (result.right.status === 'failed' || result.right.status === 'needs_input') {
+          const retryAt =
+            result.right.status === 'failed' && job.attempts < repositoryPolicy.maxAttempts
+              ? (yield* Clock.currentTimeMillis) +
+                config.workerRetryBaseMs * 2 ** Math.max(0, job.attempts - 1)
+              : undefined;
+          yield* queue.fail(job.id, job.attempts, result.right.summary, retryAt);
           return true;
         }
         yield* queue.complete(job.id, job.attempts, JSON.stringify(result.right));

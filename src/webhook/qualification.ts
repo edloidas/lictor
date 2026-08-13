@@ -64,6 +64,26 @@ export type WorkItem = {
   readonly contextUrl?: string;
 };
 
+export const WorkItemSchema: Schema.Schema<WorkItem> = Schema.Struct({
+  deliveryId: Schema.String,
+  interactionId: Schema.String,
+  event: Schema.String,
+  action: Schema.String,
+  repository: Schema.String,
+  installationId: Schema.optionalWith(Schema.Number, { exact: true }),
+  approvalRequired: Schema.optionalWith(Schema.Boolean, { exact: true }),
+  sender: Schema.String,
+  targets: Schema.Array(Schema.String),
+  reasons: Schema.Array(Schema.Literal('assigned', 'mentioned', 'review_requested')),
+  subject: Schema.Struct({
+    kind: Schema.Literal('issue', 'pull_request'),
+    number: Schema.Number,
+    title: Schema.String,
+    url: Schema.String,
+  }),
+  contextUrl: Schema.optionalWith(Schema.String, { exact: true }),
+});
+
 export class MalformedInteraction extends Data.TaggedError('MalformedInteraction')<{
   readonly message: string;
 }> {}

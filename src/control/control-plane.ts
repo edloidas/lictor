@@ -5,7 +5,6 @@ import { LictorConfig } from '../config.ts';
 import { CapabilityBroker } from '../github/capability-broker.ts';
 import { Policy } from '../policy.ts';
 import { WorkQueue } from '../queue/work-queue.ts';
-import type { WorkItem } from '../webhook/qualification.ts';
 
 export class ControlError extends Data.TaggedError('ControlError')<{
   readonly code: string;
@@ -131,18 +130,16 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
           }
           case 'capability.mcp': {
             const jobId = yield* positiveId(args[0]);
-            const work = yield* Effect.try({
-              try: () =>
-                JSON.parse(Buffer.from(args[1] ?? '', 'base64url').toString('utf8')) as WorkItem,
-              catch: (cause) =>
-                new ControlError({
-                  code: 'CONTROL_CAPABILITY_CONTEXT_INVALID',
-                  message: 'Invalid capability context',
-                  cause,
-                }),
-            });
+            const attemptNumber = yield* positiveId(args[1]);
+            const workerId = args[2];
+            if (workerId === undefined || workerId === '') {
+              return yield* new ControlError({
+                code: 'CONTROL_WORKER_ID_INVALID',
+                message: 'A worker id is required',
+              });
+            }
             const mcp = yield* Effect.try({
-              try: () => JSON.parse(args[2] ?? '') as Parameters<typeof broker.handleMcp>[2],
+              try: () => JSON.parse(args[3] ?? '') as Parameters<typeof broker.handleMcp>[3],
               catch: (cause) =>
                 new ControlError({
                   code: 'CONTROL_CAPABILITY_REQUEST_INVALID',
@@ -150,7 +147,7 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
                   cause,
                 }),
             });
-            return yield* broker.handleMcp(jobId, work, mcp);
+            return yield* broker.handleMcp(jobId, attemptNumber, workerId, mcp);
           }
           default:
             return yield* new ControlError({
@@ -195,6 +192,10 @@ export class ControlServer extends Effect.Service<ControlServer>()('ControlServe
               },
               data(socket, chunk) {
                 socket.data.buffer += Buffer.from(chunk).toString('utf8');
+                if (Buffer.byteLength(socket.data.buffer) > 256 * 1024) {
+                  socket.end();
+                  return;
+                }
                 const newline = socket.data.buffer.indexOf('\n');
                 if (newline < 0) return;
                 const source = socket.data.buffer.slice(0, newline);

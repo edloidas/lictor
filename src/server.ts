@@ -5,7 +5,7 @@ import {
   HttpServerRequest,
   HttpServerResponse,
 } from '@effect/platform';
-import { Effect, Layer, Redacted } from 'effect';
+import { Effect, Layer, Option, Redacted } from 'effect';
 import { LictorConfig } from './config.ts';
 import { GitHubClient } from './github/client.ts';
 import { Policy } from './policy.ts';
@@ -38,7 +38,11 @@ const webhook = Effect.gen(function* () {
 
   // ! Raw bytes, not `request.json`. The HMAC covers exactly what GitHub sent,
   // ! and re-serializing a parsed payload changes key order and whitespace.
-  const body = yield* request.text;
+  const bodyResult = yield* Effect.either(
+    request.text.pipe(HttpServerRequest.withMaxBodySize(Option.some(config.webhookMaxBytes))),
+  );
+  if (bodyResult._tag === 'Left') return HttpServerResponse.empty({ status: 413 });
+  const body = bodyResult.right;
 
   const verified = verifySignature({
     body,

@@ -194,8 +194,7 @@ const makePolicy = (document: PolicyDocument): AutomationPolicy => {
   const forRepository = (input: string): RepositoryPolicy => {
     const repository = canonicalRepository(input);
     const denied = deny.some((pattern) => patternMatches(pattern, repository));
-    const allowed =
-      allow.length === 0 || allow.some((pattern) => patternMatches(pattern, repository));
+    const allowed = allow.some((pattern) => patternMatches(pattern, repository));
     const override = overrides.get(repository);
     const capabilities = {
       ...defaultCapabilities,
@@ -207,7 +206,7 @@ const makePolicy = (document: PolicyDocument): AutomationPolicy => {
     return {
       repository,
       accepted: allowed && !denied,
-      execution: override?.execution ?? defaults?.execution ?? 'denied',
+      execution: override?.execution ?? defaults?.execution ?? 'automatic',
       clone: override?.clone ?? defaults?.clone ?? 'denied',
       ...(override?.workspace === undefined
         ? {}

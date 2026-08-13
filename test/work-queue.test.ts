@@ -94,6 +94,22 @@ describe('WorkQueue', () => {
     expect(result).toEqual({ completed: 'completed', failed: 'failed' });
   });
 
+  it('makes a failed delivery pending when GitHub redelivers it', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const delivery = { id: 'redelivery', event: 'issues', body: '{"version":1}' };
+        yield* queue.receiveDelivery(delivery);
+        yield* queue.claimDelivery;
+        yield* queue.finishDelivery(delivery.id, 'failed', 'old decoder');
+        const received = yield* queue.receiveDelivery({ ...delivery, body: '{"version":2}' });
+        return { received, claimed: yield* queue.claimDelivery };
+      }),
+    );
+    expect(result.received.inserted).toBe(true);
+    expect(result.claimed).toMatchObject({ id: 'redelivery', body: '{"version":2}' });
+  });
+
   it('enqueues a delivery once and returns its existing job for duplicates', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -195,6 +211,30 @@ describe('WorkQueue', () => {
 
     expect(result.next).toBeUndefined();
     expect(result.counts.retry).toBe(1);
+  });
+
+  it('resets exhausted attempts when an operator retries a dead-letter job', async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.enqueue(work('operator-retry'));
+          const first = yield* queue.claim;
+          yield* queue.recoverStale((first?.leaseExpiresAt ?? 0) + 1);
+          yield* queue.retry(first?.id ?? -1);
+          return yield* queue.claim;
+        }).pipe(
+          Effect.provide(
+            WorkQueue.DefaultWithoutDependencies.pipe(
+              Layer.provide(
+                Layer.succeed(LictorConfig, { ...config(':memory:'), workerMaxAttempts: 1 }),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(result?.attempts).toBe(1);
   });
 
   it('recovers stale running work as retryable', async () => {
@@ -379,7 +419,7 @@ describe('WorkQueue', () => {
               writer
                 .query(
                   `INSERT INTO jobs (delivery_id, interaction_id, payload, status, available_at, created_at, updated_at)
-                   VALUES ('poison', 'poison', '{', 'pending', 0, 0, 0)`,
+                   VALUES ('poison', 'poison', '{}', 'pending', 0, 0, 0)`,
                 )
                 .run();
               writer.close();

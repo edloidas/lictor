@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { Data, Effect, PartitionedSemaphore, Redacted } from 'effect';
 import { ProcessRunner } from '../executor/process-runner.ts';
@@ -25,12 +25,15 @@ const within = (root: string, candidate: string): boolean => {
 
 const canonicalExisting = (path: string) => realpathSync(path);
 
+const nearestExistingParent = (path: string): string => {
+  let current = path;
+  while (!existsSync(current)) current = dirname(current);
+  return current;
+};
+
 const expectedRemote = (repository: string): RegExp => {
   const escaped = repository.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(
-    `^(?:https://github\\.com/|git@github\\.com:|ssh://git@github\\.com/)${escaped}(?:\\.git)?/?$`,
-    'i',
-  );
+  return new RegExp(`^https://github\\.com/${escaped}(?:\\.git)?/?$`, 'i');
 };
 
 export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
@@ -52,7 +55,16 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
           input: '',
           timeoutMs: 120_000,
           outputLimitBytes: 8192,
-          ...(env === undefined ? {} : { env }),
+          env: env ?? {
+            PATH: process.env.PATH ?? '/usr/bin:/bin',
+            HOME: '/var/empty',
+            LANG: process.env.LANG ?? 'C.UTF-8',
+            GIT_CONFIG_GLOBAL: '/dev/null',
+            GIT_CONFIG_SYSTEM: '/dev/null',
+            GIT_CONFIG_COUNT: '1',
+            GIT_CONFIG_KEY_0: 'core.hooksPath',
+            GIT_CONFIG_VALUE_0: '/dev/null',
+          },
         });
 
       const resolveClone = (work: WorkItem, policy: RepositoryPolicy, roots: readonly string[]) =>
@@ -95,7 +107,20 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
               });
             }
             yield* Effect.try({
-              try: () => mkdirSync(dirname(candidate), { recursive: true, mode: 0o700 }),
+              try: () => {
+                const canonicalRoot = canonicalExisting(allowedRoot);
+                const parent = nearestExistingParent(dirname(candidate));
+                if (
+                  lstatSync(parent).isSymbolicLink() ||
+                  !within(canonicalRoot, canonicalExisting(parent))
+                ) {
+                  throw new Error('Clone parent escapes its configured root');
+                }
+                mkdirSync(dirname(candidate), { recursive: true, mode: 0o700 });
+                if (!within(canonicalRoot, canonicalExisting(dirname(candidate)))) {
+                  throw new Error('Clone parent escapes its configured root');
+                }
+              },
               catch: (cause) =>
                 new WorkspaceError({
                   code: 'WORKSPACE_CREATE_FAILED',
@@ -109,10 +134,15 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
               dirname(candidate),
               {
                 PATH: process.env.PATH ?? '/usr/bin:/bin',
+                HOME: '/var/empty',
+                GIT_CONFIG_GLOBAL: '/dev/null',
+                GIT_CONFIG_SYSTEM: '/dev/null',
                 GIT_TERMINAL_PROMPT: '0',
-                GIT_CONFIG_COUNT: '1',
+                GIT_CONFIG_COUNT: '2',
                 GIT_CONFIG_KEY_0: 'http.https://github.com/.extraHeader',
                 GIT_CONFIG_VALUE_0: `Authorization: Bearer ${Redacted.value(token)}`,
+                GIT_CONFIG_KEY_1: 'core.hooksPath',
+                GIT_CONFIG_VALUE_1: '/dev/null',
               },
             );
             if (result.exitCode !== 0) {
@@ -144,6 +174,35 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
               message: 'Existing clone does not match the delivery repository',
             });
           }
+          if (work.installationId === undefined) {
+            return yield* new WorkspaceError({
+              code: 'WORKSPACE_INSTALLATION_MISSING',
+              message: 'Installation identity is required to refresh the repository',
+            });
+          }
+          const token = yield* app.token(work.installationId);
+          const fetch = yield* command(
+            ['git', '-C', canonical, 'fetch', '--prune', 'origin'],
+            canonical,
+            {
+              PATH: process.env.PATH ?? '/usr/bin:/bin',
+              HOME: '/var/empty',
+              GIT_CONFIG_GLOBAL: '/dev/null',
+              GIT_CONFIG_SYSTEM: '/dev/null',
+              GIT_TERMINAL_PROMPT: '0',
+              GIT_CONFIG_COUNT: '2',
+              GIT_CONFIG_KEY_0: 'http.https://github.com/.extraHeader',
+              GIT_CONFIG_VALUE_0: `Authorization: Bearer ${Redacted.value(token)}`,
+              GIT_CONFIG_KEY_1: 'core.hooksPath',
+              GIT_CONFIG_VALUE_1: '/dev/null',
+            },
+          );
+          if (fetch.exitCode !== 0) {
+            return yield* new WorkspaceError({
+              code: 'WORKSPACE_FETCH_FAILED',
+              message: 'Could not refresh repository state',
+            });
+          }
           return canonical;
         });
 
@@ -157,7 +216,18 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
           const clonePath = yield* resolveClone(work, policy, roots);
           const worktreeRoot = join(dirname(clonePath), '.lictor-worktrees');
           yield* Effect.try({
-            try: () => mkdirSync(worktreeRoot, { recursive: true, mode: 0o700 }),
+            try: () => {
+              mkdirSync(worktreeRoot, { recursive: true, mode: 0o700 });
+              const canonicalRoot = canonicalExisting(
+                roots.find((root) => within(resolve(root), resolve(clonePath))) ?? '',
+              );
+              if (
+                lstatSync(worktreeRoot).isSymbolicLink() ||
+                !within(canonicalRoot, canonicalExisting(worktreeRoot))
+              ) {
+                throw new Error('Worktree root escapes its configured root');
+              }
+            },
             catch: (cause) =>
               new WorkspaceError({
                 code: 'WORKSPACE_CREATE_FAILED',
@@ -166,8 +236,39 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
               }),
           });
           const worktreePath = join(worktreeRoot, `${basename(clonePath)}-${jobId}`);
+          if (existsSync(worktreePath)) {
+            if (
+              lstatSync(worktreePath).isSymbolicLink() ||
+              !within(canonicalExisting(worktreeRoot), canonicalExisting(worktreePath))
+            ) {
+              return yield* new WorkspaceError({
+                code: 'WORKSPACE_SYMLINK_ESCAPE',
+                message: 'Retained worktree escapes its root',
+              });
+            }
+            return {
+              repository: policy.repository,
+              clonePath,
+              worktreePath,
+            } satisfies JobWorkspace;
+          }
+          const head = yield* command(
+            ['git', '-C', clonePath, 'rev-parse', '--verify', 'origin/HEAD'],
+            clonePath,
+          );
           const result = yield* command(
-            ['git', '-C', clonePath, 'worktree', 'add', '--detach', worktreePath, 'HEAD'],
+            head.exitCode === 0
+              ? ['git', '-C', clonePath, 'worktree', 'add', '--detach', worktreePath, 'origin/HEAD']
+              : [
+                  'git',
+                  '-C',
+                  clonePath,
+                  'worktree',
+                  'add',
+                  '--orphan',
+                  `lictor/job-${jobId}`,
+                  worktreePath,
+                ],
             clonePath,
           );
           if (result.exitCode !== 0)

@@ -72,7 +72,12 @@ const run = <A, E>(effect: Effect.Effect<A, E, CapabilityBroker | WorkQueue>, so
           GitHubClient,
           GitHubClient.make({ forInstallation: () => Effect.succeed(scopedClient) }),
         );
-        const PolicyLive = Layer.effect(Policy, parsePolicy(source).pipe(Effect.map(Policy.make)));
+        const PolicyLive = Layer.effect(
+          Policy,
+          parsePolicy(`${source}\n[repositories]\nallow = ["edloidas/lictor"]`).pipe(
+            Effect.map(Policy.make),
+          ),
+        );
         const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
         const BrokerLive = CapabilityBroker.DefaultWithoutDependencies.pipe(
           Layer.provide(Layer.mergeAll(GitHubLive, PolicyLive, QueueLive)),
@@ -95,23 +100,90 @@ describe('CapabilityBroker', () => {
     expect(JSON.stringify(result.value)).toContain('get_issue');
   });
 
+  it('accepts the MCP initialization handshake', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        return yield* broker.handleMcp(13, {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+        });
+      }),
+      '[defaults.capabilities]\nread = true',
+    );
+    expect(result.value).toMatchObject({ result: { serverInfo: { name: 'lictor' } } });
+  });
+
+  it('rejects capability calls after the durable job is canceled', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        yield* queue.cancel(enqueued.jobId);
+        return yield* Effect.exit(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'get_repository',
+            input: {},
+          }),
+        );
+      }),
+      '[defaults.capabilities]\nread = true',
+    );
+    expect(String(result.value)).toContain('CAPABILITY_JOB_INACTIVE');
+    expect(result.requests).toHaveLength(0);
+  });
+
+  it('rejects a capability session after the job moves to a new attempt', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const stale = yield* queue.claim;
+        yield* queue.recoverStale((stale?.leaseExpiresAt ?? 0) + 1);
+        yield* queue.claim;
+        return yield* Effect.exit(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: stale?.attempts ?? -1,
+            workerId: stale?.workerId ?? '',
+            name: 'get_repository',
+            input: {},
+          }),
+        );
+      }),
+      '[defaults.capabilities]\nread = true',
+    );
+    expect(String(result.value)).toContain('CAPABILITY_ATTEMPT_STALE');
+    expect(result.requests).toHaveLength(0);
+  });
+
   it('executes an allowed read with the job installation and audits it', async () => {
     const result = await run(
       Effect.gen(function* () {
         const broker = yield* CapabilityBroker;
         const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
         const response = yield* broker.callTool({
-          jobId: 13,
-          work,
+          jobId: enqueued.jobId,
+          attemptNumber: claimed?.attempts ?? -1,
+          workerId: claimed?.workerId ?? '',
           name: 'get_issue',
           input: { number: 13 },
         });
-        return { response, audit: yield* queue.auditLog(13) };
+        return { response, audit: yield* queue.auditLog(enqueued.jobId) };
       }),
       '[defaults.capabilities]\nread = true',
     );
     expect(result.requests[0]).toContain('/repos/edloidas/lictor/issues/13');
-    expect(result.value.audit[0]).toMatchObject({
+    expect(result.value.audit.at(-1)).toMatchObject({
       repository: 'edloidas/lictor',
       installationId: 42,
       capability: 'get_issue',
@@ -125,15 +197,18 @@ describe('CapabilityBroker', () => {
       Effect.gen(function* () {
         const broker = yield* CapabilityBroker;
         const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
         const exit = yield* Effect.exit(
           broker.callTool({
-            jobId: 13,
-            work,
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
             name: 'create_comment',
             input: { number: 13, body: 'hello', token: 'hidden' },
           }),
         );
-        return { exit, audit: yield* queue.auditLog(13) };
+        return { exit, audit: yield* queue.auditLog(enqueued.jobId) };
       }),
       '[defaults.capabilities]\nread = true\ncomment = false',
     );
@@ -146,10 +221,14 @@ describe('CapabilityBroker', () => {
     const result = await run(
       Effect.gen(function* () {
         const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
         return yield* Effect.exit(
           broker.callTool({
-            jobId: 13,
-            work,
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
             name: 'get_repository',
             input: { repository: 'other/repo' },
           }),

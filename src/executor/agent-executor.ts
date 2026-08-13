@@ -1,3 +1,5 @@
+import { mkdirSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { Data, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
 import type { WorkItem } from '../webhook/qualification.ts';
@@ -49,12 +51,18 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
   effect: Effect.gen(function* () {
     const config = yield* LictorConfig;
     const processes = yield* ProcessRunner;
+    const mcpClientPath = join(import.meta.dir, '../github/mcp-client.ts');
+    const controlSocketPath = resolve(config.controlSocketPath);
+    const codexHome = join(dirname(resolve(config.databasePath)), 'codex');
+    yield* Effect.sync(() => mkdirSync(codexHome, { recursive: true, mode: 0o700 }));
 
     const execute = (
       work: WorkItem,
       workdir = config.agentWorkdir,
       timeoutMs = config.executorTimeoutMs,
       jobId?: number,
+      attemptNumber?: number,
+      workerId?: string,
     ) => {
       if (config.executor === 'disabled') {
         return Effect.fail(
@@ -79,10 +87,11 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                   'mcp_servers.lictor.command="bun"',
                   '-c',
                   `mcp_servers.lictor.args=${JSON.stringify([
-                    'src/github/mcp-client.ts',
-                    config.controlSocketPath,
+                    mcpClientPath,
+                    controlSocketPath,
                     String(jobId),
-                    Buffer.from(JSON.stringify(work)).toString('base64url'),
+                    String(attemptNumber),
+                    workerId ?? '',
                   ])}`,
                 ]),
             '--sandbox',
@@ -98,9 +107,9 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
           outputLimitBytes: config.executorOutputBytes,
           env: {
             PATH: process.env.PATH ?? '/usr/bin:/bin',
-            HOME: process.env.HOME ?? workdir,
+            HOME: workdir,
             LANG: process.env.LANG ?? 'C.UTF-8',
-            ...(process.env.CODEX_HOME === undefined ? {} : { CODEX_HOME: process.env.CODEX_HOME }),
+            CODEX_HOME: codexHome,
           },
         })
         .pipe(

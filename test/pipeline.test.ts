@@ -54,7 +54,9 @@ const GitHubLive = Layer.succeed(
 );
 const PolicyLive = Layer.effect(
   Policy,
-  parsePolicy('[defaults]\nexecution = "automatic"').pipe(Effect.map(Policy.make)),
+  parsePolicy(
+    '[defaults]\nexecution = "automatic"\n[repositories]\nallow = ["edloidas/lictor"]',
+  ).pipe(Effect.map(Policy.make)),
 );
 const WorkspaceLive = Layer.succeed(
   RepositoryWorkspace,
