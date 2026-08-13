@@ -2,9 +2,9 @@ import { Database } from 'bun:sqlite';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { Clock, Data, Effect } from 'effect';
+import { Clock, Data, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
-import type { WorkItem } from '../webhook/qualification.ts';
+import { type WorkItem, WorkItemSchema } from '../webhook/qualification.ts';
 
 const WORKER_LEASE_MS = 60_000;
 const DAEMON_LEASE_MS = 30_000;
@@ -59,6 +59,8 @@ type JobRow = {
   readonly status: JobStatus;
   readonly attempts: number;
   readonly createdAt: number;
+  readonly workerId?: string | null;
+  readonly leaseExpiresAt?: number | null;
 };
 
 const migrate = (database: Database) => {
@@ -74,7 +76,7 @@ const migrate = (database: Database) => {
     if (version.user_version === 0)
       database.exec(`
       CREATE TABLE jobs (
-        id INTEGER PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         delivery_id TEXT NOT NULL UNIQUE,
         interaction_id TEXT NOT NULL UNIQUE,
         payload TEXT NOT NULL,
@@ -121,10 +123,11 @@ const migrate = (database: Database) => {
     `);
     if (version.user_version > 0 && version.user_version < 3) {
       database.exec(`
+        ALTER TABLE attempts RENAME TO attempts_v2;
         ALTER TABLE jobs RENAME TO jobs_v2;
         DROP INDEX IF EXISTS jobs_claimable;
         CREATE TABLE jobs (
-          id INTEGER PRIMARY KEY,
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
           delivery_id TEXT NOT NULL UNIQUE,
           interaction_id TEXT NOT NULL UNIQUE,
           payload TEXT NOT NULL,
@@ -146,7 +149,25 @@ const migrate = (database: Database) => {
           claimed_at, completed_at, failed_at, retry_at, interrupted_at, last_error, created_at, updated_at)
           SELECT id, delivery_id, interaction_id, payload, status, attempts, available_at,
           claimed_at, completed_at, failed_at, retry_at, interrupted_at, last_error, created_at, updated_at FROM jobs_v2;
+        CREATE TABLE attempts (
+          id INTEGER PRIMARY KEY,
+          job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+          number INTEGER NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'interrupted')),
+          started_at INTEGER NOT NULL,
+          finished_at INTEGER,
+          error TEXT,
+          output TEXT,
+          UNIQUE(job_id, number)
+        );
+        INSERT INTO attempts SELECT * FROM attempts_v2;
+        DROP TABLE attempts_v2;
         DROP TABLE jobs_v2;
+        UPDATE attempts SET status = 'interrupted', finished_at = COALESCE(finished_at, started_at),
+          error = COALESCE(error, 'migrated without a lease') WHERE status = 'running';
+        UPDATE jobs SET status = 'interrupted', available_at = updated_at,
+          interrupted_at = updated_at, last_error = 'migrated without a lease'
+          WHERE status = 'running' AND lease_expires_at IS NULL;
       `);
     }
     database.exec(`
@@ -198,10 +219,12 @@ const attempt = <A>(operation: string, body: () => A) =>
 
 const decodeJob = (row: JobRow): QueuedJob => ({
   id: row.id,
-  work: JSON.parse(row.payload) as WorkItem,
+  work: Schema.decodeUnknownSync(WorkItemSchema)(JSON.parse(row.payload)),
   status: row.status,
   attempts: row.attempts,
   createdAt: row.createdAt,
+  ...(row.workerId == null ? {} : { workerId: row.workerId }),
+  ...(row.leaseExpiresAt == null ? {} : { leaseExpiresAt: row.leaseExpiresAt }),
 });
 
 export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
@@ -296,7 +319,9 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             .query(
               `INSERT INTO deliveries (id, event, body, status, received_at)
                VALUES (?, ?, ?, 'pending', ?)
-               ON CONFLICT(id) DO NOTHING`,
+              ON CONFLICT(id) DO UPDATE SET event = excluded.event, body = excluded.body,
+                status = 'pending', claimed_at = NULL, processed_at = NULL, last_error = NULL
+              WHERE deliveries.status = 'failed'`,
             )
             .run(delivery.id, delivery.event, delivery.body, now);
           return { inserted: result.changes === 1 } as const;
@@ -342,14 +367,23 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         });
       });
 
-    const retryDelivery = (id: string, error: string) =>
+    const retryDelivery = (id: string, error: string, terminalAfterAttempts = true) =>
       attempt('retry delivery', () => {
         const result = database
           .query(
-            `UPDATE deliveries SET status = 'pending', claimed_at = NULL, last_error = ?
+            `UPDATE deliveries SET
+               status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
+               claimed_at = NULL,
+               processed_at = CASE WHEN attempts >= ? THEN unixepoch('subsec') * 1000 ELSE NULL END,
+               last_error = ?
              WHERE id = ? AND status = 'processing'`,
           )
-          .run(error, id);
+          .run(
+            terminalAfterAttempts ? config.workerMaxAttempts : Number.MAX_SAFE_INTEGER,
+            terminalAfterAttempts ? config.workerMaxAttempts : Number.MAX_SAFE_INTEGER,
+            error,
+            id,
+          );
         if (result.changes !== 1) throw new Error(`Delivery ${id} is not processing`);
       });
 
@@ -366,6 +400,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         return yield* attempt('enqueue', () => {
+          const existing = database
+            .query('SELECT id FROM jobs WHERE delivery_id = ? OR interaction_id = ?')
+            .get(work.deliveryId, work.interactionId) as { id: number } | null;
+          if (existing !== null) return { jobId: existing.id, inserted: false } as const;
           const active = database
             .query(
               "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('pending', 'retry', 'interrupted', 'running')",
@@ -387,7 +425,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         });
       });
 
-    const claimFor = (workerId: string) =>
+    const claimFor = (workerId: string, maxJobAgeMs = Number.POSITIVE_INFINITY) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         return yield* attempt('claim', () =>
@@ -398,13 +436,18 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                   `SELECT id, payload, status, attempts, created_at AS createdAt
                FROM jobs
                WHERE status IN ('pending', 'retry', 'interrupted') AND available_at <= ?
-                 AND CASE WHEN json_valid(payload)
-                   THEN COALESCE(json_extract(payload, '$.approvalRequired'), 0)
-                   ELSE 0 END = 0
+                 AND (
+                   CASE WHEN json_valid(payload)
+                     THEN COALESCE(json_extract(payload, '$.approvalRequired'), 0)
+                     ELSE 0 END = 0
+                   OR created_at <= ?
+                   OR json_type(payload, '$.repository') IS NULL
+                   OR json_type(payload, '$.subject') IS NULL
+                 )
                ORDER BY available_at, id
                LIMIT 1`,
                 )
-                .get(now) as JobRow | null;
+                .get(now, Number.isFinite(maxJobAgeMs) ? now - maxJobAgeMs : -1) as JobRow | null;
               if (row === null) return undefined;
 
               const attemptNumber = row.attempts + 1;
@@ -462,9 +505,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           const result = database
             .query(
               `UPDATE jobs SET lease_expires_at = ?, updated_at = ?
-               WHERE id = ? AND status = 'running' AND attempts = ? AND worker_id = ?`,
+               WHERE id = ? AND status = 'running' AND attempts = ? AND worker_id = ?
+                 AND lease_expires_at > ?`,
             )
-            .run(now + WORKER_LEASE_MS, now, jobId, attemptNumber, workerId);
+            .run(now + WORKER_LEASE_MS, now, jobId, attemptNumber, workerId, now);
           if (result.changes !== 1)
             throw new Error(`Job ${jobId} attempt ${attemptNumber} is stale`);
         });
@@ -557,10 +601,19 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                 `UPDATE jobs
                  SET status = CASE WHEN attempts >= ? THEN 'dead_letter' ELSE 'interrupted' END,
                      available_at = ?, claimed_at = NULL, worker_id = NULL, lease_expires_at = NULL,
-                     interrupted_at = ?, last_error = 'worker interrupted', updated_at = ?
+                     interrupted_at = ?, failed_at = CASE WHEN attempts >= ? THEN ? ELSE failed_at END,
+                     last_error = 'worker interrupted', updated_at = ?
                  WHERE status = 'running' AND lease_expires_at < ?`,
               )
-              .run(config.workerMaxAttempts, now, now, now, olderThan).changes;
+              .run(
+                config.workerMaxAttempts,
+                now,
+                now,
+                config.workerMaxAttempts,
+                now,
+                now,
+                olderThan,
+              ).changes;
           })(),
         );
       });
@@ -584,12 +637,27 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
 
     const maintenance = (completedBefore: number, failedBefore: number) =>
       attempt('maintain queue', () => {
+        database
+          .query(
+            `DELETE FROM capability_audit WHERE job_id IN
+             (SELECT id FROM jobs WHERE
+               (status = 'completed' AND completed_at < ?) OR
+               (status IN ('failed', 'dead_letter') AND failed_at < ?))`,
+          )
+          .run(completedBefore, failedBefore);
         const completed = database
           .query("DELETE FROM jobs WHERE status = 'completed' AND completed_at < ?")
           .run(completedBefore).changes;
         const failed = database
           .query("DELETE FROM jobs WHERE status IN ('failed', 'dead_letter') AND failed_at < ?")
           .run(failedBefore).changes;
+        database
+          .query(
+            `DELETE FROM deliveries WHERE
+             (status = 'completed' AND processed_at < ?) OR
+             (status = 'failed' AND processed_at < ?)`,
+          )
+          .run(completedBefore, failedBefore);
         database.exec('PRAGMA wal_checkpoint(PASSIVE)');
         const sizeBytes =
           config.databasePath === ':memory:' ? 0 : statSync(config.databasePath).size;
@@ -674,7 +742,30 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       });
 
     const job = (id: number) =>
-      listJobs(1000).pipe(Effect.map((jobs) => jobs.find((item) => item.id === id)));
+      attempt('inspect job', () => {
+        const row = database
+          .query(
+            `SELECT id, payload, status, attempts, last_error AS lastError,
+               created_at AS createdAt, updated_at AS updatedAt,
+               worker_id AS workerId, lease_expires_at AS leaseExpiresAt
+             FROM jobs WHERE id = ?`,
+          )
+          .get(id) as
+          | (JobRow & {
+              readonly lastError: string | null;
+              readonly createdAt: number;
+              readonly updatedAt: number;
+            })
+          | null;
+        if (row === null) return undefined;
+        const decoded = decodeJob(row);
+        return {
+          ...decoded,
+          ...(row.lastError === null ? {} : { lastError: row.lastError }),
+          createdAt: row.createdAt,
+          updatedAt: row.updatedAt,
+        } satisfies JobDetails;
+      });
 
     const mutateJob = (id: number, action: 'approve' | 'cancel' | 'retry') =>
       Effect.gen(function* () {
@@ -689,21 +780,22 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             if (action === 'approve') {
               const payload = JSON.parse(row.payload) as WorkItem;
               if (payload.approvalRequired !== true || row.status !== 'pending') return false;
-              const { approvalRequired: _removed, ...approved } = payload;
               return (
                 database
                   .query(
                     "UPDATE jobs SET payload = ?, updated_at = ? WHERE id = ? AND status = 'pending'",
                   )
-                  .run(JSON.stringify(approved), now, id).changes === 1
+                  .run(JSON.stringify({ ...payload, approvalRequired: false }), now, id).changes ===
+                1
               );
             }
             if (action === 'retry') {
               if (row.status !== 'failed' && row.status !== 'dead_letter') return false;
+              database.query('DELETE FROM attempts WHERE job_id = ?').run(id);
               return (
                 database
                   .query(
-                    `UPDATE jobs SET status = 'retry', available_at = ?, failed_at = NULL,
+                    `UPDATE jobs SET status = 'retry', attempts = 0, available_at = ?, failed_at = NULL,
                    retry_at = ?, last_error = NULL, updated_at = ? WHERE id = ?`,
                   )
                   .run(now, now, now, id).changes === 1

@@ -17,8 +17,8 @@ const load = (values: Map<string, string>) =>
   );
 
 describe('LictorConfig', () => {
-  test('disables execution when no executor is configured', async () => {
-    expect((await Effect.runPromise(load(required))).executor).toBe('disabled');
+  test('enables autonomous execution when no executor is configured', async () => {
+    expect((await Effect.runPromise(load(required))).executor).toBe('codex');
   });
 
   test.each([

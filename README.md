@@ -99,6 +99,13 @@ Run a policy check before activation:
 bun cli policy.check edloidas/lictor
 ```
 
+Authenticate the daemon-owned Codex home once. It lives beside the configured
+SQLite database and is never taken from a managed repository:
+
+```bash
+CODEX_HOME=.lictor/codex codex login
+```
+
 Then set `GITHUB_TRUSTED_SENDERS`, `GITHUB_TARGET_USERS`, and
 `LICTOR_EXECUTOR=codex` in `.env`, and restart the daemon.
 

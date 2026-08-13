@@ -60,7 +60,7 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       executor: yield* Config.literal(
         'codex',
         'disabled',
-      )('LICTOR_EXECUTOR').pipe(Config.withDefault('disabled' as const)),
+      )('LICTOR_EXECUTOR').pipe(Config.withDefault('codex' as const)),
       codexModel: yield* Config.string('LICTOR_CODEX_MODEL').pipe(
         Config.withDefault('gpt-5.6-luna'),
       ),

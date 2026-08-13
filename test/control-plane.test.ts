@@ -120,7 +120,7 @@ describe('local control plane', () => {
       );
       expect(result.approved).toMatchObject({ ok: true, result: { changed: true, jobId: 1 } });
       expect(result.status).toMatchObject({ ok: true, result: { executor: 'disabled' } });
-      expect(result.claimed?.work.approvalRequired).toBeUndefined();
+      expect(result.claimed?.work.approvalRequired).toBe(false);
       expect(result.mode).toBe(0o600);
     } finally {
       rmSync(directory, { recursive: true, force: true });

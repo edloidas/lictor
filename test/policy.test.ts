@@ -11,8 +11,8 @@ describe('repository automation policy', () => {
 
     expect(repository).toEqual({
       repository: 'edloidas/lictor',
-      accepted: true,
-      execution: 'denied',
+      accepted: false,
+      execution: 'automatic',
       clone: 'denied',
       capabilities: {
         read: true,

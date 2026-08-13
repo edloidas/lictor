@@ -28,7 +28,24 @@ export class DeliveryWorker extends Effect.Service<DeliveryWorker>()('DeliveryWo
         yield* queue.finishDelivery(stored.id, 'completed');
       });
       yield* process.pipe(
-        Effect.catchTag('QueueError', (error) => queue.retryDelivery(stored.id, String(error))),
+        Effect.catchTag('QueueError', (error) =>
+          queue
+            .retryDelivery(
+              stored.id,
+              String(error),
+              (error.cause as Error | undefined)?.message !== 'QUEUE_DEPTH_LIMIT',
+            )
+            .pipe(
+              Effect.zipRight(
+                Effect.sleep(
+                  Math.min(
+                    config.workerRetryBaseMs * 2 ** Math.max(0, stored.attempts - 1),
+                    60_000,
+                  ),
+                ),
+              ),
+            ),
+        ),
         Effect.catchAllCause((cause) =>
           Cause.isInterruptedOnly(cause)
             ? Effect.interrupt

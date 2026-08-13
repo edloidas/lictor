@@ -71,6 +71,12 @@ const Application = Layer.merge(
             yield* queue.heartbeatDaemon;
             yield* queue.recoverStale(yield* Clock.currentTimeMillis);
           }),
+        ).pipe(
+          Effect.tapError((cause) =>
+            Effect.logFatal('Daemon ownership heartbeat failed', cause).pipe(
+              Effect.zipRight(Effect.sync(() => process.kill(process.pid, 'SIGTERM'))),
+            ),
+          ),
         ),
       );
       yield* Effect.forkScoped(

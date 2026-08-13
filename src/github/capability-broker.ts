@@ -1,21 +1,24 @@
 import { HttpClientRequest } from '@effect/platform';
-import { Data, Effect } from 'effect';
+import { Clock, Data, Effect } from 'effect';
 import { Policy } from '../policy.ts';
 import { WorkQueue } from '../queue/work-queue.ts';
-import type { WorkItem } from '../webhook/qualification.ts';
 import { GitHubClient } from './client.ts';
 
 export type BrokerTool =
   | 'create_branch'
+  | 'create_blob'
   | 'create_comment'
   | 'create_commit'
+  | 'create_tree'
   | 'create_pull_request'
   | 'get_issue'
   | 'get_pull_request'
   | 'get_repository'
   | 'list_comments'
   | 'list_review_threads'
+  | 'list_review_comments'
   | 'merge_pull_request'
+  | 'update_branch'
   | 'update_issue';
 
 export class CapabilityError extends Data.TaggedError('CapabilityError')<{
@@ -32,19 +35,61 @@ const capabilities: Readonly<
   get_repository: 'read',
   list_comments: 'read',
   list_review_threads: 'read',
+  list_review_comments: 'read',
   create_comment: 'comment',
   update_issue: 'issues',
   create_branch: 'branches',
+  create_blob: 'branches',
   create_commit: 'branches',
+  create_tree: 'branches',
   create_pull_request: 'pullRequests',
   merge_pull_request: 'merge',
+  update_branch: 'branches',
 };
 
 const number = (input: Readonly<Record<string, unknown>>, name: string): number => {
   const value = input[name];
   if (!Number.isInteger(value) || Number(value) < 1)
-    throw new Error(`${name} must be a positive integer`);
+    throw new CapabilityError({
+      code: 'CAPABILITY_INPUT_INVALID',
+      message: `${name} must be a positive integer`,
+    });
   return Number(value);
+};
+
+const branchRef = (input: Readonly<Record<string, unknown>>): string => {
+  const value = input.ref;
+  if (typeof value !== 'string' || !/^heads\/[a-z0-9._/-]+$/i.test(value) || value.includes('..')) {
+    throw new CapabilityError({
+      code: 'CAPABILITY_INPUT_INVALID',
+      message: 'ref must name a branch under heads/',
+    });
+  }
+  return value;
+};
+
+const createdBranchRef = (input: Readonly<Record<string, unknown>>): void => {
+  const value = input.ref;
+  if (
+    typeof value !== 'string' ||
+    !/^refs\/heads\/[a-z0-9._/-]+$/i.test(value) ||
+    value.includes('..')
+  ) {
+    throw new CapabilityError({
+      code: 'CAPABILITY_INPUT_INVALID',
+      message: 'ref must name a branch under refs/heads/',
+    });
+  }
+};
+
+const boundedInput = (input: Readonly<Record<string, unknown>>): void => {
+  const bytes = Buffer.byteLength(JSON.stringify(input));
+  if (bytes > 256 * 1024) {
+    throw new CapabilityError({
+      code: 'CAPABILITY_INPUT_TOO_LARGE',
+      message: 'Capability input exceeds 256 KiB',
+    });
+  }
 };
 
 const route = (repository: string, tool: BrokerTool, input: Readonly<Record<string, unknown>>) => {
@@ -57,9 +102,17 @@ const route = (repository: string, tool: BrokerTool, input: Readonly<Record<stri
     case 'get_pull_request':
       return { method: 'GET', path: `${base}/pulls/${number(input, 'number')}` } as const;
     case 'list_comments':
-      return { method: 'GET', path: `${base}/issues/${number(input, 'number')}/comments` } as const;
+      return {
+        method: 'GET',
+        path: `${base}/issues/${number(input, 'number')}/comments?per_page=3&page=${input.page === undefined ? 1 : number(input, 'page')}`,
+      } as const;
     case 'list_review_threads':
-      return { method: 'GET', path: `${base}/pulls/${number(input, 'number')}/comments` } as const;
+      return { method: 'POST', path: '/graphql' } as const;
+    case 'list_review_comments':
+      return {
+        method: 'GET',
+        path: `${base}/pulls/${number(input, 'number')}/comments?per_page=3&page=${input.page === undefined ? 1 : number(input, 'page')}`,
+      } as const;
     case 'create_comment':
       return {
         method: 'POST',
@@ -68,7 +121,14 @@ const route = (repository: string, tool: BrokerTool, input: Readonly<Record<stri
     case 'update_issue':
       return { method: 'PATCH', path: `${base}/issues/${number(input, 'number')}` } as const;
     case 'create_branch':
+      createdBranchRef(input);
       return { method: 'POST', path: `${base}/git/refs` } as const;
+    case 'update_branch':
+      return { method: 'PATCH', path: `${base}/git/refs/${branchRef(input)}` } as const;
+    case 'create_blob':
+      return { method: 'POST', path: `${base}/git/blobs` } as const;
+    case 'create_tree':
+      return { method: 'POST', path: `${base}/git/trees` } as const;
     case 'create_commit':
       return { method: 'POST', path: `${base}/git/commits` } as const;
     case 'create_pull_request':
@@ -92,7 +152,16 @@ const sanitized = (input: Readonly<Record<string, unknown>>): string => {
 };
 
 const boundedJson = (value: unknown): unknown => {
-  const encoded = Buffer.from(JSON.stringify(value));
+  const encoded = Buffer.from(
+    JSON.stringify(value, (_key, item) =>
+      typeof item === 'string' && Buffer.byteLength(item) > 4096
+        ? Buffer.from(item)
+            .subarray(0, 4096)
+            .toString('utf8')
+            .replace(/\uFFFD$/u, '')
+        : item,
+    ),
+  );
   if (encoded.byteLength > 64 * 1024) throw new Error('GitHub response exceeds broker limit');
   return JSON.parse(encoded.toString('utf8')) as unknown;
 };
@@ -105,113 +174,221 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
 
     const callTool = (request: {
       readonly jobId: number;
-      readonly work: WorkItem;
+      readonly attemptNumber: number;
+      readonly workerId: string;
+      /** Ignored legacy field; persisted queue state is authoritative. */
+      readonly work?: unknown;
       readonly name: BrokerTool;
       readonly input: Readonly<Record<string, unknown>>;
-    }) => {
-      const auditInput = sanitized(request.input);
-      const invoke = Effect.gen(function* () {
-        const expectedRepository = request.work.repository.toLowerCase();
-        const requestedRepository = request.input.repository;
-        if (
-          requestedRepository !== undefined &&
-          String(requestedRepository).toLowerCase() !== expectedRepository
-        ) {
+    }) =>
+      Effect.gen(function* () {
+        const auditInput = sanitized(request.input);
+        const job = yield* queue.job(request.jobId);
+        if (job === undefined || job.status !== 'running') {
           return yield* new CapabilityError({
-            code: 'CAPABILITY_REPOSITORY_DENIED',
-            message: 'Tool request targets another repository',
+            code: 'CAPABILITY_JOB_INACTIVE',
+            message: 'Capability calls require an active persisted job',
           });
         }
-        const installationId = request.work.installationId;
-        if (installationId === undefined)
+        if (job.attempts !== request.attemptNumber || job.workerId !== request.workerId) {
           return yield* new CapabilityError({
-            code: 'CAPABILITY_INSTALLATION_MISSING',
-            message: 'Job has no installation identity',
-          });
-        const repositoryPolicy = policy.forRepository(expectedRepository);
-        const capability = capabilities[request.name];
-        if (!repositoryPolicy.accepted || repositoryPolicy.capabilities[capability] !== true) {
-          return yield* new CapabilityError({
-            code: 'CAPABILITY_DENIED',
-            message: `${request.name} is denied by repository policy`,
+            code: 'CAPABILITY_ATTEMPT_STALE',
+            message: 'Capability session belongs to a stale job attempt',
           });
         }
-        const target = route(expectedRepository, request.name, request.input);
-        const client = yield* github.forInstallation(installationId);
-        let baseRequest = HttpClientRequest.get(target.path);
-        if (target.method === 'POST') baseRequest = HttpClientRequest.post(target.path);
-        if (target.method === 'PATCH') baseRequest = HttpClientRequest.patch(target.path);
-        if (target.method === 'PUT') baseRequest = HttpClientRequest.put(target.path);
-        const httpRequest =
-          target.method === 'GET'
-            ? baseRequest
-            : HttpClientRequest.bodyUnsafeJson(baseRequest, request.input);
-        const response = yield* client.execute(httpRequest);
-        if (response.status < 200 || response.status >= 300) {
+        const now = yield* Clock.currentTimeMillis;
+        if (job.leaseExpiresAt === undefined || job.leaseExpiresAt <= now) {
           return yield* new CapabilityError({
-            code: 'CAPABILITY_GITHUB_FAILED',
-            message: `GitHub returned status ${response.status}`,
+            code: 'CAPABILITY_LEASE_EXPIRED',
+            message: 'Capability session lease has expired',
           });
         }
-        return boundedJson(yield* response.json);
-      }).pipe(
-        Effect.mapError((cause) =>
-          cause instanceof CapabilityError
-            ? cause
-            : new CapabilityError({
-                code: 'CAPABILITY_FAILED',
-                message: 'Capability call failed',
-                cause,
-              }),
-        ),
-      );
+        const auditIdentity = {
+          jobId: request.jobId,
+          repository: job.work.repository,
+          ...(job.work.installationId === undefined
+            ? {}
+            : { installationId: job.work.installationId }),
+          capability: request.name,
+          input: auditInput,
+        };
+        yield* queue.recordAudit({ ...auditIdentity, outcome: 'started' });
+        const invoke = Effect.gen(function* () {
+          yield* Effect.try({
+            try: () => boundedInput(request.input),
+            catch: (cause) => cause as CapabilityError,
+          });
+          const expectedRepository = job.work.repository.toLowerCase();
+          const requestedRepository = request.input.repository;
+          if (
+            requestedRepository !== undefined &&
+            String(requestedRepository).toLowerCase() !== expectedRepository
+          ) {
+            return yield* new CapabilityError({
+              code: 'CAPABILITY_REPOSITORY_DENIED',
+              message: 'Tool request targets another repository',
+            });
+          }
+          const installationId = job.work.installationId;
+          if (installationId === undefined)
+            return yield* new CapabilityError({
+              code: 'CAPABILITY_INSTALLATION_MISSING',
+              message: 'Job has no installation identity',
+            });
+          const repositoryPolicy = policy.forRepository(expectedRepository);
+          const capability = capabilities[request.name];
+          const forcePushDenied =
+            request.name === 'update_branch' &&
+            request.input.force === true &&
+            repositoryPolicy.capabilities.forcePush !== true;
+          if (
+            !repositoryPolicy.accepted ||
+            repositoryPolicy.capabilities[capability] !== true ||
+            forcePushDenied
+          ) {
+            return yield* new CapabilityError({
+              code: 'CAPABILITY_DENIED',
+              message: `${request.name} is denied by repository policy`,
+            });
+          }
+          const target = yield* Effect.try({
+            try: () => route(expectedRepository, request.name, request.input),
+            catch: (cause) =>
+              cause instanceof CapabilityError
+                ? cause
+                : new CapabilityError({
+                    code: 'CAPABILITY_INPUT_INVALID',
+                    message: 'Capability input is invalid',
+                    cause,
+                  }),
+          });
+          const client = yield* github.forInstallation(installationId);
+          let baseRequest = HttpClientRequest.get(target.path);
+          if (target.method === 'POST') baseRequest = HttpClientRequest.post(target.path);
+          if (target.method === 'PATCH') baseRequest = HttpClientRequest.patch(target.path);
+          if (target.method === 'PUT') baseRequest = HttpClientRequest.put(target.path);
+          const body =
+            request.name === 'list_review_threads'
+              ? yield* Effect.try({
+                  try: () => ({
+                    query:
+                      'query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:10,after:$after){pageInfo{hasNextPage endCursor} nodes{isResolved comments(first:10){pageInfo{hasNextPage endCursor} nodes{id body path line author{login} url}}}}}}}',
+                    variables: {
+                      owner: expectedRepository.split('/')[0],
+                      name: expectedRepository.split('/')[1],
+                      number: number(request.input, 'number'),
+                      after: typeof request.input.after === 'string' ? request.input.after : null,
+                    },
+                  }),
+                  catch: (cause) =>
+                    cause instanceof CapabilityError
+                      ? cause
+                      : new CapabilityError({
+                          code: 'CAPABILITY_INPUT_INVALID',
+                          message: 'Capability input is invalid',
+                          cause,
+                        }),
+                })
+              : request.input;
+          const httpRequest =
+            target.method === 'GET'
+              ? baseRequest
+              : HttpClientRequest.bodyUnsafeJson(baseRequest, body);
+          const response = yield* client.execute(httpRequest);
+          if (response.status < 200 || response.status >= 300) {
+            return yield* new CapabilityError({
+              code: 'CAPABILITY_GITHUB_FAILED',
+              message: `GitHub returned status ${response.status}`,
+            });
+          }
+          return boundedJson(yield* response.json);
+        }).pipe(
+          Effect.mapError((cause) =>
+            cause instanceof CapabilityError
+              ? cause
+              : new CapabilityError({
+                  code: 'CAPABILITY_FAILED',
+                  message: 'Capability call failed',
+                  cause,
+                }),
+          ),
+        );
 
-      return Effect.matchEffect(invoke, {
-        onFailure: (error) =>
-          queue
-            .recordAudit({
-              jobId: request.jobId,
-              repository: request.work.repository,
-              ...(request.work.installationId === undefined
-                ? {}
-                : { installationId: request.work.installationId }),
-              capability: request.name,
-              input: auditInput,
-              outcome: error.code,
-            })
-            .pipe(Effect.zipRight(Effect.fail(error))),
-        onSuccess: (result) =>
-          queue
-            .recordAudit({
-              jobId: request.jobId,
-              repository: request.work.repository,
-              ...(request.work.installationId === undefined
-                ? {}
-                : { installationId: request.work.installationId }),
-              capability: request.name,
-              input: auditInput,
-              outcome: 'ok',
-            })
-            .pipe(Effect.as(result)),
+        return yield* Effect.matchEffect(invoke, {
+          onFailure: (error) =>
+            queue
+              .recordAudit({
+                ...auditIdentity,
+                outcome: error.code,
+              })
+              .pipe(Effect.zipRight(Effect.fail(error))),
+          onSuccess: (result) =>
+            queue
+              .recordAudit({
+                ...auditIdentity,
+                outcome: 'ok',
+              })
+              .pipe(
+                Effect.catchAll((cause) =>
+                  Effect.logError('Could not finalize capability audit', cause),
+                ),
+                Effect.as(result),
+              ),
+        });
       });
-    };
 
-    const listTools = Object.keys(capabilities).map((name) => ({
+    const numberedTools = new Set<BrokerTool>([
+      'get_issue',
+      'get_pull_request',
+      'list_comments',
+      'list_review_threads',
+      'list_review_comments',
+      'create_comment',
+      'merge_pull_request',
+    ]);
+    const listTools = (Object.keys(capabilities) as BrokerTool[]).map((name) => ({
       name,
       description: `Job-scoped GitHub capability: ${name}`,
-      inputSchema: { type: 'object', additionalProperties: true },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ...(numberedTools.has(name)
+            ? { number: { type: 'integer', minimum: 1 }, page: { type: 'integer', minimum: 1 } }
+            : {}),
+        },
+        ...(numberedTools.has(name) ? { required: ['number'] } : {}),
+        additionalProperties: true,
+      },
     }));
 
     const handleMcp = (
       jobId: number,
-      work: WorkItem,
-      request: {
+      attemptOrRequest: number | unknown,
+      workerOrRequest?: string | unknown,
+      sessionRequest?: {
         readonly jsonrpc: '2.0';
         readonly id: string | number;
         readonly method: string;
         readonly params?: Readonly<Record<string, unknown>>;
       },
     ) => {
+      const request = (sessionRequest ?? workerOrRequest ?? attemptOrRequest) as {
+        readonly jsonrpc: '2.0';
+        readonly id: string | number;
+        readonly method: string;
+        readonly params?: Readonly<Record<string, unknown>>;
+      };
+      if (request.method === 'initialize') {
+        return Effect.succeed({
+          jsonrpc: '2.0' as const,
+          id: request.id,
+          result: {
+            protocolVersion: '2025-03-26',
+            capabilities: { tools: {} },
+            serverInfo: { name: 'lictor', version: '1.0.0' },
+          },
+        });
+      }
       if (request.method === 'tools/list') {
         return Effect.succeed({
           jsonrpc: '2.0' as const,
@@ -239,21 +416,30 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
         typeof args === 'object' && args !== null
           ? (args as Readonly<Record<string, unknown>>)
           : {};
-      return Effect.match(callTool({ jobId, work, name: name as BrokerTool, input }), {
-        onFailure: (error) => ({
-          jsonrpc: '2.0' as const,
-          id: request.id,
-          error: {
-            code: -32000,
-            message: error instanceof CapabilityError ? error.code : 'CAPABILITY_AUDIT_FAILED',
-          },
+      return Effect.match(
+        callTool({
+          jobId,
+          attemptNumber: Number(attemptOrRequest),
+          workerId: String(workerOrRequest),
+          name: name as BrokerTool,
+          input,
         }),
-        onSuccess: (result) => ({
-          jsonrpc: '2.0' as const,
-          id: request.id,
-          result: { content: [{ type: 'text', text: JSON.stringify(result) }] },
-        }),
-      });
+        {
+          onFailure: (error) => ({
+            jsonrpc: '2.0' as const,
+            id: request.id,
+            error: {
+              code: -32000,
+              message: error instanceof CapabilityError ? error.code : 'CAPABILITY_AUDIT_FAILED',
+            },
+          }),
+          onSuccess: (result) => ({
+            jsonrpc: '2.0' as const,
+            id: request.id,
+            result: { content: [{ type: 'text', text: JSON.stringify(result) }] },
+          }),
+        },
+      );
     };
 
     return { callTool, handleMcp, listTools };
