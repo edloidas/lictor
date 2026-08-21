@@ -18,7 +18,7 @@ const config = (databasePath: string) =>
     databasePath,
     policyPath: 'policy.toml',
     controlSocketPath: '/tmp/lictor.sock',
-    webhookMaxBytes: 1024,
+    deliveryMaxBytes: 1024,
     executor: 'disabled',
     codexModel: 'gpt-5.6-luna',
     agentWorkdir: '.',
@@ -70,7 +70,12 @@ describe('WorkQueue', () => {
 
     expect(result.first.inserted).toBe(true);
     expect(result.duplicate.inserted).toBe(false);
-    expect(result.claimed).toMatchObject({ id: 'delivery-1', status: 'processing', attempts: 1 });
+    expect(result.claimed).toMatchObject({
+      id: 'delivery-1',
+      source: 'webhook',
+      status: 'processing',
+      attempts: 1,
+    });
     expect(result.empty).toBeUndefined();
   });
 
@@ -383,11 +388,55 @@ describe('WorkQueue', () => {
     }
   });
 
+  // ! Every delivery stored before sources existed came from the webhook, so
+  // ! the migration must backfill the column rather than leave old rows
+  // ! unreadable by a consumer that switches over it. The seeds rewind to
+  // ! faithful pre-source shapes — version 2 predates the table entirely, and
+  // ! the audit table is dropped or stripped to match what each later version
+  // ! actually held, since its own migration is equality-gated on version 4.
+  it.each([2, 3, 4, 5])(
+    'upgrades a version-%i database so deliveries carry a source',
+    async (version) => {
+      const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+      const path = join(directory, 'queue.sqlite');
+      // Build the current schema first, then rewind it to the shape `version`
+      // would have held.
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(WorkQueue, (queue) => queue.counts).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+      const database = new Database(path);
+      if (version === 2) database.exec('DROP TABLE deliveries');
+      else database.exec('ALTER TABLE deliveries DROP COLUMN source');
+      if (version === 3) database.exec('DROP TABLE capability_audit');
+      if (version === 4) database.exec('ALTER TABLE capability_audit DROP COLUMN actor');
+      database.exec(`PRAGMA user_version = ${version}`);
+      database.close();
+
+      try {
+        const claimed = await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const queue = yield* WorkQueue;
+              yield* queue.receiveDelivery({ id: 'delivery-source', event: 'issues', body: '{}' });
+              return yield* queue.claimDelivery;
+            }).pipe(Effect.provide(queueLayer(path))),
+          ),
+        );
+
+        expect(claimed).toMatchObject({ id: 'delivery-source', source: 'webhook' });
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('refuses a database created by a newer queue schema', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
     const database = new Database(path, { create: true });
-    database.exec('PRAGMA user_version = 6');
+    database.exec('PRAGMA user_version = 7');
     database.close();
 
     try {

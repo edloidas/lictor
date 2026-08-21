@@ -58,7 +58,7 @@ const config = (home: string) =>
     databasePath: join(home, 'lictor.sqlite'),
     policyPath: join(home, 'policy.toml'),
     controlSocketPath: join(home, 'lictor.sock'),
-    webhookMaxBytes: 1024,
+    deliveryMaxBytes: 1024,
     executor: 'disabled',
     codexModel: 'gpt-5.6-luna',
     agentWorkdir: '.',

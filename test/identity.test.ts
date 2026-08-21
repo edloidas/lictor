@@ -18,7 +18,7 @@ const config = (expectedLogin: string, trustedSenders: readonly string[] = []) =
       databasePath: ':memory:',
       policyPath: 'unused',
       controlSocketPath: '/tmp/lictor.sock',
-      webhookMaxBytes: 1024,
+      deliveryMaxBytes: 1024,
       executor: 'disabled',
       codexModel: 'gpt-5.6-luna',
       agentWorkdir: '.',

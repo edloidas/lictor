@@ -67,7 +67,7 @@ describe('local control plane', () => {
         databasePath,
         policyPath: 'unused',
         controlSocketPath: socketPath,
-        webhookMaxBytes: 1024,
+        deliveryMaxBytes: 1024,
         executor: 'disabled',
         codexModel: 'gpt-5.6-luna',
         agentWorkdir: '.',
