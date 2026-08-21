@@ -13,13 +13,14 @@ forcePush = false
 deleteBranches = false
 scripts = []
 
+# Every repository is named in full. There are no owner wildcards here: an
+# invitation grants reach, and only a line in this list grants permission.
 [repositories]
 allow = ["edloidas/lictor"]
 deny = []
-workspaceRoots = ["/absolute/path/to/repositories"]
 
 [repositories.overrides."edloidas/lictor"]
-workspace = "/absolute/path/to/repositories/lictor"
+clone = "allowed"
 
 [limits]
 maxQueueDepth = 10000

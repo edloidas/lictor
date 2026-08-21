@@ -34,18 +34,34 @@ describe('repository automation policy', () => {
     expect(policy.maxJobAgeMs).toBe(24 * 60 * 60 * 1000);
   });
 
-  test('applies case-insensitive allow patterns with deny precedence', async () => {
+  test('accepts only repositories named exactly, with deny precedence', async () => {
     const policy = await parse(`
 [repositories]
-allow = ["Edloidas/*", "team/**"]
-deny = ["edloidas/private-*", "team/archive-*"]
+allow = ["Edloidas/Lictor", "team/platform-api", "team/archive-api"]
+deny = ["team/archive-*"]
 `);
 
     expect(policy.forRepository('EDLOIDAS/LICTOR').accepted).toBe(true);
-    expect(policy.forRepository('edloidas/private-tools').accepted).toBe(false);
     expect(policy.forRepository('team/platform-api').accepted).toBe(true);
     expect(policy.forRepository('team/archive-api').accepted).toBe(false);
+    expect(policy.forRepository('edloidas/lictor-docs').accepted).toBe(false);
     expect(policy.forRepository('other/repository').accepted).toBe(false);
+  });
+
+  test.each([
+    ['edloidas/..'],
+    ['edloidas/.'],
+    ['../etc/passwd'],
+    ['edloidas/lictor/extra'],
+    ['edloidas/lic tor'],
+    ['-edloidas/lictor'],
+  ])('never accepts the hostile repository name %p', async (repository) => {
+    const policy = await parse(`
+[repositories]
+allow = ["edloidas/lictor"]
+`);
+
+    expect(policy.forRepository(repository).accepted).toBe(false);
   });
 
   test('merges exact repository overrides over defaults', async () => {
@@ -58,13 +74,9 @@ clone = "denied"
 comment = true
 scripts = ["bun test"]
 
-[repositories]
-workspaceRoots = ["/srv/lictor/workspaces"]
-
 [repositories.overrides."edloidas/lictor"]
 execution = "automatic"
 clone = "allowed"
-workspace = "/srv/lictor/workspaces/lictor"
 
 [repositories.overrides."edloidas/lictor".capabilities]
 branches = true
@@ -75,7 +87,6 @@ scripts = []
     const repository = policy.forRepository('edloidas/lictor');
     expect(repository.execution).toBe('automatic');
     expect(repository.clone).toBe('allowed');
-    expect(repository.workspace).toBe('/srv/lictor/workspaces/lictor');
     expect(repository.capabilities.comment).toBe(true);
     expect(repository.capabilities.branches).toBe(true);
     expect(repository.capabilities.merge).toBe(true);
@@ -83,17 +94,13 @@ scripts = []
     expect(repository.capabilities.scripts).toEqual([]);
   });
 
-  test('loads workspace roots and retention windows', async () => {
+  test('loads retention windows', async () => {
     const policy = await parse(`
-[repositories]
-workspaceRoots = ["/srv/lictor", "/opt/checkouts"]
-
 [retention]
 completedDays = 14
 failedDays = 120
 `);
 
-    expect(policy.workspaceRoots).toEqual(['/srv/lictor', '/opt/checkouts']);
     expect(policy.completedRetentionDays).toBe(14);
     expect(policy.failedRetentionDays).toBe(120);
   });
@@ -114,12 +121,15 @@ execution = "automatic"
     ['invalid TOML', 'allow = ['],
     ['unknown execution mode', '[defaults]\nexecution = "sometimes"'],
     ['unknown security key', '[defaults]\nexecuton = "automatic"'],
-    ['malformed repository pattern', '[repositories]\nallow = ["lictor"]'],
-    ['relative workspace', '[repositories]\nworkspaceRoots = ["workspaces"]'],
-    ['filesystem root', '[repositories]\nworkspaceRoots = ["/"]'],
+    ['malformed repository name', '[repositories]\nallow = ["lictor"]'],
+    // ! Reach is granted by an invitation; permission must be granted one
+    // ! repository at a time, or being added anywhere arms everything there.
+    ['an owner wildcard in allow', '[repositories]\nallow = ["edloidas/*"]'],
+    ['a traversal segment in allow', '[repositories]\nallow = ["edloidas/.."]'],
+    ['a removed workspace root key', '[repositories]\nworkspaceRoots = ["/srv/lictor"]'],
     [
-      'workspace outside configured roots',
-      '[repositories]\nworkspaceRoots = ["/srv/lictor"]\n[repositories.overrides."edloidas/lictor"]\nworkspace = "/tmp/lictor"',
+      'a removed workspace override key',
+      '[repositories.overrides."edloidas/lictor"]\nworkspace = "/srv/lictor/lictor"',
     ],
     ['fractional retention', '[retention]\ncompletedDays = 1.5'],
     ['excessive retention', '[retention]\nfailedDays = 3651'],

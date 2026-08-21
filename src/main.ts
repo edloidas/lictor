@@ -28,7 +28,7 @@ const ClientLive = GitHubClient.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.merge(CredentialLive, FetchHttpClient.layer)),
 );
 const WorkspaceLive = RepositoryWorkspace.DefaultWithoutDependencies.pipe(
-  Layer.provide(Layer.merge(ProcessRunner.Default, CredentialLive)),
+  Layer.provide(Layer.mergeAll(ConfigLive, ProcessRunner.Default, CredentialLive)),
 );
 const IdentityLive = GitHubIdentity.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.merge(ConfigLive, ClientLive)),

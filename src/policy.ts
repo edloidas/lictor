@@ -1,4 +1,3 @@
-import { isAbsolute, normalize, parse, resolve } from 'node:path';
 import { Data, Effect, Schema } from 'effect';
 import { LictorConfig } from './config.ts';
 
@@ -22,7 +21,6 @@ const Costs = Schema.Struct({
 const RepositoryOverride = Schema.Struct({
   execution: Schema.optional(Execution),
   clone: Schema.optional(Clone),
-  workspace: Schema.optional(Schema.String),
   capabilities: Schema.optional(Capabilities),
   costs: Schema.optional(Costs),
 });
@@ -38,7 +36,6 @@ const PolicyDocument = Schema.Struct({
     Schema.Struct({
       allow: Schema.optional(Schema.Array(Schema.String)),
       deny: Schema.optional(Schema.Array(Schema.String)),
-      workspaceRoots: Schema.optional(Schema.Array(Schema.String)),
       overrides: Schema.optional(Schema.Record({ key: Schema.String, value: RepositoryOverride })),
     }),
   ),
@@ -65,7 +62,6 @@ export type RepositoryPolicy = {
   readonly accepted: boolean;
   readonly execution: 'automatic' | 'approval' | 'denied';
   readonly clone: 'allowed' | 'denied';
-  readonly workspace?: string;
   readonly capabilities: Capabilities;
   readonly maxAttempts: number;
   readonly maxDurationMs: number;
@@ -90,12 +86,43 @@ const defaultCapabilities: Capabilities = {
 
 const canonicalRepository = (repository: string): string => repository.trim().toLowerCase();
 
-const repositoryPattern = /^[a-z0-9_.*-]+\/[a-z0-9_.*-]+$/;
-const exactRepository = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/;
+// ! Underscores are legal in an owner: an Enterprise Managed User login is
+// ! `shortname_enterprise`, and rejecting one refuses that whole namespace.
+const ownerPattern = /^[a-z0-9](?:[a-z0-9_-]{0,37}[a-z0-9])?$/;
+const namePattern = /^[a-z0-9_.-]{1,100}$/;
 
-const validatePattern = (pattern: string): string => {
+/**
+ * Whether a name is safe to treat as one repository and to join into a path.
+ *
+ * Repository names arrive from GitHub payloads, and the daemon computes a
+ * filesystem path from them. This is the only check standing between that input
+ * and a `join`, which is why dot-only segments are rejected explicitly: the
+ * character class permits `..`.
+ *
+ * A leading dot stays legal — `owner/.github` is a real repository — so nothing
+ * the daemon puts beside a clone may be named like one.
+ */
+export const isSafeRepository = (repository: string): boolean => {
+  const segments = canonicalRepository(repository).split('/');
+  const [account, project] = segments;
+  if (segments.length !== 2 || account === undefined || project === undefined) return false;
+  if (project === '.' || project === '..') return false;
+  return ownerPattern.test(account) && namePattern.test(project);
+};
+
+const validateExact = (repository: string): string => {
+  const canonical = canonicalRepository(repository);
+  if (!isSafeRepository(canonical)) {
+    throw new PolicyError({ message: `Invalid repository name: ${repository}` });
+  }
+  return canonical;
+};
+
+const denyPattern = /^[a-z0-9_.*-]+\/[a-z0-9_.*-]+$/;
+
+const validateDenyPattern = (pattern: string): string => {
   const canonical = canonicalRepository(pattern);
-  if (!repositoryPattern.test(canonical)) {
+  if (!denyPattern.test(canonical) || canonical.split('/').includes('..')) {
     throw new PolicyError({ message: `Invalid repository pattern: ${pattern}` });
   }
   return canonical;
@@ -108,16 +135,6 @@ const patternMatches = (pattern: string, repository: string): boolean => {
     .replaceAll('*', '[^/]*')
     .replaceAll('\u0000', '.*');
   return new RegExp(`^${escaped}$`).test(repository);
-};
-
-const safeAbsolutePath = (value: string): string => {
-  if (!isAbsolute(value))
-    throw new PolicyError({ message: `Workspace path must be absolute: ${value}` });
-  const resolved = resolve(value);
-  const root = parse(resolved).root;
-  if (normalize(resolved) === root)
-    throw new PolicyError({ message: 'Workspace path cannot be a filesystem root' });
-  return resolved;
 };
 
 const positiveDays = (value: number | undefined, fallback: number, name: string): number => {
@@ -142,7 +159,6 @@ const positiveLimit = (
 };
 
 export type AutomationPolicy = {
-  readonly workspaceRoots: readonly string[];
   readonly completedRetentionDays: number;
   readonly failedRetentionDays: number;
   readonly maxQueueDepth: number;
@@ -153,9 +169,11 @@ export type AutomationPolicy = {
 const makePolicy = (document: PolicyDocument): AutomationPolicy => {
   const defaults = document.defaults;
   const repositories = document.repositories;
-  const allow = (repositories?.allow ?? []).map(validatePattern);
-  const deny = (repositories?.deny ?? []).map(validatePattern);
-  const workspaceRoots = (repositories?.workspaceRoots ?? []).map(safeAbsolutePath);
+  // ! Exact names only. An owner wildcard would arm every repository the
+  // ! account is ever invited to, collapsing reach and permission into one key.
+  // ! Deny keeps its patterns: a wildcard there can only ever subtract.
+  const allow = new Set((repositories?.allow ?? []).map(validateExact));
+  const deny = (repositories?.deny ?? []).map(validateDenyPattern);
   const overrides = new Map<string, Schema.Schema.Type<typeof RepositoryOverride>>();
   const defaultCosts = document.limits?.costs;
   const defaultMaxAttempts = positiveLimit(defaultCosts?.maxAttempts, 3, 100, 'costs.maxAttempts');
@@ -165,21 +183,10 @@ const makePolicy = (document: PolicyDocument): AutomationPolicy => {
     24 * 60,
     'costs.maxDurationMinutes',
   );
-  for (const [name, override] of Object.entries(repositories?.overrides ?? {})) {
-    const canonical = canonicalRepository(name);
-    if (!exactRepository.test(canonical)) {
-      throw new PolicyError({ message: `Invalid repository override: ${name}` });
-    }
+  for (const [repository, override] of Object.entries(repositories?.overrides ?? {})) {
+    const canonical = validateExact(repository);
     if (overrides.has(canonical)) {
-      throw new PolicyError({ message: `Duplicate repository override: ${name}` });
-    }
-    if (override.workspace !== undefined) {
-      const workspace = safeAbsolutePath(override.workspace);
-      if (!workspaceRoots.some((root) => workspace.startsWith(`${root}/`))) {
-        throw new PolicyError({
-          message: `Workspace must be inside a configured root: ${workspace}`,
-        });
-      }
+      throw new PolicyError({ message: `Duplicate repository override: ${repository}` });
     }
     positiveLimit(override.costs?.maxAttempts, defaultMaxAttempts, 100, 'costs.maxAttempts');
     positiveLimit(
@@ -194,7 +201,7 @@ const makePolicy = (document: PolicyDocument): AutomationPolicy => {
   const forRepository = (input: string): RepositoryPolicy => {
     const repository = canonicalRepository(input);
     const denied = deny.some((pattern) => patternMatches(pattern, repository));
-    const allowed = allow.some((pattern) => patternMatches(pattern, repository));
+    const allowed = isSafeRepository(repository) && allow.has(repository);
     const override = overrides.get(repository);
     const capabilities = {
       ...defaultCapabilities,
@@ -208,9 +215,6 @@ const makePolicy = (document: PolicyDocument): AutomationPolicy => {
       accepted: allowed && !denied,
       execution: override?.execution ?? defaults?.execution ?? 'automatic',
       clone: override?.clone ?? defaults?.clone ?? 'denied',
-      ...(override?.workspace === undefined
-        ? {}
-        : { workspace: safeAbsolutePath(override.workspace) }),
       capabilities,
       maxAttempts: positiveLimit(
         override?.costs?.maxAttempts,
@@ -229,7 +233,6 @@ const makePolicy = (document: PolicyDocument): AutomationPolicy => {
   };
 
   return {
-    workspaceRoots,
     completedRetentionDays: positiveDays(
       document.retention?.completedDays,
       30,
