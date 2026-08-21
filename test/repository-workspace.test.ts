@@ -2,9 +2,9 @@ import { describe, expect, it } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Effect, Layer, Redacted, Ref } from 'effect';
+import { Cause, Effect, Layer, Option, Redacted, Ref } from 'effect';
 import { type ProcessRequest, ProcessRunner } from '../src/executor/process-runner.ts';
-import { GitHubApp } from '../src/github/app.ts';
+import { GitHubCredential } from '../src/github/credential.ts';
 import type { RepositoryPolicy } from '../src/policy.ts';
 import type { WorkItem } from '../src/webhook/qualification.ts';
 import { RepositoryWorkspace } from '../src/workspace/repository-workspace.ts';
@@ -53,8 +53,11 @@ const service = (run: InstanceType<typeof ProcessRunner>['run']) =>
     Layer.provide(Layer.succeed(ProcessRunner, ProcessRunner.make({ run }))),
     Layer.provide(
       Layer.succeed(
-        GitHubApp,
-        GitHubApp.make({ token: () => Effect.succeed(Redacted.make('secret-token')) }),
+        GitHubCredential,
+        GitHubCredential.make({
+          token: Effect.succeed(Redacted.make('secret-token')),
+          gitAuthHeader: Effect.succeed(Redacted.make('Basic c2VjcmV0')),
+        }),
       ),
     ),
   );
@@ -92,6 +95,10 @@ describe('RepositoryWorkspace', () => {
       );
       expect(result.worktreePath).toContain('.lictor-worktrees/lictor-10');
       expect(calls.some((call) => call.command.includes('worktree'))).toBe(true);
+      // ! The fetch carries whatever scheme the credential produced, untouched.
+      // ! A Bearer value here authenticates against the API but not against git.
+      const fetch = calls.find((call) => call.command.includes('fetch'));
+      expect(fetch?.env?.GIT_CONFIG_VALUE_0).toBe('Authorization: Basic c2VjcmV0');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -226,5 +233,99 @@ describe('RepositoryWorkspace', () => {
       ),
     );
     expect(active).toBe(1);
+  });
+  // ! A refused credential never heals, and each retry pays for another clone.
+  // ! git reports it only in prose on stderr, so the text is the only signal.
+  it.each([
+    ['remote: invalid credentials', 'WORKSPACE_CREDENTIAL_REJECTED'],
+    [
+      'fatal: Authentication failed for https://github.com/edloidas/lictor',
+      'WORKSPACE_CREDENTIAL_REJECTED',
+    ],
+    ['remote: Write access to repository not granted.', 'WORKSPACE_ACCESS_DENIED'],
+    // ! GitHub says "not found" for a private repository the credential cannot
+    // ! see, so this must not be the terminal code that a real absence deserves.
+    ['remote: Repository not found.', 'WORKSPACE_REPOSITORY_UNAVAILABLE'],
+    ['You have exceeded a secondary rate limit', 'WORKSPACE_RATE_LIMITED'],
+    [
+      'fatal: unable to access https://github.com/edloidas/lictor: The requested URL returned error: 429',
+      'WORKSPACE_RATE_LIMITED',
+    ],
+    ['error: something else entirely', 'WORKSPACE_FETCH_FAILED'],
+  ])('classifies a failed fetch reporting %p', async (stderr, code) => {
+    const root = mkdtempSync(join(tmpdir(), 'lictor-workspace-'));
+    const clone = join(root, 'edloidas', 'lictor');
+    mkdirSync(clone, { recursive: true });
+    try {
+      const exit = await Effect.runPromiseExit(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const manager = yield* RepositoryWorkspace;
+            return yield* manager.create(10, work, policy(clone), [root]);
+          }).pipe(
+            Effect.provide(
+              service((request) =>
+                Effect.succeed({
+                  exitCode: request.command.includes('fetch') ? 1 : 0,
+                  stdout: request.command.includes('get-url')
+                    ? 'https://github.com/edloidas/lictor.git\n'
+                    : '',
+                  stderr: request.command.includes('fetch') ? stderr : '',
+                  outputTruncated: false,
+                }),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      expect(String(exit)).toContain(code);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // ! A refused credential heals when an operator rotates the token, so the job
+  // ! must survive it — but not by retrying every 30 seconds and paying for a
+  // ! clone each time.
+  it('keeps a refused credential retryable but far out', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'lictor-workspace-'));
+    const clone = join(root, 'edloidas', 'lictor');
+    mkdirSync(clone, { recursive: true });
+    try {
+      const exit = await Effect.runPromiseExit(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const manager = yield* RepositoryWorkspace;
+            return yield* manager.create(10, work, policy(clone), [root]);
+          }).pipe(
+            Effect.provide(
+              service((request) =>
+                Effect.succeed({
+                  exitCode: request.command.includes('fetch') ? 1 : 0,
+                  stdout: request.command.includes('get-url')
+                    ? 'https://github.com/edloidas/lictor.git\n'
+                    : '',
+                  stderr: request.command.includes('fetch') ? 'remote: invalid credentials' : '',
+                  outputTruncated: false,
+                }),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      expect(exit._tag).toBe('Failure');
+      if (exit._tag !== 'Failure') return;
+      const error = Cause.failureOption(exit.cause);
+      const failure = Option.getOrUndefined(error);
+      expect(failure?._tag).toBe('WorkspaceError');
+      expect(failure?._tag === 'WorkspaceError' ? failure.retryable : undefined).not.toBe(false);
+      expect(failure?._tag === 'WorkspaceError' ? failure.retryAfterMs : undefined).toBe(
+        5 * 60 * 1000,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

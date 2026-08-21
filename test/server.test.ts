@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { HttpClient, HttpClientRequest } from '@effect/platform';
 import { BunHttpServer } from '@effect/platform-bun';
 import { ConfigProvider, Effect, Layer, Logger } from 'effect';
+import { GitHubIdentity } from '../src/github/identity.ts';
 import { ServerLive, WEBHOOK_PATH } from '../src/server.ts';
 import { sign } from '../src/webhook/signature.ts';
 
@@ -13,15 +14,23 @@ const secret = 'test-webhook-secret';
  * the suite never depends on a `.env` being present.
  */
 const TestServer = ServerLive.pipe(
+  Layer.provide(
+    Layer.succeed(
+      GitHubIdentity,
+      GitHubIdentity.make({
+        verified: Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }),
+      }),
+    ),
+  ),
   Layer.provide(BunHttpServer.layerTest),
   Layer.provide(Logger.remove(Logger.defaultLogger)),
   Layer.provide(
     Layer.setConfigProvider(
       ConfigProvider.fromMap(
         new Map([
-          ['GITHUB_APP_ID', '1'],
-          ['GITHUB_PRIVATE_KEY', 'unused-by-these-routes'],
           ['GITHUB_WEBHOOK_SECRET', secret],
+          ['LICTOR_GITHUB_TOKEN', 'test-token'],
+          ['LICTOR_GITHUB_LOGIN', 'adiutriel'],
           ['LICTOR_DATABASE_PATH', ':memory:'],
           ['LICTOR_POLICY_PATH', 'policy.example.toml'],
         ]),

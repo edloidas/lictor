@@ -59,8 +59,8 @@ describe('local control plane', () => {
     const ConfigLive = Layer.succeed(
       LictorConfig,
       LictorConfig.make({
-        appId: '1',
-        privateKey: Redacted.make('private'),
+        githubToken: Redacted.make('test-token'),
+        expectedLogin: 'adiutriel',
         webhookSecret: Redacted.make('secret'),
         trustedSenders: [],
         targetUsers: [],

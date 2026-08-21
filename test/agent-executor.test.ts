@@ -25,8 +25,8 @@ const work: WorkItem = {
 
 const config = (executor: 'codex' | 'disabled' = 'codex') =>
   LictorConfig.make({
-    appId: '1',
-    privateKey: Redacted.make('unused'),
+    githubToken: Redacted.make('test-token'),
+    expectedLogin: 'adiutriel',
     webhookSecret: Redacted.make('unused'),
     trustedSenders: ['edloidas'],
     targetUsers: ['adiutriel'],
@@ -124,7 +124,7 @@ describe('AgentExecutor', () => {
       '-',
     ]);
     expect(request.request?.input).toContain('$(touch /tmp/nope)');
-    expect(request.request?.env).not.toHaveProperty('GITHUB_PRIVATE_KEY');
+    expect(request.request?.env).not.toHaveProperty('LICTOR_GITHUB_TOKEN');
     expect(request.request?.env).not.toHaveProperty('GITHUB_WEBHOOK_SECRET');
     expect(request.request?.env).not.toHaveProperty('GH_TOKEN');
   });
@@ -173,7 +173,7 @@ describe('AgentExecutor', () => {
         Effect.succeed({
           exitCode: 0,
           stdout: 'not-json',
-          stderr: 'GITHUB_PRIVATE_KEY=must-not-surface',
+          stderr: 'LICTOR_GITHUB_TOKEN=must-not-surface',
           outputTruncated: false,
         }),
     });

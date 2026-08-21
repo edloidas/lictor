@@ -6,7 +6,7 @@ import { Policy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/webhook/qualification.ts';
 import { Worker } from '../src/worker.ts';
-import { RepositoryWorkspace } from '../src/workspace/repository-workspace.ts';
+import { RepositoryWorkspace, WorkspaceError } from '../src/workspace/repository-workspace.ts';
 
 const work: WorkItem = {
   deliveryId: 'delivery-1',
@@ -27,8 +27,8 @@ const work: WorkItem = {
 
 const config = (maxAttempts = 3) =>
   LictorConfig.make({
-    appId: '1',
-    privateKey: Redacted.make('unused'),
+    githubToken: Redacted.make('test-token'),
+    expectedLogin: 'adiutriel',
     webhookSecret: Redacted.make('unused'),
     trustedSenders: ['edloidas'],
     targetUsers: ['adiutriel'],
@@ -51,6 +51,7 @@ const run = <A, E>(
   execute: InstanceType<typeof AgentExecutor>['execute'],
   maxAttempts = 3,
   enabled = true,
+  createWorkspace?: InstanceType<typeof RepositoryWorkspace>['create'],
 ) => {
   const ConfigLive = Layer.succeed(LictorConfig, config(maxAttempts));
   const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
@@ -88,12 +89,14 @@ const run = <A, E>(
   const WorkspaceLive = Layer.succeed(
     RepositoryWorkspace,
     RepositoryWorkspace.make({
-      create: () =>
-        Effect.succeed({
-          repository: work.repository,
-          clonePath: '/tmp/lictor',
-          worktreePath: '/tmp/lictor-job',
-        }),
+      create:
+        createWorkspace ??
+        (() =>
+          Effect.succeed({
+            repository: work.repository,
+            clonePath: '/tmp/lictor',
+            worktreePath: '/tmp/lictor-job',
+          })),
       cleanup: () => Effect.void,
       withRepositoryLock: <A, E, R>(_repository: string, effect: Effect.Effect<A, E, R>) => effect,
     }),
@@ -174,5 +177,107 @@ describe('Worker.runOnce', () => {
 
     expect(result.worked).toBe(false);
     expect(result.counts.pending).toBe(1);
+  });
+  // ! Access is a fact about the repository, not the daemon, and repeating the
+  // ! attempt cannot change it — unlike a refused credential, which an operator
+  // ! rotates. So this one stays terminal and the credential one does not.
+  it('does not retry a workspace failure that can never succeed', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return { counts: yield* queue.counts, reclaimed: yield* queue.claim };
+      }),
+      () => Effect.die('the executor must not run'),
+      3,
+      true,
+      () =>
+        new WorkspaceError({
+          code: 'WORKSPACE_ACCESS_DENIED',
+          message: 'The daemon account cannot write to this repository',
+          retryable: false,
+        }),
+    );
+
+    expect(result.counts.failed).toBe(1);
+    expect(result.reclaimed).toBeUndefined();
+  });
+
+  it('still retries a workspace failure that might succeed', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return yield* queue.counts;
+      }),
+      () => Effect.die('the executor must not run'),
+      3,
+      true,
+      () =>
+        new WorkspaceError({
+          code: 'WORKSPACE_FETCH_FAILED',
+          message: 'Could not refresh repository state',
+        }),
+    );
+
+    expect(result.retry).toBe(1);
+  });
+
+  // ! GitHub publishes when the bucket refills. Guessing with exponential
+  // ! backoff either wastes the wait or retries into the same wall. Both halves
+  // ! are load-bearing: `retry` proves the job is still scheduled rather than
+  // ! abandoned, and the unavailability after 250ms proves it was scheduled from
+  // ! the hint and not from the 100ms configured base. Either one alone is also
+  // ! satisfied by a permanently failed job.
+  it('schedules a throttled workspace failure from the wait GitHub asked for', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        yield* Effect.sleep('250 millis');
+        return { reclaimed: yield* queue.claim, counts: yield* queue.counts };
+      }),
+      () => Effect.die('the executor must not run'),
+      3,
+      true,
+      () =>
+        new WorkspaceError({
+          code: 'WORKSPACE_RATE_LIMITED',
+          message: 'GitHub throttled the repository operation',
+          retryAfterMs: 60_000,
+        }),
+    );
+
+    expect(result.counts.retry).toBe(1);
+    expect(result.reclaimed).toBeUndefined();
+  });
+
+  it('reclaims an ordinary retryable failure once the short backoff elapses', async () => {
+    const reclaimed = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        yield* Effect.sleep('250 millis');
+        return yield* queue.claim;
+      }),
+      () => Effect.die('the executor must not run'),
+      3,
+      true,
+      () =>
+        new WorkspaceError({
+          code: 'WORKSPACE_FETCH_FAILED',
+          message: 'Could not refresh repository state',
+        }),
+    );
+
+    expect(reclaimed?.work.deliveryId).toBe(work.deliveryId);
   });
 });

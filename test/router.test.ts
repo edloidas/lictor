@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { Effect, Redacted, Ref } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { GitHubClient } from '../src/github/client.ts';
+import { GitHubIdentity } from '../src/github/identity.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { Delivery } from '../src/webhook/event.ts';
@@ -9,7 +10,7 @@ import { dispatch, type Registry } from '../src/webhook/router.ts';
 
 /** Handlers carry `GitHubClient` in their requirements; the router never calls it. */
 const stubClient = GitHubClient.make({
-  forInstallation: () => Effect.die('the router must not reach GitHub'),
+  authenticated: Effect.die('the router must not reach GitHub'),
 });
 const stubPolicy = Policy.make(Effect.runSync(parsePolicy('')));
 
@@ -29,12 +30,18 @@ const run = (registry: (log: Ref.Ref<string[]>) => Registry, received: Delivery)
       return yield* Ref.get(log);
     }).pipe(
       Effect.provideService(GitHubClient, stubClient),
+      Effect.provideService(
+        GitHubIdentity,
+        GitHubIdentity.make({
+          verified: Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }),
+        }),
+      ),
       Effect.provideService(Policy, stubPolicy),
       Effect.provideService(
         LictorConfig,
         LictorConfig.make({
-          appId: '1',
-          privateKey: Redacted.make('unused'),
+          githubToken: Redacted.make('test-token'),
+          expectedLogin: 'adiutriel',
           webhookSecret: Redacted.make('unused'),
           trustedSenders: [],
           targetUsers: [],

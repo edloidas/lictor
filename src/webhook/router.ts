@@ -1,6 +1,7 @@
 import { Effect, type ParseResult } from 'effect';
 import type { LictorConfig } from '../config.ts';
 import type { GitHubClient } from '../github/client.ts';
+import type { GitHubIdentity, GitHubIdentityError } from '../github/identity.ts';
 import type { Policy } from '../policy.ts';
 import type { QueueError, WorkQueue } from '../queue/work-queue.ts';
 import { type Delivery, deliveryKey } from './event.ts';
@@ -13,8 +14,8 @@ export type Handler = (
   delivery: Delivery,
 ) => Effect.Effect<
   void,
-  MalformedInteraction | ParseResult.ParseError | QueueError,
-  GitHubClient | LictorConfig | Policy | WorkQueue
+  GitHubIdentityError | MalformedInteraction | ParseResult.ParseError | QueueError,
+  GitHubClient | GitHubIdentity | LictorConfig | Policy | WorkQueue
 >;
 
 /**
@@ -25,7 +26,7 @@ export type Registry = Readonly<Record<string, Handler>>;
 
 /**
  * Dispatches one delivery. An event nobody registered for is logged and
- * dropped, not an error: a GitHub App subscribes to whole event types, so
+ * dropped, not an error: a webhook subscribes to whole event types, so
  * receiving actions you do not care about is the normal case.
  */
 export const dispatch =
@@ -34,8 +35,8 @@ export const dispatch =
     delivery: Delivery,
   ): Effect.Effect<
     void,
-    MalformedInteraction | ParseResult.ParseError | QueueError,
-    GitHubClient | LictorConfig | Policy | WorkQueue
+    GitHubIdentityError | MalformedInteraction | ParseResult.ParseError | QueueError,
+    GitHubClient | GitHubIdentity | LictorConfig | Policy | WorkQueue
   > =>
     Effect.gen(function* () {
       const key = deliveryKey(delivery);

@@ -6,6 +6,7 @@ import { LictorConfig } from '../src/config.ts';
 import { DeliveryWorker } from '../src/delivery-worker.ts';
 import { AgentExecutor } from '../src/executor/agent-executor.ts';
 import { GitHubClient } from '../src/github/client.ts';
+import { GitHubIdentity } from '../src/github/identity.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import { Server, WEBHOOK_PATH } from '../src/server.ts';
@@ -17,8 +18,8 @@ const secret = 'pipeline-secret';
 const ConfigLive = Layer.succeed(
   LictorConfig,
   LictorConfig.make({
-    appId: '1',
-    privateKey: Redacted.make('unused'),
+    githubToken: Redacted.make('test-token'),
+    expectedLogin: 'adiutriel',
     webhookSecret: Redacted.make(secret),
     trustedSenders: ['edloidas'],
     targetUsers: ['adiutriel'],
@@ -48,9 +49,15 @@ const ExecutorLive = Layer.succeed(
       ),
   }),
 );
+const IdentityLive = Layer.succeed(
+  GitHubIdentity,
+  GitHubIdentity.make({
+    verified: Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }),
+  }),
+);
 const GitHubLive = Layer.succeed(
   GitHubClient,
-  GitHubClient.make({ forInstallation: () => Effect.die('pipeline must not call GitHub') }),
+  GitHubClient.make({ authenticated: Effect.die('pipeline must not call GitHub') }),
 );
 const PolicyLive = Layer.effect(
   Policy,
@@ -75,7 +82,7 @@ const WorkerLive = Worker.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, ExecutorLive, PolicyLive, WorkspaceLive)),
 );
 const DeliveryWorkerLive = DeliveryWorker.DefaultWithoutDependencies.pipe(
-  Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, GitHubLive, PolicyLive)),
+  Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, GitHubLive, IdentityLive, PolicyLive)),
 );
 const Services = Layer.mergeAll(
   ConfigLive,
@@ -83,6 +90,7 @@ const Services = Layer.mergeAll(
   WorkerLive,
   DeliveryWorkerLive,
   GitHubLive,
+  IdentityLive,
   PolicyLive,
   WorkspaceLive,
 );

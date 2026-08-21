@@ -3,7 +3,7 @@ import { LictorConfig } from './config.ts';
 import { AgentExecutor, ExecutorError } from './executor/agent-executor.ts';
 import { Policy } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
-import { RepositoryWorkspace } from './workspace/repository-workspace.ts';
+import { RepositoryWorkspace, WorkspaceError } from './workspace/repository-workspace.ts';
 
 export class Worker extends Effect.Service<Worker>()('Worker', {
   effect: Effect.gen(function* () {
@@ -87,8 +87,17 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
             cause instanceof ExecutorError
               ? cause
               : new ExecutorError({
-                  message: 'Could not prepare or clean up the isolated workspace',
-                  retryable: true,
+                  message:
+                    cause instanceof WorkspaceError
+                      ? cause.message
+                      : 'Could not prepare or clean up the isolated workspace',
+                  // ! A refused credential never heals, and each retry pays for
+                  // ! another clone. Only genuinely transient workspace failures
+                  // ! are worth another attempt.
+                  retryable: cause instanceof WorkspaceError ? cause.retryable !== false : true,
+                  ...(cause instanceof WorkspaceError && cause.retryAfterMs !== undefined
+                    ? { retryAfterMs: cause.retryAfterMs }
+                    : {}),
                   cause,
                 }),
           ),
@@ -114,7 +123,9 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       const retry = result.left.retryable && job.attempts < config.workerMaxAttempts;
       const now = yield* Clock.currentTimeMillis;
       const retryAt = retry
-        ? now + config.workerRetryBaseMs * 2 ** Math.max(0, job.attempts - 1)
+        ? now +
+          (result.left.retryAfterMs ??
+            config.workerRetryBaseMs * 2 ** Math.max(0, job.attempts - 1))
         : undefined;
       yield* queue.fail(job.id, job.attempts, result.left.message, retryAt);
       yield* Effect.logWarning(retry ? 'Queued work will retry' : 'Queued work failed').pipe(

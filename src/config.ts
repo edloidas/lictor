@@ -32,10 +32,27 @@ const positiveInteger = (name: string, fallback: number, maximum: number) =>
 export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig', {
   effect: Effect.gen(function* () {
     return {
-      /** Numeric App ID from the GitHub App settings page, used as the JWT issuer. */
-      appId: yield* Config.string('GITHUB_APP_ID'),
-      /** PEM private key. Newlines may be escaped as `\n` — see {@link normalizePem}. */
-      privateKey: yield* Config.redacted('GITHUB_PRIVATE_KEY'),
+      /**
+       * Personal access token for the account the daemon acts as.
+       *
+       * ! Deliberately not `GITHUB_TOKEN`. That name is exported by `gh`, GitHub
+       * ! Actions, and direnv, and Bun does not let `.env` override a variable
+       * ! already exported by the shell — a stray export would silently run the
+       * ! daemon as whoever owns that token.
+       */
+      githubToken: yield* Config.redacted('LICTOR_GITHUB_TOKEN'),
+      /**
+       * Login the token is expected to belong to. Asserted against `GET /user`
+       * at startup, so a swapped or revoked token fails loudly instead of
+       * acting as the wrong account.
+       */
+      expectedLogin: yield* Config.string('LICTOR_GITHUB_LOGIN').pipe(
+        Config.map((login) => login.trim().toLowerCase()),
+        Config.validate({
+          message: 'LICTOR_GITHUB_LOGIN must not be empty',
+          validation: (login) => login.length > 0,
+        }),
+      ),
       /** Shared secret GitHub signs each delivery with. */
       webhookSecret: yield* Config.redacted('GITHUB_WEBHOOK_SECRET'),
       /** GitHub users whose activity may create work. Empty trusts nobody. */
@@ -90,10 +107,3 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
 
 /** Port to bind. Read outside the service so the server layer can build with it. */
 export const port = Config.integer('PORT').pipe(Config.withDefault(3000));
-
-/**
- * A PEM stored in a single-line `.env` value arrives with literal `\n` pairs
- * instead of newlines. `node:crypto` rejects those outright, and the resulting
- * error names neither the cause nor the fix.
- */
-export const normalizePem = (pem: string): string => pem.replace(/\\n/g, '\n');

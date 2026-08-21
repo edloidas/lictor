@@ -10,8 +10,8 @@ import type { WorkItem } from '../src/webhook/qualification.ts';
 
 const config = (databasePath: string) =>
   LictorConfig.make({
-    appId: '1',
-    privateKey: Redacted.make('unused'),
+    githubToken: Redacted.make('test-token'),
+    expectedLogin: 'adiutriel',
     webhookSecret: Redacted.make('unused'),
     trustedSenders: ['edloidas'],
     targetUsers: ['adiutriel'],
@@ -340,11 +340,54 @@ describe('WorkQueue', () => {
     }
   });
 
+  // ! `capability_audit` is created with `IF NOT EXISTS`, so a database that
+  // ! already has the table skips it entirely and needs the column added by
+  // ! hand. Without the ALTER, every audit write on an existing install fails.
+  it('adds the audit actor column to a database created before it existed', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    // Build a faithful pre-actor database: let the current schema create every
+    // table, then take the column and the version back off.
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(WorkQueue, (queue) => queue.counts).pipe(Effect.provide(queueLayer(path))),
+      ),
+    );
+    const database = new Database(path);
+    database.exec('ALTER TABLE capability_audit DROP COLUMN actor');
+    database.exec('PRAGMA user_version = 4');
+    database.close();
+
+    try {
+      const audit = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            const enqueued = yield* queue.enqueue(work('delivery-actor'), 10);
+            yield* queue.recordAudit({
+              jobId: enqueued.jobId,
+              repository: 'edloidas/lictor',
+              actor: 'adiutriel',
+              capability: 'get_issue',
+              input: '{}',
+              outcome: 'ok',
+            });
+            return yield* queue.auditLog(enqueued.jobId);
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(audit.at(-1)).toMatchObject({ actor: 'adiutriel', capability: 'get_issue' });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('refuses a database created by a newer queue schema', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
     const database = new Database(path, { create: true });
-    database.exec('PRAGMA user_version = 5');
+    database.exec('PRAGMA user_version = 6');
     database.close();
 
     try {

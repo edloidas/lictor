@@ -40,6 +40,11 @@ type InteractionPayload = Schema.Schema.Type<typeof InteractionPayload>;
 export type QualificationPolicy = {
   readonly trustedSenders: readonly string[];
   readonly targetUsers: readonly string[];
+  /**
+   * The login the daemon itself authenticates as, confirmed by GitHub rather
+   * than read from configuration.
+   */
+  readonly selfLogin: string;
 };
 
 export type WorkReason = 'assigned' | 'mentioned' | 'review_requested';
@@ -167,6 +172,11 @@ export const qualifyDelivery = (
     Effect.flatMap((payload) => validatePayload(delivery.event, payload)),
     Effect.map((payload) => {
       const sender = normalize(payload.sender.login);
+      // ! Acting as a real account means receiving webhooks for the daemon's own
+      // ! comments and pushes — an App actor never did. Dropping the sender here
+      // ! rather than relying on it being absent from `trustedSenders` makes the
+      // ! loop impossible to configure into existence.
+      if (sender === normalize(policy.selfLogin)) return undefined;
       const trusted = new Set(policy.trustedSenders.map(normalize));
       const targets = policy.targetUsers.map(normalize);
       if (!trusted.has(sender) || targets.length === 0) return undefined;

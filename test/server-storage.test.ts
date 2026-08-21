@@ -10,8 +10,8 @@ import { Server, WEBHOOK_PATH } from '../src/server.ts';
 import { sign } from '../src/webhook/signature.ts';
 
 const config = LictorConfig.make({
-  appId: '1',
-  privateKey: Redacted.make('unused'),
+  githubToken: Redacted.make('test-token'),
+  expectedLogin: 'adiutriel',
   webhookSecret: Redacted.make('storage-secret'),
   trustedSenders: [],
   targetUsers: [],
@@ -86,7 +86,7 @@ const serve = (workQueue: WorkQueue) =>
             Layer.provide(
               Layer.succeed(
                 GitHubClient,
-                GitHubClient.make({ forInstallation: () => Effect.die('unused') }),
+                GitHubClient.make({ authenticated: Effect.die('unused') }),
               ),
             ),
             Layer.provide(Layer.effect(Policy, parsePolicy('').pipe(Effect.map(Policy.make)))),

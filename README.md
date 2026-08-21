@@ -10,7 +10,7 @@ A local GitHub automation daemon that gives Codex durable, policy-scoped work.
   <a href="https://bun.sh/"><img src="https://img.shields.io/badge/bun-%E2%89%A5%201.3.14-fbf0df" alt="Bun >= 1.3.14"></a>
 </p>
 
-Lictor verifies GitHub App webhooks, commits each delivery to SQLite before
+Lictor verifies signed GitHub webhooks, commits each delivery to SQLite before
 acknowledging it, and runs qualifying work in an isolated repository worktree.
 GitHub credentials stay in the daemon; agent GitHub operations pass through a
 job-scoped, audited capability broker.
@@ -26,7 +26,8 @@ GitHub -> tunnel -> webhook -> durable inbox -> policy -> queue
 ## Requirements
 
 - Bun 1.3.14 or newer
-- a GitHub App installed on each managed repository
+- a classic `repo`-scope personal access token for the account the daemon acts as
+- a webhook on each managed repository, delivering to the route below
 - the Codex CLI, authenticated on the daemon machine
 - a tunnel such as `cloudflared` for the public webhook route
 
@@ -44,13 +45,23 @@ bun run start
 ```
 
 The example environment starts with `LICTOR_EXECUTOR=disabled`, empty trusted
-principals, and no implicit GitHub mutation authority. This lets you verify App
+principals, and no implicit GitHub mutation authority. This lets you verify token
 authentication, webhook signatures, durable receipt, and policy loading before
 Codex can claim work.
 
-Create the GitHub App with a webhook secret, download its private key, install
-it on the repositories you intend to manage, and subscribe only to the issue,
-pull-request, review, and comment events you use. Point its webhook URL at:
+Create the token from the account's Developer settings, set it as
+`LICTOR_GITHUB_TOKEN`, and put that account's login in `LICTOR_GITHUB_LOGIN` —
+startup calls `GET /user` and refuses to run if the two disagree.
+
+A classic token cannot be scoped to particular repositories: it reaches
+everything the account reaches, which includes its own repositories and anything
+granted through organization membership or a team. Use a dedicated account whose
+entire access you control, not a personal one.
+
+Add a webhook to each repository you intend to manage with the same secret, and
+subscribe only to the issue, pull-request, review, and comment events you use.
+Set its content type to `application/json` — the default urlencoded body passes
+signature verification and then fails to parse. Point its payload URL at:
 
 ```text
 https://<your-tunnel>/webhooks/github
@@ -88,8 +99,9 @@ pullRequests = true
 merge = false
 ```
 
-When cloning is allowed, Lictor mints a short-lived installation token and
-passes it to Git without storing it in the remote URL or credential store.
+When cloning is allowed, Lictor passes the token to Git as an `Authorization`
+header injected per command, without storing it in the remote URL or credential
+store.
 Existing clones are accepted only when their canonical path stays inside an
 allowed root and `origin` matches the delivery repository.
 
@@ -161,14 +173,15 @@ running. SQLite state and its WAL must be treated as one consistency boundary.
 ## Failure guarantees and limits
 
 - `202 Accepted` means the exact signed delivery is durably committed.
-- Storage failure returns `503`, leaving GitHub responsible for redelivery.
+- Storage failure returns `503`. GitHub does not retry a failed delivery on its
+  own, so recovery is a manual redelivery from the webhook's delivery log.
 - Duplicate delivery and interaction identities are idempotent.
 - One daemon owns the database; worker attempts use renewable fenced leases.
 - Expired work is retried within its attempt budget, then dead-lettered.
 - Queue depth, job age, per-repository attempts, and execution duration are
   policy limits, not prompt instructions.
-- Codex receives an allowlisted environment without App keys, webhook secrets,
-  installation tokens, or ambient `gh` credentials.
+- Codex receives an allowlisted environment without the access token, webhook
+  secret, or ambient `gh` credentials. Every write goes through the broker.
 - Logs use stable error codes and omit raw payloads, parse values, credentials,
   and agent stderr.
 

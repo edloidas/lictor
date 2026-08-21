@@ -2,15 +2,89 @@ import { existsSync, lstatSync, mkdirSync, realpathSync, rmSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { Data, Effect, PartitionedSemaphore, Redacted } from 'effect';
 import { ProcessRunner } from '../executor/process-runner.ts';
-import { GitHubApp } from '../github/app.ts';
+import { GitHubCredential } from '../github/credential.ts';
 import type { RepositoryPolicy } from '../policy.ts';
 import type { WorkItem } from '../webhook/qualification.ts';
 
 export class WorkspaceError extends Data.TaggedError('WorkspaceError')<{
   readonly code: string;
   readonly message: string;
+  /**
+   * Whether another attempt could plausibly succeed. Absent means yes — most
+   * workspace failures are transient. A refused credential is not.
+   */
+  readonly retryable?: boolean;
+  /** How long to wait before retrying, when GitHub asked for a delay. */
+  readonly retryAfterMs?: number;
   readonly cause?: unknown;
 }> {}
+
+/**
+ * `git` reports a refused credential only in prose on stderr, so the text is
+ * the only signal available. Retrying either of these costs a full clone cycle
+ * and cannot succeed: the token is wrong, or the account lacks write access.
+ */
+const CREDENTIAL_REJECTED =
+  /invalid credentials|authentication failed|could not read username|terminal prompts disabled/i;
+const ACCESS_DENIED = /write access to repository not granted/i;
+// ! Separate from access denial, because GitHub answers "not found" for a private
+// ! repository the credential cannot see. That is indistinguishable from a
+// ! repository that truly does not exist, and one of the two heals — on a token
+// ! rotation, an SSO authorization, or an invitation being accepted.
+const REPOSITORY_UNAVAILABLE = /repository not found/i;
+// ! Git reports API throttling two ways: the prose GitHub writes on the
+// ! smart-HTTP channel, and the bare status the transport surfaces when there is
+// ! no prose at all. Only matching the first left the common case falling
+// ! through to a generic failure that retries on the short exponential base.
+const RATE_LIMITED = /exceeded a secondary rate limit|rate limit exceeded|returned error: 429/i;
+
+/** Conservative wait when git reports throttling, which carries no reset header. */
+const GIT_RATE_LIMIT_WAIT_MS = 60_000;
+
+/** Room for an operator to notice a dead credential and rotate it. */
+const CREDENTIAL_ROTATION_WAIT_MS = 5 * 60 * 1000;
+
+const classifyGitFailure = (
+  stderr: string,
+  fallback: { readonly code: string; readonly message: string },
+): WorkspaceError => {
+  if (CREDENTIAL_REJECTED.test(stderr)) {
+    // ! Retryable, but slowly. A refused credential heals the moment an operator
+    // ! rotates the token, so failing the job outright discards work for a
+    // ! daemon-side problem that says nothing about the job — the same reasoning
+    // ! that stops a delivery being condemned for it. The long wait is what
+    // ! stops the attempt budget burning a clone cycle per minute in the
+    // ! meantime. Retaining the job without spending attempts at all needs queue
+    // ! support and belongs with the credential breaker in #28.
+    return new WorkspaceError({
+      code: 'WORKSPACE_CREDENTIAL_REJECTED',
+      message: 'GitHub rejected the daemon credential',
+      retryAfterMs: CREDENTIAL_ROTATION_WAIT_MS,
+    });
+  }
+  if (ACCESS_DENIED.test(stderr)) {
+    return new WorkspaceError({
+      code: 'WORKSPACE_ACCESS_DENIED',
+      message: 'The daemon account cannot write to this repository',
+      retryable: false,
+    });
+  }
+  if (REPOSITORY_UNAVAILABLE.test(stderr)) {
+    return new WorkspaceError({
+      code: 'WORKSPACE_REPOSITORY_UNAVAILABLE',
+      message: 'The repository does not exist or is invisible to the daemon account',
+      retryAfterMs: CREDENTIAL_ROTATION_WAIT_MS,
+    });
+  }
+  if (RATE_LIMITED.test(stderr)) {
+    return new WorkspaceError({
+      code: 'WORKSPACE_RATE_LIMITED',
+      message: 'GitHub throttled the repository operation',
+      retryAfterMs: GIT_RATE_LIMIT_WAIT_MS,
+    });
+  }
+  return new WorkspaceError(fallback);
+};
 
 export type JobWorkspace = {
   readonly repository: string;
@@ -41,7 +115,7 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
   {
     effect: Effect.gen(function* () {
       const processes = yield* ProcessRunner;
-      const app = yield* GitHubApp;
+      const credential = yield* GitHubCredential;
       const locks = yield* PartitionedSemaphore.make<string>({ permits: 1 });
 
       const command = (
@@ -100,12 +174,6 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
                 message: 'Repository cloning is denied by policy',
               });
             }
-            if (work.installationId === undefined) {
-              return yield* new WorkspaceError({
-                code: 'WORKSPACE_INSTALLATION_MISSING',
-                message: 'Installation identity is required to clone',
-              });
-            }
             yield* Effect.try({
               try: () => {
                 const canonicalRoot = canonicalExisting(allowedRoot);
@@ -128,7 +196,7 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
                   cause,
                 }),
             });
-            const token = yield* app.token(work.installationId);
+            const authorization = yield* credential.gitAuthHeader;
             const result = yield* command(
               ['git', 'clone', `https://github.com/${work.repository}.git`, candidate],
               dirname(candidate),
@@ -140,13 +208,13 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
                 GIT_TERMINAL_PROMPT: '0',
                 GIT_CONFIG_COUNT: '2',
                 GIT_CONFIG_KEY_0: 'http.https://github.com/.extraHeader',
-                GIT_CONFIG_VALUE_0: `Authorization: Bearer ${Redacted.value(token)}`,
+                GIT_CONFIG_VALUE_0: `Authorization: ${Redacted.value(authorization)}`,
                 GIT_CONFIG_KEY_1: 'core.hooksPath',
                 GIT_CONFIG_VALUE_1: '/dev/null',
               },
             );
             if (result.exitCode !== 0) {
-              return yield* new WorkspaceError({
+              return yield* classifyGitFailure(result.stderr, {
                 code: 'WORKSPACE_CLONE_FAILED',
                 message: 'Could not clone repository',
               });
@@ -174,13 +242,7 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
               message: 'Existing clone does not match the delivery repository',
             });
           }
-          if (work.installationId === undefined) {
-            return yield* new WorkspaceError({
-              code: 'WORKSPACE_INSTALLATION_MISSING',
-              message: 'Installation identity is required to refresh the repository',
-            });
-          }
-          const token = yield* app.token(work.installationId);
+          const authorization = yield* credential.gitAuthHeader;
           const fetch = yield* command(
             ['git', '-C', canonical, 'fetch', '--prune', 'origin'],
             canonical,
@@ -192,13 +254,13 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
               GIT_TERMINAL_PROMPT: '0',
               GIT_CONFIG_COUNT: '2',
               GIT_CONFIG_KEY_0: 'http.https://github.com/.extraHeader',
-              GIT_CONFIG_VALUE_0: `Authorization: Bearer ${Redacted.value(token)}`,
+              GIT_CONFIG_VALUE_0: `Authorization: ${Redacted.value(authorization)}`,
               GIT_CONFIG_KEY_1: 'core.hooksPath',
               GIT_CONFIG_VALUE_1: '/dev/null',
             },
           );
           if (fetch.exitCode !== 0) {
-            return yield* new WorkspaceError({
+            return yield* classifyGitFailure(fetch.stderr, {
               code: 'WORKSPACE_FETCH_FAILED',
               message: 'Could not refresh repository state',
             });
@@ -305,6 +367,6 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
 
       return { create, cleanup, withRepositoryLock };
     }),
-    dependencies: [ProcessRunner.Default, GitHubApp.Default],
+    dependencies: [ProcessRunner.Default, GitHubCredential.Default],
   },
 ) {}

@@ -3,7 +3,7 @@ import { Effect, Either } from 'effect';
 import type { Delivery } from '../src/webhook/event.ts';
 import { qualifyDelivery } from '../src/webhook/qualification.ts';
 
-const policy = { trustedSenders: ['edloidas'], targetUsers: ['adiutriel'] };
+const policy = { trustedSenders: ['edloidas'], targetUsers: ['adiutriel'], selfLogin: 'adiutriel' };
 const subject = {
   number: 17,
   title: 'Keep the queue moving',
@@ -36,6 +36,41 @@ const run = (input: Delivery, customPolicy = policy) =>
   Effect.runSync(Effect.either(qualifyDelivery(input, customPolicy)));
 
 describe('qualifyDelivery', () => {
+  // ! An App actor never received webhooks for its own actions; a real account
+  // ! does. The drop must not depend on the operator having left the daemon's
+  // ! login out of `trustedSenders`.
+  it('drops a delivery the daemon itself authored, even when that login is trusted', () => {
+    const result = run(
+      delivery('issue_comment', {
+        action: 'created',
+        sender: { login: 'adiutriel' },
+        issue: subject,
+        comment: { body: 'following up @adiutriel', html_url: 'https://github.com/c/1' },
+      }),
+      {
+        trustedSenders: ['edloidas', 'adiutriel'],
+        targetUsers: ['adiutriel'],
+        selfLogin: 'adiutriel',
+      },
+    );
+
+    expect(Either.getOrThrow(result)).toBeUndefined();
+  });
+
+  it('matches the daemon login case-insensitively when dropping', () => {
+    const result = run(
+      delivery('issue_comment', {
+        action: 'created',
+        sender: { login: 'Adiutriel' },
+        issue: subject,
+        comment: { body: 'ping @adiutriel', html_url: 'https://github.com/c/2' },
+      }),
+      { trustedSenders: ['Adiutriel'], targetUsers: ['adiutriel'], selfLogin: 'adiutriel' },
+    );
+
+    expect(Either.getOrThrow(result)).toBeUndefined();
+  });
+
   it('qualifies an issue assigned by a trusted sender to a configured target', () => {
     const result = run(
       delivery('issues', { action: 'assigned', issue: subject, assignee: { login: 'Adiutriel' } }),
@@ -154,7 +189,9 @@ describe('qualifyDelivery', () => {
     });
 
     expect(
-      Either.getOrThrow(run(input, { trustedSenders: [], targetUsers: ['adiutriel'] })),
+      Either.getOrThrow(
+        run(input, { trustedSenders: [], targetUsers: ['adiutriel'], selfLogin: 'adiutriel' }),
+      ),
     ).toBeUndefined();
   });
 
