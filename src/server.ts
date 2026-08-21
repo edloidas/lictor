@@ -32,14 +32,14 @@ const webhook = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
 
   const contentLength = Number(request.headers['content-length']);
-  if (Number.isFinite(contentLength) && contentLength > config.webhookMaxBytes) {
+  if (Number.isFinite(contentLength) && contentLength > config.deliveryMaxBytes) {
     return HttpServerResponse.empty({ status: 413 });
   }
 
   // ! Raw bytes, not `request.json`. The HMAC covers exactly what GitHub sent,
   // ! and re-serializing a parsed payload changes key order and whitespace.
   const bodyResult = yield* Effect.either(
-    request.text.pipe(HttpServerRequest.withMaxBodySize(Option.some(config.webhookMaxBytes))),
+    request.text.pipe(HttpServerRequest.withMaxBodySize(Option.some(config.deliveryMaxBytes))),
   );
   if (bodyResult._tag === 'Left') return HttpServerResponse.empty({ status: 413 });
   const body = bodyResult.right;
@@ -55,7 +55,7 @@ const webhook = Effect.gen(function* () {
     return HttpServerResponse.empty({ status: 401 });
   }
 
-  if (new TextEncoder().encode(body).byteLength > config.webhookMaxBytes) {
+  if (new TextEncoder().encode(body).byteLength > config.deliveryMaxBytes) {
     return HttpServerResponse.empty({ status: 413 });
   }
 

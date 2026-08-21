@@ -145,8 +145,8 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       databasePath: yield* statePath('LICTOR_DATABASE_PATH', 'lictor.sqlite'),
       policyPath: yield* statePath('LICTOR_POLICY_PATH', 'policy.toml'),
       controlSocketPath: yield* statePath('LICTOR_SOCKET_PATH', 'lictor.sock'),
-      webhookMaxBytes: yield* positiveInteger(
-        'LICTOR_WEBHOOK_MAX_BYTES',
+      deliveryMaxBytes: yield* positiveInteger(
+        'LICTOR_DELIVERY_MAX_BYTES',
         1024 * 1024,
         10 * 1024 * 1024,
       ),

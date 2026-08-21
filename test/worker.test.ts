@@ -35,7 +35,7 @@ const config = (maxAttempts = 3) =>
     databasePath: ':memory:',
     policyPath: 'policy.toml',
     controlSocketPath: '/tmp/lictor.sock',
-    webhookMaxBytes: 1024,
+    deliveryMaxBytes: 1024,
     executor: 'disabled',
     codexModel: 'gpt-5.6-luna',
     agentWorkdir: '.',

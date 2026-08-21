@@ -11,6 +11,13 @@ const DAEMON_LEASE_MS = 30_000;
 
 export type InboxStatus = 'pending' | 'processing' | 'completed' | 'failed';
 
+/**
+ * The producer that stored a delivery. One per transport; a consumer that
+ * decodes stored bodies switches over this instead of assuming an envelope.
+ * Grows when a second producer lands.
+ */
+export type DeliverySource = 'webhook';
+
 export type ReceivedDelivery = {
   readonly id: string;
   readonly event: string;
@@ -18,6 +25,7 @@ export type ReceivedDelivery = {
 };
 
 export type InboxDelivery = ReceivedDelivery & {
+  readonly source: DeliverySource;
   readonly status: InboxStatus;
   readonly attempts: number;
 };
@@ -67,8 +75,19 @@ const migrate = (database: Database) => {
   database.exec('PRAGMA journal_mode = WAL');
   database.exec('PRAGMA foreign_keys = ON');
   const version = database.query('PRAGMA user_version').get() as { user_version: number };
-  if (version.user_version === 5) return;
-  if (version.user_version > 5) {
+  // ! Column presence, not the version stamp alone, decides whether migration
+  // ! runs. The deliveries table predates its source column by several schema
+  // ! versions, and a database can carry the current stamp while its table
+  // ! lacks the column — an equality guard once stamped v6 onto v2–v4 tables
+  // ! it never altered, leaving every claim dying on a missing column while
+  // ! the server kept acknowledging deliveries into a queue nothing could
+  // ! drain. Checking presence makes both that state and any like it heal.
+  const deliveriesHaveSource = () =>
+    (database.query('PRAGMA table_info(deliveries)').all() as { name: string }[]).some(
+      (column) => column.name === 'source',
+    );
+  if (version.user_version === 6 && deliveriesHaveSource()) return;
+  if (version.user_version > 6) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -112,6 +131,7 @@ const migrate = (database: Database) => {
         id TEXT PRIMARY KEY,
         event TEXT NOT NULL,
         body TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'webhook',
         status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
         attempts INTEGER NOT NULL DEFAULT 0,
         received_at INTEGER NOT NULL,
@@ -175,6 +195,12 @@ const migrate = (database: Database) => {
     if (version.user_version === 4) {
       database.exec('ALTER TABLE capability_audit ADD COLUMN actor TEXT');
     }
+    // ! The check sits after the `CREATE TABLE IF NOT EXISTS` above, which is
+    // ! its only ordering constraint: a table that never existed is created
+    // ! complete, and one that predates the column is altered here.
+    if (!deliveriesHaveSource()) {
+      database.exec("ALTER TABLE deliveries ADD COLUMN source TEXT NOT NULL DEFAULT 'webhook'");
+    }
     database.exec(`
       CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs(status, available_at, id);
       CREATE TABLE IF NOT EXISTS daemon_owner (
@@ -195,7 +221,7 @@ const migrate = (database: Database) => {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS capability_audit_job ON capability_audit(job_id, id);
-      PRAGMA user_version = 5;
+      PRAGMA user_version = 6;
     `);
   })();
 };
@@ -313,7 +339,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
 
     const receiveDelivery = (delivery: ReceivedDelivery) =>
       Effect.gen(function* () {
-        if (new TextEncoder().encode(delivery.body).byteLength > config.webhookMaxBytes) {
+        if (new TextEncoder().encode(delivery.body).byteLength > config.deliveryMaxBytes) {
           return yield* new QueueError({
             operation: 'receive delivery',
             cause: new Error('Delivery body exceeds configured maximum'),
@@ -341,7 +367,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           .transaction(() => {
             const row = database
               .query(
-                `SELECT id, event, body, status, attempts FROM deliveries
+                `SELECT id, event, body, source, status, attempts FROM deliveries
                  WHERE status = 'pending' ORDER BY received_at, id LIMIT 1`,
               )
               .get() as InboxDelivery | null;
