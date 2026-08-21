@@ -59,7 +59,6 @@ const run = <A, E>(
   const PolicyLive = Layer.succeed(
     Policy,
     Policy.make({
-      workspaceRoots: ['/tmp'],
       completedRetentionDays: 30,
       failedRetentionDays: 90,
       maxQueueDepth: 1000,
@@ -69,7 +68,6 @@ const run = <A, E>(
         accepted: true,
         execution: 'automatic',
         clone: 'denied',
-        workspace: '/tmp/lictor',
         maxAttempts: 3,
         maxDurationMs: 30 * 60 * 1000,
         capabilities: {

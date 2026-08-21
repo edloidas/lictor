@@ -1,9 +1,10 @@
-import { existsSync, lstatSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { Data, Effect, PartitionedSemaphore, Redacted } from 'effect';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { Data, Effect, PartitionedSemaphore, Redacted, Ref } from 'effect';
+import { LictorConfig } from '../config.ts';
 import { ProcessRunner } from '../executor/process-runner.ts';
 import { GitHubCredential } from '../github/credential.ts';
-import type { RepositoryPolicy } from '../policy.ts';
+import { isSafeRepository, type RepositoryPolicy } from '../policy.ts';
 import type { WorkItem } from '../webhook/qualification.ts';
 
 export class WorkspaceError extends Data.TaggedError('WorkspaceError')<{
@@ -92,31 +93,21 @@ export type JobWorkspace = {
   readonly worktreePath: string;
 };
 
-const within = (root: string, candidate: string): boolean => {
-  const path = relative(root, candidate);
-  return path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path);
-};
-
-const canonicalExisting = (path: string) => realpathSync(path);
-
-const nearestExistingParent = (path: string): string => {
-  let current = path;
-  while (!existsSync(current)) current = dirname(current);
-  return current;
-};
-
-const expectedRemote = (repository: string): RegExp => {
-  const escaped = repository.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`^https://github\\.com/${escaped}(?:\\.git)?/?$`, 'i');
-};
-
 export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
   'RepositoryWorkspace',
   {
     effect: Effect.gen(function* () {
+      const config = yield* LictorConfig;
       const processes = yield* ProcessRunner;
       const credential = yield* GitHubCredential;
       const locks = yield* PartitionedSemaphore.make<string>({ permits: 1 });
+      /** Worktrees this daemon created and has not cleaned up. */
+      const owned = yield* Ref.make<ReadonlySet<string>>(new Set());
+      /**
+       * Every clone lives here, and nothing else decides where. Beside the
+       * database, like the Codex home, so relocating state relocates all of it.
+       */
+      const root = join(dirname(resolve(config.databasePath)), 'workspaces');
 
       const command = (
         args: readonly string[],
@@ -141,53 +132,44 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
           },
         });
 
-      const resolveClone = (work: WorkItem, policy: RepositoryPolicy, roots: readonly string[]) =>
+      const resolveClone = (work: WorkItem, policy: RepositoryPolicy) =>
         Effect.gen(function* () {
-          const configured = policy.workspace;
-          const [owner, name] = work.repository.toLowerCase().split('/');
-          if (owner === undefined || name === undefined) {
+          // ! The one check between a GitHub payload and a `join`. Terminal:
+          // ! nothing about a name changes on a retry or a token rotation.
+          if (!isSafeRepository(work.repository)) {
             return yield* new WorkspaceError({
               code: 'WORKSPACE_REPOSITORY_INVALID',
               message: 'Invalid repository name',
+              retryable: false,
             });
           }
-          const candidate =
-            configured ?? (roots[0] === undefined ? undefined : join(roots[0], owner, name));
-          if (candidate === undefined) {
-            return yield* new WorkspaceError({
-              code: 'WORKSPACE_ROOT_MISSING',
-              message: 'No workspace root is configured',
-            });
-          }
-          const allowedRoot = roots.find((root) => within(resolve(root), resolve(candidate)));
-          if (allowedRoot === undefined) {
-            return yield* new WorkspaceError({
-              code: 'WORKSPACE_PATH_DENIED',
-              message: 'Repository path is outside configured roots',
-            });
-          }
+          const repository = work.repository.trim().toLowerCase();
+          const candidate = join(root, repository);
 
-          if (!existsSync(candidate)) {
+          // ! Asking git, not the filesystem. `git clone` writes `.git` first
+          // ! and cleans up after its own failures only, so a hard kill leaves
+          // ! a directory that looks like a clone and has no resolvable `HEAD`.
+          const healthy =
+            existsSync(candidate) &&
+            (yield* command(
+              ['git', '-C', candidate, 'rev-parse', '--verify', '--quiet', 'HEAD'],
+              candidate,
+            )).exitCode === 0;
+
+          if (!healthy) {
+            // ! Terminal: neither the policy nor the unusable directory
+            // ! changes between attempts.
             if (policy.clone !== 'allowed') {
               return yield* new WorkspaceError({
                 code: 'WORKSPACE_CLONE_DENIED',
                 message: 'Repository cloning is denied by policy',
+                retryable: false,
               });
             }
             yield* Effect.try({
               try: () => {
-                const canonicalRoot = canonicalExisting(allowedRoot);
-                const parent = nearestExistingParent(dirname(candidate));
-                if (
-                  lstatSync(parent).isSymbolicLink() ||
-                  !within(canonicalRoot, canonicalExisting(parent))
-                ) {
-                  throw new Error('Clone parent escapes its configured root');
-                }
+                rmSync(candidate, { recursive: true, force: true });
                 mkdirSync(dirname(candidate), { recursive: true, mode: 0o700 });
-                if (!within(canonicalRoot, canonicalExisting(dirname(candidate)))) {
-                  throw new Error('Clone parent escapes its configured root');
-                }
               },
               catch: (cause) =>
                 new WorkspaceError({
@@ -198,7 +180,7 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
             });
             const authorization = yield* credential.gitAuthHeader;
             const result = yield* command(
-              ['git', 'clone', `https://github.com/${work.repository}.git`, candidate],
+              ['git', 'clone', `https://github.com/${repository}.git`, candidate],
               dirname(candidate),
               {
                 PATH: process.env.PATH ?? '/usr/bin:/bin',
@@ -221,31 +203,10 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
             }
           }
 
-          const canonicalRoot = canonicalExisting(allowedRoot);
-          const canonical = canonicalExisting(candidate);
-          if (!within(canonicalRoot, canonical)) {
-            return yield* new WorkspaceError({
-              code: 'WORKSPACE_SYMLINK_ESCAPE',
-              message: 'Canonical repository path escapes its root',
-            });
-          }
-          const remote = yield* command(
-            ['git', '-C', canonical, 'remote', 'get-url', 'origin'],
-            canonical,
-          );
-          if (
-            remote.exitCode !== 0 ||
-            !expectedRemote(work.repository).test(remote.stdout.trim())
-          ) {
-            return yield* new WorkspaceError({
-              code: 'WORKSPACE_REMOTE_MISMATCH',
-              message: 'Existing clone does not match the delivery repository',
-            });
-          }
           const authorization = yield* credential.gitAuthHeader;
           const fetch = yield* command(
-            ['git', '-C', canonical, 'fetch', '--prune', 'origin'],
-            canonical,
+            ['git', '-C', candidate, 'fetch', '--prune', 'origin'],
+            candidate,
             {
               PATH: process.env.PATH ?? '/usr/bin:/bin',
               HOME: '/var/empty',
@@ -265,31 +226,20 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
               message: 'Could not refresh repository state',
             });
           }
-          return canonical;
+          return { path: candidate, repository, fresh: !healthy };
         });
 
-      const create = (
-        jobId: number,
-        work: WorkItem,
-        policy: RepositoryPolicy,
-        roots: readonly string[],
-      ) =>
+      const create = (jobId: number, work: WorkItem, policy: RepositoryPolicy) =>
         Effect.gen(function* () {
-          const clonePath = yield* resolveClone(work, policy, roots);
-          const worktreeRoot = join(dirname(clonePath), '.lictor-worktrees');
+          const clone = yield* resolveClone(work, policy);
+          const clonePath = clone.path;
+          // ! Beside the clones, not among them: an owner may not begin with a
+          // ! dot, while `owner/.lictor-worktrees` is a name GitHub allows.
+          // ! Still keyed by repository, because a job id alone is not unique
+          // ! across the databases these directories outlive.
+          const worktreeRoot = join(root, '.worktrees', clone.repository);
           yield* Effect.try({
-            try: () => {
-              mkdirSync(worktreeRoot, { recursive: true, mode: 0o700 });
-              const canonicalRoot = canonicalExisting(
-                roots.find((root) => within(resolve(root), resolve(clonePath))) ?? '',
-              );
-              if (
-                lstatSync(worktreeRoot).isSymbolicLink() ||
-                !within(canonicalRoot, canonicalExisting(worktreeRoot))
-              ) {
-                throw new Error('Worktree root escapes its configured root');
-              }
-            },
+            try: () => mkdirSync(worktreeRoot, { recursive: true, mode: 0o700 }),
             catch: (cause) =>
               new WorkspaceError({
                 code: 'WORKSPACE_CREATE_FAILED',
@@ -297,17 +247,26 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
                 cause,
               }),
           });
-          const worktreePath = join(worktreeRoot, `${basename(clonePath)}-${jobId}`);
-          if (existsSync(worktreePath)) {
-            if (
-              lstatSync(worktreePath).isSymbolicLink() ||
-              !within(canonicalExisting(worktreeRoot), canonicalExisting(worktreePath))
-            ) {
-              return yield* new WorkspaceError({
-                code: 'WORKSPACE_SYMLINK_ESCAPE',
-                message: 'Retained worktree escapes its root',
-              });
-            }
+          const worktreePath = join(worktreeRoot, `job-${jobId}`);
+          // ! Only a worktree this daemon made, over a clone it did not just
+          // ! replace, may be handed back. Anything else at that path belongs
+          // ! to another epoch or to a `worktree add` that was killed halfway,
+          // ! and running the agent in it is running it in the wrong tree.
+          const reusable = (yield* Ref.get(owned)).has(worktreePath) && !clone.fresh;
+          if (existsSync(worktreePath) && !reusable) {
+            yield* Effect.try({
+              try: () => rmSync(worktreePath, { recursive: true, force: true }),
+              catch: (cause) =>
+                new WorkspaceError({
+                  code: 'WORKSPACE_CREATE_FAILED',
+                  message: 'Could not discard a stale worktree',
+                  cause,
+                }),
+            });
+            // ! `worktree add` refuses a path git still has a record of, and
+            // ! removing the directory does not remove the record.
+            yield* command(['git', '-C', clonePath, 'worktree', 'prune'], clonePath);
+          } else if (reusable) {
             return {
               repository: policy.repository,
               clonePath,
@@ -338,6 +297,7 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
               code: 'WORKTREE_CREATE_FAILED',
               message: 'Could not create isolated worktree',
             });
+          yield* Ref.update(owned, (paths) => new Set(paths).add(worktreePath));
           return { repository: policy.repository, clonePath, worktreePath } satisfies JobWorkspace;
         });
 
@@ -359,6 +319,13 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
               Effect.tap(() =>
                 Effect.sync(() => rmSync(workspace.worktreePath, { recursive: true, force: true })),
               ),
+              Effect.tap(() =>
+                Ref.update(owned, (paths) => {
+                  const remaining = new Set(paths);
+                  remaining.delete(workspace.worktreePath);
+                  return remaining;
+                }),
+              ),
               Effect.asVoid,
             );
 
@@ -367,6 +334,6 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
 
       return { create, cleanup, withRepositoryLock };
     }),
-    dependencies: [ProcessRunner.Default, GitHubCredential.Default],
+    dependencies: [LictorConfig.Default, ProcessRunner.Default, GitHubCredential.Default],
   },
 ) {}

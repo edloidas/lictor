@@ -48,7 +48,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         .withRepositoryLock(
           job.work.repository,
           Effect.acquireUseRelease(
-            workspaces.create(job.id, job.work, repositoryPolicy, policy.workspaceRoots),
+            workspaces.create(job.id, job.work, repositoryPolicy),
             (workspace) =>
               executor
                 .execute(

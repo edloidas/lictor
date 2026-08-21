@@ -83,8 +83,10 @@ signature configuration.
 
 ## Activate repository policy
 
-Edit `~/.lictor/policy.toml` before enabling execution. Absolute workspace roots
-are mandatory; explicit repository paths must resolve beneath one of them.
+Edit `~/.lictor/policy.toml` before enabling execution. Policy names
+repositories, never filesystem paths: `allow` takes full `owner/name` entries and
+rejects owner wildcards, so a repository is armed only when it is listed here.
+Being invited to one grants reach, not permission.
 
 ```toml
 [defaults]
@@ -92,14 +94,12 @@ execution = "approval"
 clone = "denied"
 
 [repositories]
-allow = ["edloidas/*"]
+allow = ["edloidas/lictor"]
 deny = []
-workspaceRoots = ["/srv/lictor/repositories"]
 
 [repositories.overrides."edloidas/lictor"]
 execution = "automatic"
 clone = "allowed"
-workspace = "/srv/lictor/repositories/edloidas/lictor"
 
 [repositories.overrides."edloidas/lictor".capabilities]
 read = true
@@ -112,9 +112,10 @@ merge = false
 
 When cloning is allowed, Lictor passes the token to Git as an `Authorization`
 header injected per command, without storing it in the remote URL or credential
-store.
-Existing clones are accepted only when their canonical path stays inside an
-allowed root and `origin` matches the delivery repository.
+store. Clones live under `workspaces/` beside the configured SQLite database,
+one directory per `owner/name`, on a path the daemon computes rather than one
+policy names. A directory there that is not a repository is discarded and cloned
+again, so an interrupted clone costs one job, not the repository.
 
 Run a policy check before activation:
 
