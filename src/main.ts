@@ -1,7 +1,7 @@
 import { FetchHttpClient } from '@effect/platform';
 import { BunHttpServer, BunRuntime } from '@effect/platform-bun';
 import { Cause, Clock, Effect, Exit, Layer } from 'effect';
-import { LictorConfig, port } from './config.ts';
+import { LictorConfig, legacyStateConflict, port } from './config.ts';
 import { ControlPlane, ControlServer } from './control/control-plane.ts';
 import { DeliveryWorker } from './delivery-worker.ts';
 import { describeCause } from './diagnostics.ts';
@@ -194,4 +194,15 @@ const Main = Layer.unwrapEffect(
   Effect.map(port, (bound) => Layer.provide(Application, BunHttpServer.layer({ port: bound }))),
 );
 
-BunRuntime.runMain(Layer.launch(Main));
+/**
+ * Runs before anything opens a file, because `WorkQueue` creates the database it
+ * cannot find and there is no second chance to notice the old one afterwards.
+ */
+const guardLegacyState = Effect.flatMap(LictorConfig, (config) => {
+  const conflict = legacyStateConflict(config);
+  return conflict === undefined
+    ? Effect.void
+    : Effect.logFatal(conflict).pipe(Effect.zipRight(Effect.fail(new Error(conflict))));
+}).pipe(Effect.provide(ConfigLive));
+
+BunRuntime.runMain(Effect.zipRight(guardLegacyState, Layer.launch(Main)));

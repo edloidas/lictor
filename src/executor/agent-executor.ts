@@ -58,6 +58,9 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
     const processes = yield* ProcessRunner;
     const mcpClientPath = join(import.meta.dir, '../github/mcp-client.ts');
     const controlSocketPath = resolve(config.controlSocketPath);
+    // ! Derived from the database's directory rather than configured, so the
+    // ! agent's home always follows daemon state. With the default that is
+    // ! `~/.lictor/codex`, which is the path `codex login` has to be run against.
     const codexHome = join(dirname(resolve(config.databasePath)), 'codex');
     yield* Effect.sync(() => mkdirSync(codexHome, { recursive: true, mode: 0o700 }));
 
