@@ -4,6 +4,7 @@ import { Effect, Layer, Redacted, Ref } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { CapabilityBroker } from '../src/github/capability-broker.ts';
 import { GitHubClient } from '../src/github/client.ts';
+import { GitHubIdentity } from '../src/github/identity.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/webhook/qualification.ts';
@@ -28,8 +29,8 @@ const work: WorkItem = {
 const ConfigLive = Layer.succeed(
   LictorConfig,
   LictorConfig.make({
-    appId: '1',
-    privateKey: Redacted.make('private'),
+    githubToken: Redacted.make('test-token'),
+    expectedLogin: 'adiutriel',
     webhookSecret: Redacted.make('secret'),
     trustedSenders: [],
     targetUsers: [],
@@ -48,18 +49,34 @@ const ConfigLive = Layer.succeed(
   }),
 );
 
-const run = <A, E>(effect: Effect.Effect<A, E, CapabilityBroker | WorkQueue>, source: string) =>
+const readBody = (request: { readonly body: unknown }): string => {
+  const body = request.body as { readonly body?: unknown };
+  return body.body instanceof Uint8Array ? new TextDecoder().decode(body.body) : '';
+};
+
+const run = <A, E>(
+  effect: Effect.Effect<A, E, CapabilityBroker | WorkQueue>,
+  source: string,
+  reply: {
+    readonly status?: number;
+    readonly headers?: Record<string, string>;
+    readonly body?: unknown;
+  } = {},
+) =>
   Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
         const requests = yield* Ref.make<string[]>([]);
+        const bodies = yield* Ref.make<string[]>([]);
         const client = HttpClient.make((request) =>
           Ref.update(requests, (items) => [...items, request.url]).pipe(
+            Effect.zipRight(Ref.update(bodies, (items) => [...items, readBody(request)])),
             Effect.as(
               HttpClientResponse.fromWeb(
                 request,
-                new Response(JSON.stringify({ ok: true, token: undefined }), {
-                  headers: { 'content-type': 'application/json' },
+                new Response(JSON.stringify(reply.body ?? { ok: true, token: undefined }), {
+                  status: reply.status ?? 200,
+                  headers: { 'content-type': 'application/json', ...reply.headers },
                 }),
               ),
             ),
@@ -70,7 +87,7 @@ const run = <A, E>(effect: Effect.Effect<A, E, CapabilityBroker | WorkQueue>, so
         );
         const GitHubLive = Layer.succeed(
           GitHubClient,
-          GitHubClient.make({ forInstallation: () => Effect.succeed(scopedClient) }),
+          GitHubClient.make({ authenticated: Effect.succeed(scopedClient) }),
         );
         const PolicyLive = Layer.effect(
           Policy,
@@ -79,11 +96,17 @@ const run = <A, E>(effect: Effect.Effect<A, E, CapabilityBroker | WorkQueue>, so
           ),
         );
         const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
+        const IdentityLive = Layer.succeed(
+          GitHubIdentity,
+          GitHubIdentity.make({
+            verified: Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }),
+          }),
+        );
         const BrokerLive = CapabilityBroker.DefaultWithoutDependencies.pipe(
-          Layer.provide(Layer.mergeAll(GitHubLive, PolicyLive, QueueLive)),
+          Layer.provide(Layer.mergeAll(GitHubLive, IdentityLive, PolicyLive, QueueLive)),
         );
         const value = yield* effect.pipe(Effect.provide(Layer.merge(BrokerLive, QueueLive)));
-        return { value, requests: yield* Ref.get(requests) };
+        return { value, requests: yield* Ref.get(requests), bodies: yield* Ref.get(bodies) };
       }),
     ),
   );
@@ -186,6 +209,9 @@ describe('CapabilityBroker', () => {
     expect(result.value.audit.at(-1)).toMatchObject({
       repository: 'edloidas/lictor',
       installationId: 42,
+      // ! Repository webhooks never populate installationId, so on a real
+      // ! delivery the actor is the only identity an audit row carries.
+      actor: 'adiutriel',
       capability: 'get_issue',
       outcome: 'ok',
     });
@@ -238,5 +264,264 @@ describe('CapabilityBroker', () => {
     );
     expect(String(result.value)).toContain('CAPABILITY_REPOSITORY_DENIED');
     expect(result.requests).toHaveLength(0);
+  });
+  // ! Harmless while every commit was visibly `lictor[bot]`; once commits carry a
+  // ! person's account, a forwarded `author` attributes work to someone who did
+  // ! not do it.
+  it('strips agent-supplied author and committer from a commit', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        return yield* broker.callTool({
+          jobId: enqueued.jobId,
+          attemptNumber: claimed?.attempts ?? -1,
+          workerId: claimed?.workerId ?? '',
+          name: 'create_commit',
+          input: {
+            message: 'chore: something',
+            tree: 'abc',
+            parents: ['def'],
+            author: { name: 'Someone Else', email: 'someone@example.com' },
+            committer: { name: 'Someone Else', email: 'someone@example.com' },
+          },
+        });
+      }),
+      '[defaults.capabilities]\nread = true\nbranches = true',
+    );
+
+    expect(result.bodies[0]).toContain('chore: something');
+    expect(result.bodies[0]).not.toContain('author');
+    expect(result.bodies[0]).not.toContain('committer');
+    expect(result.bodies[0]).not.toContain('someone@example.com');
+  });
+
+  it('leaves other capabilities\u2019 input untouched', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        return yield* broker.callTool({
+          jobId: enqueued.jobId,
+          attemptNumber: claimed?.attempts ?? -1,
+          workerId: claimed?.workerId ?? '',
+          name: 'create_comment',
+          input: { number: 13, body: 'mentioning author and committer' },
+        });
+      }),
+      '[defaults.capabilities]\nread = true\ncomment = true',
+    );
+
+    expect(result.bodies[0]).toContain('mentioning author and committer');
+  });
+
+  // ! An installation token healed by re-minting. A revoked PAT never does, so a
+  // ! generic failure code spends every remaining attempt on a dead credential.
+  it('reports a rejected credential distinctly from a generic failure', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        return yield* Effect.exit(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'get_issue',
+            input: { number: 13 },
+          }),
+        );
+      }),
+      '[defaults.capabilities]\nread = true',
+      { status: 401 },
+    );
+
+    expect(String(result.value)).toContain('CAPABILITY_CREDENTIAL_REJECTED');
+  });
+
+  it('turns a throttled response into a rate-limit code carrying the wait', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        return yield* Effect.flip(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'get_issue',
+            input: { number: 13 },
+          }),
+        );
+      }),
+      '[defaults.capabilities]\nread = true',
+      { status: 429, headers: { 'retry-after': '30' } },
+    );
+
+    expect(result.value._tag).toBe('CapabilityError');
+    if (result.value._tag !== 'CapabilityError') return;
+    expect(result.value.code).toBe('CAPABILITY_RATE_LIMITED');
+    expect(result.value.retryAfterMs).toBe(30_000);
+  });
+
+  // ! 403 is GitHub's answer for both "forbidden" and "slow down". Only the
+  // ! throttled variant is worth retrying.
+  it('keeps an unthrottled 403 as a generic failure', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        return yield* Effect.flip(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'get_issue',
+            input: { number: 13 },
+          }),
+        );
+      }),
+      '[defaults.capabilities]\nread = true',
+      { status: 403 },
+    );
+
+    expect(result.value._tag).toBe('CapabilityError');
+    if (result.value._tag !== 'CapabilityError') return;
+    expect(result.value.code).toBe('CAPABILITY_GITHUB_FAILED');
+  });
+
+  // ! Unlike 403, a 429 has no second meaning. Falling through to the generic
+  // ! code when the header is missing tells the agent to retry at once, against
+  // ! a bucket GitHub just said is closed.
+  it('treats a 429 with no usable header as rate limited anyway', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        return yield* Effect.flip(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'get_issue',
+            input: { number: 13 },
+          }),
+        );
+      }),
+      '[defaults.capabilities]\nread = true',
+      { status: 429, headers: { 'retry-after': 'soon' } },
+    );
+
+    expect(result.value._tag).toBe('CapabilityError');
+    if (result.value._tag !== 'CapabilityError') return;
+    expect(result.value.code).toBe('CAPABILITY_RATE_LIMITED');
+    expect(result.value.retryAfterMs).toBe(60_000);
+  });
+
+  // ! A secondary limit is what an agent creating content actually trips, and
+  // ! GitHub answers it with 403 and no rate headers at all. Reading it as
+  // ! "forbidden" tells the agent to give up on a call that would succeed later.
+  it('recognises a secondary rate limit that arrives with no rate headers', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        return yield* Effect.flip(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'get_issue',
+            input: { number: 13 },
+          }),
+        );
+      }),
+      '[defaults.capabilities]\nread = true',
+      {
+        status: 403,
+        body: { message: 'You have exceeded a secondary rate limit. Please wait a few minutes.' },
+      },
+    );
+
+    expect(result.value._tag).toBe('CapabilityError');
+    if (result.value._tag !== 'CapabilityError') return;
+    expect(result.value.code).toBe('CAPABILITY_RATE_LIMITED');
+    expect(result.value.retryAfterMs).toBe(60_000);
+  });
+
+  it('still refuses a 403 whose body is an ordinary permission failure', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        return yield* Effect.flip(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'get_issue',
+            input: { number: 13 },
+          }),
+        );
+      }),
+      '[defaults.capabilities]\nread = true',
+      { status: 403, body: { message: 'Resource not accessible by personal access token' } },
+    );
+
+    expect(result.value._tag).toBe('CapabilityError');
+    if (result.value._tag !== 'CapabilityError') return;
+    expect(result.value.code).toBe('CAPABILITY_GITHUB_FAILED');
+  });
+
+  // ! `callTool` is only ever reached through `handleMcp` in production. A wait
+  // ! the agent cannot see is a wait that does not exist.
+  it('carries the wait and the prose across the MCP boundary', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        return yield* broker.handleMcp(
+          enqueued.jobId,
+          claimed?.attempts ?? -1,
+          claimed?.workerId ?? '',
+          {
+            jsonrpc: '2.0',
+            id: 7,
+            method: 'tools/call',
+            params: { name: 'get_issue', arguments: { number: 13 } },
+          },
+        );
+      }),
+      '[defaults.capabilities]\nread = true',
+      { status: 429, headers: { 'retry-after': '30' } },
+    );
+
+    expect(result.value).toMatchObject({
+      id: 7,
+      error: {
+        code: -32000,
+        message: 'CAPABILITY_RATE_LIMITED',
+        data: { retryAfterMs: 30_000 },
+      },
+    });
+    expect(JSON.stringify(result.value)).toContain('retry in 30s');
   });
 });

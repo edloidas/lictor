@@ -3,9 +3,9 @@ import { ConfigProvider, Effect, Layer } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 
 const required = new Map([
-  ['GITHUB_APP_ID', '1'],
-  ['GITHUB_PRIVATE_KEY', 'private'],
   ['GITHUB_WEBHOOK_SECRET', 'secret'],
+  ['LICTOR_GITHUB_TOKEN', 'test-token'],
+  ['LICTOR_GITHUB_LOGIN', 'Adiutriel'],
 ]);
 
 const load = (values: Map<string, string>) =>

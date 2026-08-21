@@ -67,8 +67,8 @@ const migrate = (database: Database) => {
   database.exec('PRAGMA journal_mode = WAL');
   database.exec('PRAGMA foreign_keys = ON');
   const version = database.query('PRAGMA user_version').get() as { user_version: number };
-  if (version.user_version === 4) return;
-  if (version.user_version > 4) {
+  if (version.user_version === 5) return;
+  if (version.user_version > 5) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -170,6 +170,11 @@ const migrate = (database: Database) => {
           WHERE status = 'running' AND lease_expires_at IS NULL;
       `);
     }
+    // The block below creates `capability_audit` for every path that predates
+    // it, so only a schema that already has the table needs the new column.
+    if (version.user_version === 4) {
+      database.exec('ALTER TABLE capability_audit ADD COLUMN actor TEXT');
+    }
     database.exec(`
       CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs(status, available_at, id);
       CREATE TABLE IF NOT EXISTS daemon_owner (
@@ -183,13 +188,14 @@ const migrate = (database: Database) => {
         job_id INTEGER NOT NULL,
         repository TEXT NOT NULL,
         installation_id INTEGER,
+        actor TEXT,
         capability TEXT NOT NULL,
         input TEXT NOT NULL,
         outcome TEXT NOT NULL,
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS capability_audit_job ON capability_audit(job_id, id);
-      PRAGMA user_version = 4;
+      PRAGMA user_version = 5;
     `);
   })();
 };
@@ -668,6 +674,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       readonly jobId: number;
       readonly repository: string;
       readonly installationId?: number;
+      readonly actor?: string;
       readonly capability: string;
       readonly input: string;
       readonly outcome: string;
@@ -678,13 +685,14 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           database
             .query(
               `INSERT INTO capability_audit
-                (job_id, repository, installation_id, capability, input, outcome, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                (job_id, repository, installation_id, actor, capability, input, outcome, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
             )
             .run(
               entry.jobId,
               entry.repository,
               entry.installationId ?? null,
+              entry.actor ?? null,
               entry.capability,
               entry.input,
               entry.outcome,
@@ -699,12 +707,13 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         () =>
           database
             .query(
-              `SELECT repository, installation_id AS installationId, capability, input, outcome,
+              `SELECT repository, installation_id AS installationId, actor, capability, input, outcome,
                  created_at AS createdAt FROM capability_audit WHERE job_id = ? ORDER BY id`,
             )
             .all(jobId) as readonly {
             readonly repository: string;
             readonly installationId: number | null;
+            readonly actor: string | null;
             readonly capability: string;
             readonly input: string;
             readonly outcome: string;

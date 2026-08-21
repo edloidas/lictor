@@ -1,5 +1,6 @@
 import { Effect } from 'effect';
 import { LictorConfig } from '../config.ts';
+import { GitHubIdentity } from '../github/identity.ts';
 import { Policy } from '../policy.ts';
 import { WorkQueue } from '../queue/work-queue.ts';
 import { qualifyDelivery, supportsInteraction } from '../webhook/qualification.ts';
@@ -15,7 +16,9 @@ export const handleInteraction: Handler = (delivery) =>
     }
 
     const config = yield* LictorConfig;
-    const work = yield* qualifyDelivery(delivery, config);
+    const identity = yield* GitHubIdentity;
+    const { login } = yield* identity.verified;
+    const work = yield* qualifyDelivery(delivery, { ...config, selfLogin: login });
     if (work === undefined) return;
     const policy = yield* Policy;
     const repositoryPolicy = policy.forRepository(work.repository);

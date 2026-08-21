@@ -8,6 +8,11 @@ import { ProcessRunner } from './process-runner.ts';
 export class ExecutorError extends Data.TaggedError('ExecutorError')<{
   readonly message: string;
   readonly retryable: boolean;
+  /**
+   * Concrete delay GitHub asked for. Preferred over exponential backoff, which
+   * is guesswork against an account-wide bucket whose reset time is known.
+   */
+  readonly retryAfterMs?: number;
   readonly cause?: unknown;
 }> {}
 

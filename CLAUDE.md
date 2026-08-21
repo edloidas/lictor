@@ -1,7 +1,8 @@
 # lictor
 
 GitHub webhook server. TypeScript, Bun, Effect. Receives deliveries from a
-GitHub App and dispatches them to handlers.
+GitHub webhook and dispatches them to handlers. It authenticates as a real
+account with a classic personal access token, not as an App.
 
 ## Rules
 
@@ -28,7 +29,7 @@ bun validate    # Full gate: check + test:ci (coverage)
   `Effect.Config`, payloads decode through `Effect.Schema`. No ad-hoc `async`
   functions in `src/` — an escape hatch there loses the error channel
 - Runs locally. GitHub cannot reach `localhost`, so a delivery only arrives
-  through a tunnel whose URL is set as the App's webhook URL
+  through a tunnel whose URL is set as the repository webhook's payload URL
 - **Signature verification reads the raw body, always before parsing.** The HMAC
   covers the exact bytes GitHub sent; re-serializing a parsed payload changes key
   order and whitespace, and every delivery then fails. `request.text`, never

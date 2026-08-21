@@ -3,6 +3,8 @@ import { Clock, Data, Effect } from 'effect';
 import { Policy } from '../policy.ts';
 import { WorkQueue } from '../queue/work-queue.ts';
 import { GitHubClient } from './client.ts';
+import { GitHubIdentity } from './identity.ts';
+import { DEFAULT_THROTTLE_WAIT_MS, isSecondaryRateLimit, retryAfterMs } from './retry-after.ts';
 
 export type BrokerTool =
   | 'create_branch'
@@ -24,6 +26,8 @@ export type BrokerTool =
 export class CapabilityError extends Data.TaggedError('CapabilityError')<{
   readonly code: string;
   readonly message: string;
+  /** How long to wait before retrying, when GitHub said so. */
+  readonly retryAfterMs?: number;
   readonly cause?: unknown;
 }> {}
 
@@ -90,6 +94,24 @@ const boundedInput = (input: Readonly<Record<string, unknown>>): void => {
       message: 'Capability input exceeds 256 KiB',
     });
   }
+};
+
+/**
+ * Commit authorship is GitHub's to assign, not the agent's.
+ *
+ * The tool schema allows additional properties, so `create_commit` would
+ * otherwise forward whatever `author` and `committer` the agent supplied. That
+ * was cosmetic while every commit was visibly `lictor[bot]`; once commits carry
+ * a person's account it becomes a way to attribute work to someone who did not
+ * do it. Dropping the fields makes GitHub fall back to the authenticated user.
+ */
+const pinCommitIdentity = (
+  tool: BrokerTool,
+  input: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> => {
+  if (tool !== 'create_commit') return input;
+  const { author: _author, committer: _committer, ...rest } = input;
+  return rest;
 };
 
 const route = (repository: string, tool: BrokerTool, input: Readonly<Record<string, unknown>>) => {
@@ -169,6 +191,20 @@ const boundedJson = (value: unknown): unknown => {
 export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('CapabilityBroker', {
   effect: Effect.gen(function* () {
     const github = yield* GitHubClient;
+    const identity = yield* GitHubIdentity;
+    // ! Resolved per call rather than at construction, so building the broker
+    // ! costs no network. The first call pays for the probe; the rest share it.
+    const actor = identity.verified.pipe(
+      Effect.map(({ login }) => login),
+      Effect.mapError(
+        (cause) =>
+          new CapabilityError({
+            code: 'CAPABILITY_CREDENTIAL_REJECTED',
+            message: cause.message,
+            cause,
+          }),
+      ),
+    );
     const policy = yield* Policy;
     const queue = yield* WorkQueue;
 
@@ -209,6 +245,7 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
           ...(job.work.installationId === undefined
             ? {}
             : { installationId: job.work.installationId }),
+          actor: yield* actor,
           capability: request.name,
           input: auditInput,
         };
@@ -229,12 +266,6 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
               message: 'Tool request targets another repository',
             });
           }
-          const installationId = job.work.installationId;
-          if (installationId === undefined)
-            return yield* new CapabilityError({
-              code: 'CAPABILITY_INSTALLATION_MISSING',
-              message: 'Job has no installation identity',
-            });
           const repositoryPolicy = policy.forRepository(expectedRepository);
           const capability = capabilities[request.name];
           const forcePushDenied =
@@ -262,7 +293,7 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
                     cause,
                   }),
           });
-          const client = yield* github.forInstallation(installationId);
+          const client = yield* github.authenticated;
           let baseRequest = HttpClientRequest.get(target.path);
           if (target.method === 'POST') baseRequest = HttpClientRequest.post(target.path);
           if (target.method === 'PATCH') baseRequest = HttpClientRequest.patch(target.path);
@@ -289,13 +320,51 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
                           cause,
                         }),
                 })
-              : request.input;
+              : pinCommitIdentity(request.name, request.input);
           const httpRequest =
             target.method === 'GET'
               ? baseRequest
               : HttpClientRequest.bodyUnsafeJson(baseRequest, body);
           const response = yield* client.execute(httpRequest);
           if (response.status < 200 || response.status >= 300) {
+            // ! An installation token healed by re-minting; a revoked PAT never
+            // ! does. Collapsing a 401 into a generic failure spends every
+            // ! remaining attempt, and each one costs a full clone cycle.
+            if (response.status === 401) {
+              yield* Effect.logError('GitHub rejected the daemon credential').pipe(
+                Effect.annotateLogs({ job: request.jobId, capability: request.name }),
+              );
+              return yield* new CapabilityError({
+                code: 'CAPABILITY_CREDENTIAL_REJECTED',
+                message: 'GitHub rejected the daemon credential',
+              });
+            }
+            // ! A 429 is definitive on its own; a 403 also means "forbidden", so
+            // ! it needs evidence. Headers are the first source, the body the
+            // ! second: a secondary rate limit — the realistic tripwire for an
+            // ! agent creating content — is documented to answer 403 with
+            // ! neither rate header. Dropping either case into the generic branch
+            // ! tells the agent to retry at once against a closed bucket.
+            const hinted =
+              response.status === 403 || response.status === 429
+                ? retryAfterMs(response.headers, yield* Clock.currentTimeMillis)
+                : undefined;
+            const secondary =
+              response.status === 403 &&
+              hinted === undefined &&
+              // ! An exhausted bucket reported without a reset time is still an
+              // ! exhausted bucket, and a secondary limit says so only in prose.
+              (response.headers['x-ratelimit-remaining'] === '0' ||
+                isSecondaryRateLimit(yield* Effect.orElseSucceed(response.text, () => '')));
+            const wait =
+              response.status === 429 || secondary ? (hinted ?? DEFAULT_THROTTLE_WAIT_MS) : hinted;
+            if (wait !== undefined) {
+              return yield* new CapabilityError({
+                code: 'CAPABILITY_RATE_LIMITED',
+                message: `GitHub rate limit reached; retry in ${Math.ceil(wait / 1000)}s`,
+                retryAfterMs: wait,
+              });
+            }
             return yield* new CapabilityError({
               code: 'CAPABILITY_GITHUB_FAILED',
               message: `GitHub returned status ${response.status}`,
@@ -425,12 +494,20 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
           input,
         }),
         {
+          // ! The code stays the whole contract, because that is what the agent
+          // ! branches on. `data` appears only when there is something the agent
+          // ! can act on that the code cannot carry: telling it the bucket is
+          // ! closed without telling it for how long leaves it to guess, and its
+          // ! guess is a retry storm.
           onFailure: (error) => ({
             jsonrpc: '2.0' as const,
             id: request.id,
             error: {
               code: -32000,
               message: error instanceof CapabilityError ? error.code : 'CAPABILITY_AUDIT_FAILED',
+              ...(error instanceof CapabilityError && error.retryAfterMs !== undefined
+                ? { data: { detail: error.message, retryAfterMs: error.retryAfterMs } }
+                : {}),
             },
           }),
           onSuccess: (result) => ({
@@ -444,5 +521,5 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
 
     return { callTool, handleMcp, listTools };
   }),
-  dependencies: [GitHubClient.Default, Policy.Default, WorkQueue.Default],
+  dependencies: [GitHubClient.Default, GitHubIdentity.Default, Policy.Default, WorkQueue.Default],
 }) {}
