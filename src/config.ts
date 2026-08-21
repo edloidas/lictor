@@ -1,3 +1,6 @@
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { Config, Effect } from 'effect';
 
 const loginList = (name: string) =>
@@ -12,6 +15,80 @@ const loginList = (name: string) =>
       ),
     ]),
   );
+
+/**
+ * Where daemon state lives when nothing says otherwise.
+ *
+ * Outside any repository on purpose. Lictor serves many repositories, and one of
+ * them may be lictor itself — a database inside the working directory would then
+ * sit in a tree the agent is editing.
+ */
+const HOME = join(homedir(), '.lictor');
+
+/**
+ * Path config with a home-relative default.
+ *
+ * A leading `~/` in a supplied value is expanded, because the defaults printed
+ * in `.env.example` are home paths and an operator who copies one into `.env`
+ * writes exactly that. Without expansion the daemon would create a literal `~`
+ * directory beside the working directory and open a second, empty database
+ * there — silently, since every path is created on demand.
+ *
+ * Only a leading `~/`. Not `~user`, not `$HOME`: one rule, stated once, and no
+ * path is ever rewritten in a way the operator did not type.
+ */
+/** Where state used to live: relative to wherever the daemon happened to run. */
+const LEGACY_HOME = '.lictor';
+
+/**
+ * Refuses to start beside state the daemon used to own.
+ *
+ * The default moved out of the working directory, and nothing migrates. Starting
+ * anyway is the worst outcome available: a fresh empty database opens, the old
+ * policy is not read, and queued work is neither processed nor reported missing —
+ * so the daemon looks healthy while doing none of what it did yesterday. Failing
+ * with both paths named turns that into a one-line fix.
+ *
+ * Only when the operator set nothing: an explicit path is a decision already
+ * made, and a legacy directory beside it is then just a directory.
+ */
+export const legacyStateConflict = (
+  config: { readonly databasePath: string },
+  /** Injectable so the suite can assert this without depending on the real home. */
+  home = HOME,
+  legacy = LEGACY_HOME,
+): string | undefined => {
+  // ! The database alone decides. It is the only path whose relocation is
+  // ! *silent* — the queue creates the file it cannot find, so the daemon comes
+  // ! up healthy with zero work. A relocated policy path fails loudly on its own
+  // ! when the file is missing, and requiring both to be defaults would miss the
+  // ! operator who set only `LICTOR_POLICY_PATH`, which is the worst case: a
+  // ! daemon that looks fine and quietly ignores yesterday's queue.
+  if (config.databasePath !== join(home, 'lictor.sqlite')) return undefined;
+  // ! Files, not directories. The setup instructions say to `mkdir -p ~/.lictor`
+  // ! and copy a policy into it, so a directory test would be defeated by the
+  // ! documented upgrade path itself — the new home exists, the old database is
+  // ! still full of work, and the guard waves it through. An empty legacy
+  // ! directory is likewise nothing to strand.
+  if (existsSync(config.databasePath)) return undefined;
+  if (!existsSync(join(legacy, 'lictor.sqlite'))) return undefined;
+  // ! `mkdir -p` first, because the guard fires precisely when the target may not
+  // ! exist yet, and `mv` with a glob into a missing directory aborts having moved
+  // ! nothing. And "point ... at" rather than "set ...", because the operator may
+  // ! already have set these — `~/.lictor/lictor.sqlite` expands to exactly the
+  // ! default, so setting it explicitly is indistinguishable from setting nothing
+  // ! and being told to set it would be no help at all.
+  return `Found a daemon database at ${join(legacy, 'lictor.sqlite')} and none at ${config.databasePath}. Move it (mkdir -p ${home} && mv ${legacy}/* ${home}/) or point LICTOR_DATABASE_PATH, LICTOR_POLICY_PATH, and LICTOR_SOCKET_PATH at ${legacy} to keep using it.`;
+};
+
+const expandHome = (value: string): string => {
+  if (value === '~') return homedir();
+  if (value.startsWith('~/')) return join(homedir(), value.slice(2));
+  return value;
+};
+
+const statePath = (name: string, fallback: string) =>
+  Config.string(name).pipe(Config.withDefault(join(HOME, fallback)), Config.map(expandHome));
 
 const positiveInteger = (name: string, fallback: number, maximum: number) =>
   Config.integer(name).pipe(
@@ -59,16 +136,15 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       trustedSenders: yield* loginList('GITHUB_TRUSTED_SENDERS'),
       /** GitHub users whose assignments and mentions may create work. */
       targetUsers: yield* loginList('GITHUB_TARGET_USERS'),
-      /** Local SQLite file used for durable work. */
-      databasePath: yield* Config.string('LICTOR_DATABASE_PATH').pipe(
-        Config.withDefault('.lictor/lictor.sqlite'),
-      ),
-      policyPath: yield* Config.string('LICTOR_POLICY_PATH').pipe(
-        Config.withDefault('.lictor/policy.toml'),
-      ),
-      controlSocketPath: yield* Config.string('LICTOR_SOCKET_PATH').pipe(
-        Config.withDefault('.lictor/lictor.sock'),
-      ),
+      /**
+       * Local SQLite file used for durable work.
+       *
+       * `CODEX_HOME` is derived from this path's directory, so moving it moves
+       * the agent's home with it — see `src/executor/agent-executor.ts`.
+       */
+      databasePath: yield* statePath('LICTOR_DATABASE_PATH', 'lictor.sqlite'),
+      policyPath: yield* statePath('LICTOR_POLICY_PATH', 'policy.toml'),
+      controlSocketPath: yield* statePath('LICTOR_SOCKET_PATH', 'lictor.sock'),
       webhookMaxBytes: yield* positiveInteger(
         'LICTOR_WEBHOOK_MAX_BYTES',
         1024 * 1024,

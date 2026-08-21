@@ -38,11 +38,22 @@ are public. Readiness and management use an owner-only local Unix socket.
 
 ```bash
 cp .env.example .env
-mkdir -p .lictor
-cp policy.example.toml .lictor/policy.toml
+mkdir -p ~/.lictor
+cp policy.example.toml ~/.lictor/policy.toml
 bun install
 bun run start
 ```
+
+Daemon state lives in `~/.lictor/` — database, control socket, policy, and the
+agent's `CODEX_HOME` — deliberately outside any repository, since one of the
+repositories lictor manages may be lictor itself. Override any of the three paths
+with `LICTOR_DATABASE_PATH`, `LICTOR_POLICY_PATH`, or `LICTOR_SOCKET_PATH`; a
+leading `~/` is expanded. One daemon per user owns that state: a second instance
+sharing it loses the ownership lease and stops itself, so give a development
+instance its own paths rather than pointing it at the same home.
+
+If a `.lictor/` directory from an earlier version is still present in the working
+directory, startup refuses rather than opening a fresh database beside it.
 
 The example environment starts with `LICTOR_EXECUTOR=disabled`, empty trusted
 principals, and no implicit GitHub mutation authority. This lets you verify token
@@ -72,7 +83,7 @@ signature configuration.
 
 ## Activate repository policy
 
-Edit `.lictor/policy.toml` before enabling execution. Absolute workspace roots
+Edit `~/.lictor/policy.toml` before enabling execution. Absolute workspace roots
 are mandatory; explicit repository paths must resolve beneath one of them.
 
 ```toml
@@ -115,7 +126,7 @@ Authenticate the daemon-owned Codex home once. It lives beside the configured
 SQLite database and is never taken from a managed repository:
 
 ```bash
-CODEX_HOME=.lictor/codex codex login
+CODEX_HOME=~/.lictor/codex codex login
 ```
 
 Then set `GITHUB_TRUSTED_SENDERS`, `GITHUB_TARGET_USERS`, and

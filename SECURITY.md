@@ -49,7 +49,7 @@ local process behind a tunnel and neither is expected to absorb load.
   containing unrelated credentials.
 - Keep `GITHUB_TRUSTED_SENDERS` narrow. Target matching decides relevance, but
   the sender list decides whose GitHub prose may trigger local agent work.
-- Protect `.lictor/lictor.sqlite`: it stores issue metadata, execution errors,
+- Protect `~/.lictor/lictor.sqlite`: it stores issue metadata, execution errors,
   and bounded agent output. It does not store raw webhook bodies or comments.
 - `LICTOR_EXECUTOR=disabled` is the safe mode for validating a new webhook or
   allowlist. Work remains pending until execution is re-enabled.
