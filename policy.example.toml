@@ -2,15 +2,12 @@
 execution = "automatic"
 clone = "allowed"
 
+# Narrowest useful capability set: investigate and reply. Widen per repository
+# only when a phase needs it — branches and pullRequests for code changes,
+# issues for assignment work.
 [defaults.capabilities]
 read = true
 comment = true
-issues = true
-branches = true
-pullRequests = true
-merge = false
-forcePush = false
-deleteBranches = false
 scripts = []
 
 # Every repository is named in full. There are no owner wildcards here: an

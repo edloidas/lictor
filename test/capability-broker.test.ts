@@ -117,11 +117,57 @@ describe('CapabilityBroker', () => {
     const result = await run(
       Effect.gen(function* () {
         const broker = yield* CapabilityBroker;
-        return yield* broker.handleMcp(13, work, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        yield* queue.claim;
+        return yield* broker.handleMcp(enqueued.jobId, work, {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/list',
+        });
       }),
       '[defaults.capabilities]\nread = true',
     );
     expect(JSON.stringify(result.value)).toContain('get_issue');
+  });
+
+  it('hides tools a repository policy denies from discovery', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        yield* queue.claim;
+        const response = yield* broker.handleMcp(enqueued.jobId, work, {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/list',
+        });
+        if (!('result' in response) || !('tools' in response.result))
+          throw new Error('tools/list failed');
+        return response.result.tools.map((tool: { readonly name: string }) => tool.name);
+      }),
+      '[defaults.capabilities]\nread = true\ncomment = true',
+    );
+    expect(result.value).toContain('get_issue');
+    expect(result.value).toContain('create_comment');
+    expect(result.value).not.toContain('create_branch');
+    expect(result.value).not.toContain('merge_pull_request');
+  });
+
+  it('exposes no tools to discovery without an active job session', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        return yield* broker.handleMcp(13, work, {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/list',
+        });
+      }),
+      '[defaults.capabilities]\nread = true',
+    );
+    expect(result.value).toMatchObject({ result: { tools: [] } });
   });
 
   it('accepts the MCP initialization handshake', async () => {

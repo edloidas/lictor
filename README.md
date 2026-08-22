@@ -100,11 +100,15 @@ clone = "allowed"
 [repositories.overrides."edloidas/lictor".capabilities]
 read = true
 comment = true
-issues = true
-branches = true
-pullRequests = true
-merge = false
 ```
+
+Read and comment is the largest capability set whose worst case is a wrong or
+unwanted comment. Start there: she can clone at the triggering subject's ref —
+a mention on a pull request gives her that PR's head — investigate, and reply.
+Widen to `branches` and `pullRequests` when code changes are wanted, and to
+`issues` and `merge` only once assignment handling is trusted. Tool discovery is
+scoped the same way: a capability denied by policy is invisible to the agent,
+not merely refused at call time.
 
 When cloning is allowed, Lictor passes the token to Git as an `Authorization`
 header injected per command, without storing it in the remote URL or credential

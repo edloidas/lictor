@@ -430,6 +430,14 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
       },
     }));
 
+    // ! Discovery is scoped to the job's repository policy, so the agent never
+    // ! sees a tool it could only ever fail: offering `merge_pull_request` to
+    // ! a read+comment repository invites attempts whose denial is the feature.
+    const visibleTools = (repository: string) => {
+      const granted = policy.forRepository(repository.toLowerCase()).capabilities;
+      return listTools.filter((tool) => granted[capabilities[tool.name]] === true);
+    };
+
     const handleMcp = (
       jobId: number,
       attemptOrRequest: number | unknown,
@@ -459,11 +467,18 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
         });
       }
       if (request.method === 'tools/list') {
-        return Effect.succeed({
-          jsonrpc: '2.0' as const,
-          id: request.id,
-          result: { tools: listTools },
-        });
+        return Effect.flatMap(queue.job(jobId), (job) =>
+          Effect.succeed({
+            jsonrpc: '2.0' as const,
+            id: request.id,
+            result: {
+              tools:
+                job === undefined || job.status !== 'running'
+                  ? []
+                  : visibleTools(job.work.repository),
+            },
+          }),
+        );
       }
       if (request.method !== 'tools/call') {
         return Effect.succeed({
