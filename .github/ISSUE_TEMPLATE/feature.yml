@@ -21,6 +21,6 @@ body:
     id: notes
     attributes:
       label: Implementation notes
-      description: Any details, if already planned — App permissions needed, events to subscribe to.
+      description: Any details, if already planned — token scopes needed, notification reasons to accept.
     validations:
       required: false

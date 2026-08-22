@@ -7,13 +7,11 @@ import { GitHubClient } from '../src/github/client.ts';
 import { GitHubIdentity } from '../src/github/identity.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
-import type { WorkItem } from '../src/webhook/qualification.ts';
+import type { WorkItem } from '../src/work-item.ts';
 
 const work: WorkItem = {
   deliveryId: 'delivery-13',
   interactionId: 'interaction-13',
-  event: 'issues',
-  action: 'assigned',
   repository: 'edloidas/lictor',
   installationId: 42,
   sender: 'edloidas',
@@ -31,9 +29,7 @@ const ConfigLive = Layer.succeed(
   LictorConfig.make({
     githubToken: Redacted.make('test-token'),
     expectedLogin: 'adiutriel',
-    webhookSecret: Redacted.make('secret'),
     trustedSenders: [],
-    targetUsers: [],
     databasePath: ':memory:',
     policyPath: 'unused',
     controlSocketPath: '/tmp/lictor.sock',
@@ -46,6 +42,7 @@ const ConfigLive = Layer.succeed(
     workerPollMs: 10,
     workerMaxAttempts: 3,
     workerRetryBaseMs: 100,
+    notificationPollMs: 60_000,
   }),
 );
 
@@ -87,7 +84,10 @@ const run = <A, E>(
         );
         const GitHubLive = Layer.succeed(
           GitHubClient,
-          GitHubClient.make({ authenticated: Effect.succeed(scopedClient) }),
+          GitHubClient.make({
+            authenticated: Effect.succeed(scopedClient),
+            addReaction: () => Effect.succeed(undefined),
+          }),
         );
         const PolicyLive = Layer.effect(
           Policy,
@@ -209,8 +209,9 @@ describe('CapabilityBroker', () => {
     expect(result.value.audit.at(-1)).toMatchObject({
       repository: 'edloidas/lictor',
       installationId: 42,
-      // ! Repository webhooks never populate installationId, so on a real
-      // ! delivery the actor is the only identity an audit row carries.
+      // ! A polled notification never populates installationId — it is App-era
+      // ! residue — so on a real delivery the actor is the only identity an audit
+      // ! row carries.
       actor: 'adiutriel',
       capability: 'get_issue',
       outcome: 'ok',

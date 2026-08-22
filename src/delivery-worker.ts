@@ -4,7 +4,8 @@ import { LictorConfig } from './config.ts';
 import { describeCause } from './diagnostics.ts';
 import { GitHubClient } from './github/client.ts';
 import { GitHubIdentity, type GitHubIdentityError } from './github/identity.ts';
-import { registry } from './handlers/index.ts';
+import { type NotificationError, qualifyNotification } from './notifications/qualify.ts';
+import { decodeThread } from './notifications/thread.ts';
 import { Policy } from './policy.ts';
 import {
   type DeliverySource,
@@ -12,9 +13,7 @@ import {
   type QueueError,
   WorkQueue,
 } from './queue/work-queue.ts';
-import { decodePayload } from './webhook/event.ts';
-import type { MalformedInteraction } from './webhook/qualification.ts';
-import { dispatch } from './webhook/router.ts';
+import type { ContextRef, WorkItem } from './work-item.ts';
 
 class InvalidStoredDelivery extends Data.TaggedError('InvalidStoredDelivery')<{
   readonly cause: unknown;
@@ -32,10 +31,8 @@ class InvalidStoredDelivery extends Data.TaggedError('InvalidStoredDelivery')<{
  */
 export const isTerminalFailure = (
   error: unknown,
-): error is InvalidStoredDelivery | ParseResult.ParseError | MalformedInteraction =>
-  isTagged('InvalidStoredDelivery')(error) ||
-  isTagged('ParseError')(error) ||
-  isTagged('MalformedInteraction')(error);
+): error is InvalidStoredDelivery | ParseResult.ParseError =>
+  isTagged('InvalidStoredDelivery')(error) || isTagged('ParseError')(error);
 
 type ProcessRequirements = GitHubClient | GitHubIdentity | LictorConfig | Policy | WorkQueue;
 
@@ -44,6 +41,47 @@ type ProcessRequirements = GitHubClient | GitHubIdentity | LictorConfig | Policy
  * `DeliverySource` member and this map forces its decoder into existence —
  * nothing downstream assumes an envelope again.
  */
+/**
+ * Reacts to the triggering comment, and records that it did.
+ *
+ * Strictly best-effort: every failure is logged and swallowed. This runs inside
+ * the delivery worker, where a non-`QueueError` failure marks the delivery
+ * permanently `failed` — so a reaction GitHub refused would throw away work that
+ * is already durably queued and about to run. The eyes are a courtesy; the job
+ * is the product.
+ */
+const acknowledge = (work: WorkItem, context: ContextRef, jobId: number) =>
+  Effect.gen(function* () {
+    const github = yield* GitHubClient;
+    const queue = yield* WorkQueue;
+    const input = JSON.stringify({ target: context, content: 'eyes' });
+    const outcome = yield* github.addReaction(work.repository, context, 'eyes').pipe(
+      Effect.as('ok'),
+      Effect.catchAll((error) =>
+        Effect.logWarning('Could not acknowledge queued work').pipe(
+          Effect.annotateLogs({ job: jobId, repository: work.repository, reason: error.message }),
+          Effect.as('react_failed'),
+        ),
+      ),
+    );
+    yield* queue.recordAudit({
+      jobId,
+      repository: work.repository,
+      actor: 'daemon',
+      capability: 'react',
+      input,
+      outcome,
+    });
+  }).pipe(
+    Effect.catchAllCause((cause) =>
+      Cause.isInterruptedOnly(cause)
+        ? Effect.interrupt
+        : Effect.logWarning('Acknowledgement failed').pipe(
+            Effect.annotateLogs({ job: jobId, reason: describeCause(cause) }),
+          ),
+    ),
+  );
+
 const processBySource: Record<
   DeliverySource,
   (
@@ -52,13 +90,13 @@ const processBySource: Record<
     void,
     | InvalidStoredDelivery
     | ParseResult.ParseError
-    | MalformedInteraction
+    | NotificationError
     | GitHubIdentityError
     | QueueError,
     ProcessRequirements
   >
 > = {
-  webhook: (stored) =>
+  notification: (stored) =>
     Effect.gen(function* () {
       // ! `Effect.try`, not a bare `JSON.parse`. A throw inside `Effect.gen`
       // ! is a defect, which none of the recovery branches below would see.
@@ -66,8 +104,71 @@ const processBySource: Record<
         try: () => JSON.parse(stored.body) as unknown,
         catch: (cause) => new InvalidStoredDelivery({ cause }),
       });
-      const payload = yield* decodePayload(raw);
-      yield* dispatch(registry)({ id: stored.id, event: stored.event, payload, raw });
+      // ! A `ParseError` here is terminal, and correctly so: the body is one the
+      // ! poller serialized from a thread it had already decoded, so a shape this
+      // ! schema rejects fails identically on every retry. Enrichment failures
+      // ! are a different tag — see `NotificationError` — precisely so a GitHub
+      // ! 502 mid-qualification costs an attempt rather than the delivery.
+      const thread = yield* decodeThread(raw);
+      const identity = yield* GitHubIdentity;
+      const { login } = yield* identity.verified;
+      const config = yield* LictorConfig;
+      const queue = yield* WorkQueue;
+      const cursorMs = yield* queue.notificationCursor(thread.id);
+      const { work, lastActivityAt } = yield* qualifyNotification({
+        deliveryId: stored.id,
+        thread,
+        policy: { selfLogin: login, trustedSenders: config.trustedSenders },
+        cursorMs,
+      });
+      // ! Advanced only after the job is committed, never before. A cursor moved
+      // ! ahead of a failed `enqueue` makes the retry scan from the wrong anchor
+      // ! and miss the comment that caused the notification in the first place.
+      const advance = Number.isFinite(lastActivityAt)
+        ? queue.advanceNotificationCursor(thread.id, lastActivityAt)
+        : Effect.void;
+
+      if (work === undefined) return yield* advance;
+
+      const policy = yield* Policy;
+      const repositoryPolicy = policy.forRepository(work.repository);
+      if (!repositoryPolicy.accepted || repositoryPolicy.execution === 'denied') {
+        yield* Effect.logInfo('Dropped notification denied by repository policy').pipe(
+          Effect.annotateLogs({ delivery: stored.id, repository: work.repository }),
+        );
+        return yield* advance;
+      }
+
+      const enqueued = yield* queue.enqueue(
+        {
+          ...work,
+          ...(repositoryPolicy.execution === 'approval' ? { approvalRequired: true } : {}),
+        },
+        policy.maxQueueDepth,
+      );
+      yield* advance;
+
+      yield* Effect.logInfo(
+        enqueued.inserted ? 'Queued GitHub interaction' : 'Ignored duplicate notification',
+      ).pipe(
+        Effect.annotateLogs({
+          job: enqueued.jobId,
+          delivery: stored.id,
+          repository: work.repository,
+          sender: work.sender,
+          targets: work.targets.join(','),
+          reasons: work.reasons.join(','),
+          subject: `${work.subject.kind}#${work.subject.number}`,
+        }),
+      );
+
+      // ! Only on a fresh insert. `enqueue` reports `inserted: false` for a
+      // ! replayed notification, and reacting again would be a second write for
+      // ! work that already exists — GitHub's endpoint is idempotent, but the
+      // ! audit row would not be.
+      if (enqueued.inserted && work.context !== undefined) {
+        yield* acknowledge(work, work.context, enqueued.jobId);
+      }
     }),
 };
 

@@ -7,14 +7,12 @@ import { LictorConfig } from '../src/config.ts';
 import { type ProcessRequest, ProcessRunner } from '../src/executor/process-runner.ts';
 import { GitHubCredential } from '../src/github/credential.ts';
 import type { RepositoryPolicy } from '../src/policy.ts';
-import type { WorkItem } from '../src/webhook/qualification.ts';
+import type { WorkItem } from '../src/work-item.ts';
 import { RepositoryWorkspace } from '../src/workspace/repository-workspace.ts';
 
 const work: WorkItem = {
   deliveryId: 'delivery-1',
   interactionId: 'interaction-1',
-  event: 'issues',
-  action: 'assigned',
   repository: 'edloidas/lictor',
   installationId: 42,
   sender: 'edloidas',
@@ -52,9 +50,7 @@ const config = (home: string) =>
   LictorConfig.make({
     githubToken: Redacted.make('test-token'),
     expectedLogin: 'adiutriel',
-    webhookSecret: Redacted.make('unused'),
     trustedSenders: ['edloidas'],
-    targetUsers: ['adiutriel'],
     databasePath: join(home, 'lictor.sqlite'),
     policyPath: join(home, 'policy.toml'),
     controlSocketPath: join(home, 'lictor.sock'),
@@ -67,6 +63,7 @@ const config = (home: string) =>
     workerPollMs: 10,
     workerMaxAttempts: 3,
     workerRetryBaseMs: 100,
+    notificationPollMs: 60_000,
   });
 
 /** Where the daemon puts a clone, given its state directory. */

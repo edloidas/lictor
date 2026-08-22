@@ -10,9 +10,7 @@ const ConfigLive = Layer.succeed(
   LictorConfig.make({
     githubToken: Redacted.make('pat-value'),
     expectedLogin: 'adiutriel',
-    webhookSecret: Redacted.make('secret'),
     trustedSenders: [],
-    targetUsers: [],
     databasePath: ':memory:',
     policyPath: 'unused',
     controlSocketPath: '/tmp/lictor.sock',
@@ -25,6 +23,7 @@ const ConfigLive = Layer.succeed(
     workerPollMs: 10,
     workerMaxAttempts: 3,
     workerRetryBaseMs: 100,
+    notificationPollMs: 60_000,
   }),
 );
 

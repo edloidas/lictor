@@ -8,13 +8,11 @@ import { ControlPlane, type ControlRequest, ControlServer } from '../src/control
 import { CapabilityBroker } from '../src/github/capability-broker.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
-import type { WorkItem } from '../src/webhook/qualification.ts';
+import type { WorkItem } from '../src/work-item.ts';
 
 const work: WorkItem = {
   deliveryId: 'control-delivery',
   interactionId: 'control-interaction',
-  event: 'issues',
-  action: 'assigned',
   repository: 'edloidas/lictor',
   installationId: 42,
   approvalRequired: true,
@@ -61,9 +59,7 @@ describe('local control plane', () => {
       LictorConfig.make({
         githubToken: Redacted.make('test-token'),
         expectedLogin: 'adiutriel',
-        webhookSecret: Redacted.make('secret'),
         trustedSenders: [],
-        targetUsers: [],
         databasePath,
         policyPath: 'unused',
         controlSocketPath: socketPath,
@@ -76,6 +72,7 @@ describe('local control plane', () => {
         workerPollMs: 10,
         workerMaxAttempts: 3,
         workerRetryBaseMs: 100,
+        notificationPollMs: 60_000,
       }),
     );
     const PolicyLive = Layer.effect(

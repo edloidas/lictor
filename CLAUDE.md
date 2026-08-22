@@ -1,8 +1,8 @@
 # lictor
 
-GitHub webhook server. TypeScript, Bun, Effect. Receives deliveries from a
-GitHub webhook and dispatches them to handlers. It authenticates as a real
-account with a classic personal access token, not as an App.
+GitHub automation daemon. TypeScript, Bun, Effect. Polls the notifications API,
+qualifies what arrives, and hands durable work to an agent. It authenticates as a
+real account with a classic personal access token, not as an App.
 
 ## Rules
 
@@ -14,7 +14,6 @@ symlink with a real file.
 ```bash
 bun dev         # Watch-mode server on PORT (default 3000)
 bun run start   # One-shot server
-bun tunnel      # cloudflared tunnel exposing localhost:3000 to GitHub
 bun check:fix   # Typecheck + biome check --write (lint + format + import sort)
 bun test        # Run tests — no network, every suite stubs GitHub
 bun validate    # Full gate: check + test:ci (coverage)
@@ -28,31 +27,40 @@ bun validate    # Full gate: check + test:ci (coverage)
 - Effect throughout: services are `Effect.Service` classes, config is
   `Effect.Config`, payloads decode through `Effect.Schema`. No ad-hoc `async`
   functions in `src/` — an escape hatch there loses the error channel
-- Runs locally. GitHub cannot reach `localhost`, so a delivery only arrives
-  through a tunnel whose URL is set as the repository webhook's payload URL
-- **Signature verification reads the raw body, always before parsing.** The HMAC
-  covers the exact bytes GitHub sent; re-serializing a parsed payload changes key
-  order and whitespace, and every delivery then fails. `request.text`, never
-  `request.json`
-- **The webhook route acks with 202 and forks the handler with
-  `Effect.forkDaemon`.** GitHub records a delivery as failed after 10 seconds, and
-  handler work is not bounded by that. Deliveries are durable on GitHub's side and
-  replayable by id, so acking early loses nothing
-- Handlers are `Effect<void, never, GitHubClient>` — they cannot fail, because
-  nothing is left to report a failure to once the response is sent. Recover
-  inside the handler and log what you swallowed
+- Runs locally, and needs no inbound reachability. `GET /notifications` is the
+  only transport: a repository webhook requires admin on the repository, so it is
+  scoped to the operator's rights instead of the account's own reach. The HTTP
+  server exposes `GET /health` and nothing else
+- **A notification thread is marked read only after its row is committed.** That
+  is what the webhook 202 used to be. Crash before the mark and GitHub still
+  holds the item; mark first and it is gone for good
+- **The poller stores, the delivery worker qualifies.** A notification names a
+  thread, never the sender or the body, so qualification has to fetch — and doing
+  that inside the poll loop puts GitHub failures outside the durable retry budget.
+  Enrichment failures are `NotificationError`, never `ParseError`, because
+  `isTerminalFailure` treats the latter as permanent
+- **A notification's `reason` is an exclusion list, never an allow list.** It
+  describes the thread, not the activity that just landed on it, and GitHub does
+  not re-key an already-unread thread — so a thread that went unread as `assign`
+  and then received a mention still reports `assign`
+- **Never mark read past the queue-depth limit.** GitHub is the overflow buffer;
+  the limit is checked before the sweep, not in `enqueue`, which runs a stage
+  later when the thread is already gone
+- The eyes reaction is strictly best-effort and goes through `GitHubClient`, not
+  `CapabilityBroker`. The broker refuses anything that is not a `running` job with
+  a live lease, and a just-enqueued job is `pending`
 - A throw inside `Effect.gen` is a defect, not a failure: `catchAll` never sees
-  it and the route answers 500. Wrap anything that throws — `JSON.parse` above
-  all — in `Effect.try`
+  it, so the recovery branches in the delivery worker are all bypassed and the
+  loop dies. Wrap anything that throws — `JSON.parse` above all — in `Effect.try`
 - Secrets are `Config.redacted` and stay `Redacted` until the moment they are
   used, so a logged service or error trace cannot leak them
 - **In tests, provide `Service.DefaultWithoutDependencies`, not
   `Service.Default`.** `Default` bakes in `FetchHttpClient.layer`, which wins over
   any client provided from outside — a suite using `Default` silently calls the
   real api.github.com
-- New event handlers go in `src/handlers/` and are registered in
-  `src/handlers/index.ts`. An event absent from that registry is logged and
-  dropped, which is the normal case for a subscription you do not act on
+- One decoder per `DeliverySource`, in `src/delivery-worker.ts`. Adding a producer
+  means adding a member and the map forces its decoder into existence — nothing
+  downstream assumes an envelope
 
 ## Ad-hoc scripts
 

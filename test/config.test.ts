@@ -6,7 +6,6 @@ import { ConfigProvider, Effect, Layer } from 'effect';
 import { LictorConfig, legacyStateConflict } from '../src/config.ts';
 
 const required = new Map([
-  ['GITHUB_WEBHOOK_SECRET', 'secret'],
   ['LICTOR_GITHUB_TOKEN', 'test-token'],
   ['LICTOR_GITHUB_LOGIN', 'Adiutriel'],
 ]);

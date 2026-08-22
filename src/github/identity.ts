@@ -46,11 +46,10 @@ export type VerifiedIdentity = {
  *
  * **Building this layer performs no I/O.** The probe runs on first use of
  * `verified` and its result is memoized. That is deliberate and load-bearing:
- * everything that must survive a GitHub outage — binding the webhook socket,
+ * everything that must survive a GitHub outage — binding the health socket,
  * claiming daemon ownership and renewing its lease, answering the control
  * socket — would otherwise be serialized behind a network call none of them
- * need. A delivery refused at an unbound socket is lost, because GitHub does not
- * redeliver a failed delivery on its own.
+ * need.
  *
  * Transient failures retry without limit rather than against a budget, for the
  * same reason: the inbox stays reachable throughout, so waiting costs nothing

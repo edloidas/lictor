@@ -12,9 +12,7 @@ const config = (expectedLogin: string, trustedSenders: readonly string[] = []) =
     LictorConfig.make({
       githubToken: Redacted.make('pat-value'),
       expectedLogin,
-      webhookSecret: Redacted.make('secret'),
       trustedSenders: [...trustedSenders],
-      targetUsers: [],
       databasePath: ':memory:',
       policyPath: 'unused',
       controlSocketPath: '/tmp/lictor.sock',
@@ -27,6 +25,7 @@ const config = (expectedLogin: string, trustedSenders: readonly string[] = []) =
       workerPollMs: 10,
       workerMaxAttempts: 3,
       workerRetryBaseMs: 100,
+      notificationPollMs: 60_000,
     }),
   );
 

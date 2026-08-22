@@ -5,7 +5,7 @@ import { LictorConfig } from '../config.ts';
 import { ProcessRunner } from '../executor/process-runner.ts';
 import { GitHubCredential } from '../github/credential.ts';
 import { isSafeRepository, type RepositoryPolicy } from '../policy.ts';
-import type { WorkItem } from '../webhook/qualification.ts';
+import type { WorkItem } from '../work-item.ts';
 
 export class WorkspaceError extends Data.TaggedError('WorkspaceError')<{
   readonly code: string;

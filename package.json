@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "description": "A lictor for your agent: watches GitHub, hands work.",
-  "keywords": ["lictor", "github", "webhook", "bot", "effect", "bun"],
+  "keywords": ["lictor", "github", "notifications", "bot", "effect", "bun"],
   "homepage": "https://github.com/edloidas/lictor",
   "bugs": {
     "url": "https://github.com/edloidas/lictor/issues",
@@ -21,7 +21,6 @@
     "dev": "bun --watch src/main.ts",
     "start": "bun src/main.ts",
     "cli": "bun src/cli.ts",
-    "tunnel": "cloudflared tunnel --url http://localhost:3000",
     "typecheck": "tsc --noEmit",
     "lint": "biome lint .",
     "lint:fix": "biome lint --write .",

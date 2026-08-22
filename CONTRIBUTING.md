@@ -45,13 +45,13 @@ Match the surrounding code. Style, naming, and type conventions are enforced by
   `Effect.Config`, payloads decode through `Effect.Schema`. A bare `async`
   function in `src/` drops the error channel on the floor.
 - **A throw inside `Effect.gen` is a defect, not a failure.** `catchAll` never
-  sees it, and the route answers 500 on something that was merely malformed.
-  Wrap anything that throws — `JSON.parse` above all — in `Effect.try`.
-- **Verify signatures against the raw body, before parsing.** `request.text`,
-  never `request.json`.
-- **Handlers cannot fail.** `Handler` returns `Effect<void, never, GitHubClient>`
-  because it runs detached from the request. Recover inside the handler and log
-  what you swallowed.
+  sees it, so the delivery worker's recovery branches are all bypassed and the
+  loop dies. Wrap anything that throws — `JSON.parse` above all — in `Effect.try`.
+- **Mark a notification thread read only after its row is committed.** Until the
+  mark lands, GitHub still owns the item; mark first and it is gone for good.
+- **Enrichment failures are `NotificationError`, never `ParseError`.** The
+  delivery worker treats `ParseError` as permanent, and a GitHub 502 during
+  qualification is a property of the moment, not of the delivery.
 - **Secrets stay `Redacted`** until the moment they are used.
 
 ## Tests
