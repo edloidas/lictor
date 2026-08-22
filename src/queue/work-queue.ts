@@ -45,6 +45,13 @@ export type JobStatus =
   | 'retry'
   | 'running';
 
+/**
+ * Statuses past which a job never runs again. Only `liveJobIds` reads this
+ * list; `maintenance` inlines the same literals in its SQL. The values agree
+ * today — keep them that way when editing either.
+ */
+const TERMINAL_JOB_STATUSES: readonly JobStatus[] = ['completed', 'failed', 'dead_letter'];
+
 export type QueuedJob = {
   readonly id: number;
   readonly work: WorkItem;
@@ -896,6 +903,24 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         });
       });
 
+    /**
+     * Every non-terminal job id, unbounded.
+     *
+     * ! Ids only and no `LIMIT`, deliberately. The consumer treats absence as
+     * ! dead, so a truncated page would name live sessions deletable —
+     * ! over-reporting liveness merely delays a sweep by an hour, while
+     * ! under-reporting deletes one mid-execution. The result stays small by
+     * ! construction: terminal rows, however many, are never selected.
+     */
+    const liveJobIds = attempt('list live job ids', () => {
+      const rows = database
+        .query(
+          `SELECT id FROM jobs WHERE status NOT IN (${TERMINAL_JOB_STATUSES.map(() => '?').join(', ')})`,
+        )
+        .all(...TERMINAL_JOB_STATUSES) as readonly { id: number }[];
+      return new Set<number>(rows.map((row) => row.id));
+    });
+
     const job = (id: number) =>
       attempt('inspect job', () => {
         const row = database
@@ -1061,6 +1086,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       auditLog,
       listJobs,
       job,
+      liveJobIds,
       approve: (id: number) => mutateJob(id, 'approve'),
       retry: (id: number) => mutateJob(id, 'retry'),
       cancel: (id: number) => mutateJob(id, 'cancel'),

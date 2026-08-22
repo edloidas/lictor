@@ -166,6 +166,16 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
         256 * 1024,
         10 * 1024 * 1024,
       ),
+      /**
+       * Ceiling on every git operation the service runs, network and local
+       * alike — `clone`, `fetch`, and the `checkout` that detaches onto a
+       * fetched ref. The checkout counts as long-running even though it never
+       * touches the network: detaching materializes the working-tree delta,
+       * which on a large repository with a cold cache routinely exceeds any
+       * short local budget. Raising this value therefore raises the budget of
+       * a wedged filesystem too.
+       */
+      gitTimeoutMs: yield* positiveInteger('LICTOR_GIT_TIMEOUT_MS', 180_000, 60 * 60 * 1000),
       workerPollMs: yield* positiveInteger('LICTOR_WORKER_POLL_MS', 1000, 60_000),
       workerMaxAttempts: yield* positiveInteger('LICTOR_WORKER_MAX_ATTEMPTS', 3, 100),
       workerRetryBaseMs: yield* positiveInteger(

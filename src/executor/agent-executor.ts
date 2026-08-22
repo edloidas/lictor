@@ -118,6 +118,10 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
             HOME: workdir,
             LANG: process.env.LANG ?? 'C.UTF-8',
             CODEX_HOME: codexHome,
+            // ! The session must stay token-free and non-interactive: git the
+            // ! agent runs must fail fast on a credential need instead of
+            // ! blocking on a prompt until the executor timeout.
+            GIT_TERMINAL_PROMPT: '0',
           },
         })
         .pipe(

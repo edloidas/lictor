@@ -4,7 +4,7 @@ import { Cause, Clock, Effect, Exit, Layer } from 'effect';
 import { LictorConfig, legacyStateConflict, port } from './config.ts';
 import { ControlPlane, ControlServer } from './control/control-plane.ts';
 import { DeliveryWorker } from './delivery-worker.ts';
-import { describeCause } from './diagnostics.ts';
+import { describeCause, failureOperation } from './diagnostics.ts';
 import { AgentExecutor } from './executor/agent-executor.ts';
 import { ProcessRunner } from './executor/process-runner.ts';
 import { CapabilityBroker } from './github/capability-broker.ts';
@@ -16,7 +16,7 @@ import { Policy } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 import { Server } from './server.ts';
 import { Worker } from './worker.ts';
-import { RepositoryWorkspace } from './workspace/repository-workspace.ts';
+import { DiskStat, RepositoryWorkspace } from './workspace/repository-workspace.ts';
 
 const ConfigLive = LictorConfig.Default;
 const PolicyLive = Policy.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
@@ -29,7 +29,9 @@ const ClientLive = GitHubClient.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.merge(CredentialLive, FetchHttpClient.layer)),
 );
 const WorkspaceLive = RepositoryWorkspace.DefaultWithoutDependencies.pipe(
-  Layer.provide(Layer.mergeAll(ConfigLive, ProcessRunner.Default, CredentialLive)),
+  Layer.provide(
+    Layer.mergeAll(ConfigLive, ProcessRunner.Default, DiskStat.Default, CredentialLive),
+  ),
 );
 const IdentityLive = GitHubIdentity.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.merge(ConfigLive, ClientLive)),
@@ -127,6 +129,43 @@ const Application = Layer.merge(
       const worker = yield* Worker;
       const deliveryWorker = yield* DeliveryWorker;
       const poller = yield* NotificationPoller;
+      const workspaces = yield* RepositoryWorkspace;
+      /**
+       * Collects sessions whose jobs are gone.
+       *
+       * Liveness is passed as an effect and resolved *by the sweep*, after it
+       * has listed the sessions directory: a job counts as live while it exists
+       * in any non-terminal state, and an absent id is not live. The asymmetry
+       * decides both the query shape and the ordering — over-reporting liveness
+       * merely delays a deletion by one hourly pass, but under-reporting it
+       * deletes a session that is executing right now, so `liveJobIds` is
+       * exhaustive, with no page cap, and the listing predates the liveness
+       * answer, so a job enqueued after the snapshot cannot be named by it. A
+       * failed sweep is logged, never fatal: losing one pass costs disk, killing
+       * the loop costs everything.
+       */
+      const sweepSessions = workspaces.sweep(queue.liveJobIds).pipe(
+        // ! Interrupt-only causes are shutdown reaching a sweep, not a sweep
+        // ! failing — treated as clean, exactly like `supervised` above.
+        // ! Otherwise the cause is described rather than `.message`d, because
+        // ! `QueueError` carries no `message` and the most likely failure —
+        // ! a SQLite error while resolving liveness — would log an empty
+        // ! string. The description alone is a bare tag, so the queue's
+        // ! authored operation name is annotated beside it.
+        Effect.catchAllCause((cause) =>
+          Cause.isInterruptedOnly(cause)
+            ? Effect.void
+            : Effect.logError('Session sweep failed').pipe(
+                Effect.annotateLogs({
+                  error: describeCause(cause),
+                  operation: failureOperation(cause) ?? 'unknown',
+                }),
+              ),
+        ),
+      );
+      // ! One pass before the loops: sessions orphaned by a crash are collected
+      // ! now rather than at the first hourly tick.
+      yield* sweepSessions;
       // ! Forked, not awaited: the health socket must bind and daemon ownership
       // ! must renew whether or not GitHub is answering. But the worker starts *inside* this
       // ! fiber, after the account is confirmed — it clones and pushes with the
@@ -190,10 +229,33 @@ const Application = Layer.merge(
           Effect.gen(function* () {
             yield* Effect.sleep('1 hour');
             const now = yield* Clock.currentTimeMillis;
-            yield* queue.maintenance(
-              now - policy.completedRetentionDays * 86_400_000,
-              now - policy.failedRetentionDays * 86_400_000,
-            );
+            // ! A failed pass is logged and the loop moves to the next tick,
+            // ! like `Worker.run`: one transient `SQLITE_BUSY` or disk I/O
+            // ! error must not kill the fiber — once it is dead, maintenance
+            // ! stops and every later session orphan leaks a full clone until
+            // ! the daemon restarts. Not fatal, then; not `supervised`.
+            yield* queue
+              .maintenance(
+                now - policy.completedRetentionDays * 86_400_000,
+                now - policy.failedRetentionDays * 86_400_000,
+              )
+              .pipe(
+                // ! Interrupt-only means shutdown, not failure — as in
+                // ! `sweepSessions`. Described rather than `.message`d,
+                // ! because `QueueError` has no `message`, with the authored
+                // ! operation name beside it for the same reason.
+                Effect.catchAllCause((cause) =>
+                  Cause.isInterruptedOnly(cause)
+                    ? Effect.void
+                    : Effect.logError('Queue maintenance failed').pipe(
+                        Effect.annotateLogs({
+                          error: describeCause(cause),
+                          operation: failureOperation(cause) ?? 'unknown',
+                        }),
+                      ),
+                ),
+              );
+            yield* sweepSessions;
           }),
         ),
       );

@@ -35,6 +35,7 @@ const config = (executor: 'codex' | 'disabled' = 'codex') =>
     agentWorkdir: '/tmp/lictor-workspace',
     executorTimeoutMs: 5000,
     executorOutputBytes: 4096,
+    gitTimeoutMs: 180_000,
     workerPollMs: 10,
     workerMaxAttempts: 3,
     workerRetryBaseMs: 100,
