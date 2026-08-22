@@ -23,6 +23,18 @@ const work: WorkItem = {
   },
 };
 
+const prWork: WorkItem = {
+  ...work,
+  deliveryId: 'delivery-2',
+  interactionId: 'interaction-2',
+  subject: {
+    kind: 'pull_request',
+    number: 42,
+    title: 'Run the worker on a pull request',
+    url: 'https://github.com/edloidas/lictor/pull/42',
+  },
+};
+
 const config = (maxAttempts = 3) =>
   LictorConfig.make({
     githubToken: Redacted.make('test-token'),
@@ -37,6 +49,7 @@ const config = (maxAttempts = 3) =>
     agentWorkdir: '.',
     executorTimeoutMs: 1000,
     executorOutputBytes: 1024,
+    gitTimeoutMs: 180_000,
     workerPollMs: 10,
     workerMaxAttempts: maxAttempts,
     workerRetryBaseMs: 100,
@@ -48,7 +61,7 @@ const run = <A, E>(
   execute: InstanceType<typeof AgentExecutor>['execute'],
   maxAttempts = 3,
   enabled = true,
-  createWorkspace?: InstanceType<typeof RepositoryWorkspace>['create'],
+  createWorkspace?: InstanceType<typeof RepositoryWorkspace>['acquire'],
 ) => {
   const ConfigLive = Layer.succeed(LictorConfig, config(maxAttempts));
   const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
@@ -84,16 +97,9 @@ const run = <A, E>(
   const WorkspaceLive = Layer.succeed(
     RepositoryWorkspace,
     RepositoryWorkspace.make({
-      create:
-        createWorkspace ??
-        (() =>
-          Effect.succeed({
-            repository: work.repository,
-            clonePath: '/tmp/lictor',
-            worktreePath: '/tmp/lictor-job',
-          })),
-      cleanup: () => Effect.void,
-      withRepositoryLock: <A, E, R>(_repository: string, effect: Effect.Effect<A, E, R>) => effect,
+      acquire: createWorkspace ?? (() => Effect.succeed({ path: '/tmp/lictor-job' })),
+      release: () => Effect.void,
+      sweep: () => Effect.void,
     }),
   );
   const WorkerLive = Worker.DefaultWithoutDependencies.pipe(
@@ -274,5 +280,52 @@ describe('Worker.runOnce', () => {
     );
 
     expect(reclaimed?.work.deliveryId).toBe(work.deliveryId);
+  });
+
+  // ! A pull-request job must clone at its head, not the default branch —
+  // ! reviewing a PR requires reviewing its tree. `refs/pull/<n>/head` resolves
+  // ! from the base repository, so it works for fork PRs too.
+  it('clones a pull-request job at refs/pull/<n>/head', async () => {
+    const acquireCalls: Parameters<InstanceType<typeof RepositoryWorkspace>['acquire']>[0][] = [];
+    await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(prWork);
+        const worker = yield* Worker;
+        return yield* worker.runOnce;
+      }),
+      () => Effect.succeed({ status: 'completed', summary: 'done' }),
+      3,
+      true,
+      (request) => {
+        acquireCalls.push(request);
+        return Effect.succeed({ path: '/tmp/lictor-job' });
+      },
+    );
+
+    expect(acquireCalls.length).toBe(1);
+    expect(acquireCalls[0]?.ref).toBe('refs/pull/42/head');
+  });
+
+  it('passes no ref for an issue job', async () => {
+    const acquireCalls: Parameters<InstanceType<typeof RepositoryWorkspace>['acquire']>[0][] = [];
+    await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        return yield* worker.runOnce;
+      }),
+      () => Effect.succeed({ status: 'completed', summary: 'done' }),
+      3,
+      true,
+      (request) => {
+        acquireCalls.push(request);
+        return Effect.succeed({ path: '/tmp/lictor-job' });
+      },
+    );
+
+    expect(acquireCalls.length).toBe(1);
+    expect(acquireCalls[0]?.ref).toBeUndefined();
   });
 });

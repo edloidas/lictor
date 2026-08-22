@@ -84,7 +84,10 @@ const defaultCapabilities: Capabilities = {
   scripts: [],
 };
 
-const canonicalRepository = (repository: string): string => repository.trim().toLowerCase();
+// ! Shared, not private: the clone path and the per-repository semaphore key in
+// ! the worker must normalize identically, or a name that validates takes a
+// ! different lock partition than it clones under.
+export const canonicalRepository = (repository: string): string => repository.trim().toLowerCase();
 
 // ! Underscores are legal in an owner: an Enterprise Managed User login is
 // ! `shortname_enterprise`, and rejecting one refuses that whole namespace.

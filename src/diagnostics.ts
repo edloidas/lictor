@@ -21,6 +21,18 @@ export const describeCause = (cause: Cause.Cause<unknown>): string => {
   return Cause.isInterrupted(cause) ? 'Interrupted' : 'Empty';
 };
 
+/**
+ * The authored operation name carried by the cause's failure, when its error
+ * has one. `QueueError` has no `message`, so a described cause is a bare tag
+ * and this is what names the statement that failed.
+ */
+export const failureOperation = (cause: Cause.Cause<unknown>): string | undefined => {
+  const failure = Cause.failureOption(cause);
+  if (Option.isNone(failure)) return undefined;
+  const operation = (failure.value as { readonly operation?: unknown }).operation;
+  return typeof operation === 'string' ? operation : undefined;
+};
+
 const describe = (error: unknown, fallback: string): string => {
   const shape = error as { readonly _tag?: unknown; readonly message?: unknown };
   // ! A class name is safe to print and is the only label a plain `Error` has.

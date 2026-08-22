@@ -27,6 +27,7 @@ const ConfigLive = Layer.succeed(
     agentWorkdir: '.',
     executorTimeoutMs: 1000,
     executorOutputBytes: 1024,
+    gitTimeoutMs: 180_000,
     workerPollMs: 1,
     workerMaxAttempts: 3,
     workerRetryBaseMs: 10,
@@ -161,15 +162,9 @@ describe('notification-to-agent pipeline', () => {
           const WorkspaceLive = Layer.succeed(
             RepositoryWorkspace,
             RepositoryWorkspace.make({
-              create: (_jobId, work) =>
-                Effect.succeed({
-                  repository: work.repository,
-                  clonePath: process.cwd(),
-                  worktreePath: process.cwd(),
-                }),
-              cleanup: () => Effect.void,
-              withRepositoryLock: <A, E, R>(_repository: string, effect: Effect.Effect<A, E, R>) =>
-                effect,
+              acquire: () => Effect.succeed({ path: process.cwd() }),
+              release: () => Effect.void,
+              sweep: () => Effect.void,
             }),
           );
           const Services = Layer.mergeAll(

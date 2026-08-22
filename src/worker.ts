@@ -1,7 +1,7 @@
-import { Clock, Effect, Exit, Ref } from 'effect';
+import { Clock, Effect, Exit, PartitionedSemaphore, Ref } from 'effect';
 import { LictorConfig } from './config.ts';
 import { AgentExecutor, ExecutorError } from './executor/agent-executor.ts';
-import { Policy } from './policy.ts';
+import { canonicalRepository, Policy } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 import { RepositoryWorkspace, WorkspaceError } from './workspace/repository-workspace.ts';
 
@@ -12,6 +12,20 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
     const queue = yield* WorkQueue;
     const policy = yield* Policy;
     const workspaces = yield* RepositoryWorkspace;
+    // ! Worker-owned scheduling, not a workspace API. Despite the partitioned
+    // ! key, `PartitionedSemaphore`'s permits are *global*, shared across all
+    // ! keys round-robin — `permits: 1` is a daemon-wide mutex with fair
+    // ! queuing, not one permit per repository. That over-serializes: safe,
+    // ! since each job's session is its own, but nothing runs concurrently.
+    // ! Genuine per-repository serialization needs a different construct
+    // ! before any concurrent worker fiber exists. The API itself is marked
+    // ! `@experimental`. Today `Worker.run` is a single sequential loop, so
+    // ! this only orders work; it guards no shared store — there are no
+    // ! pushes (the session is token-free by design), and every GitHub write
+    // ! goes through `CapabilityBroker`, which checks each call against the
+    // ! job's persisted attempt and live lease, so two jobs racing on one
+    // ! issue are individually attributed, never conflated.
+    const locks = yield* PartitionedSemaphore.make<string>({ permits: 1 });
 
     const runOnce = Effect.gen(function* () {
       if (!executor.enabled) return false;
@@ -32,6 +46,14 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         ),
       );
       const repositoryPolicy = policy.forRepository(job.work.repository);
+      // ! A pull-request job clones at its head: `refs/pull/<n>/head` resolves
+      // ! the PR head from the base repository, so it works for forks too, and
+      // ! landing on the default branch would review the wrong tree. An issue
+      // ! job passes no ref — the clone already sits on the default HEAD.
+      const ref =
+        job.work.subject.kind === 'pull_request'
+          ? `refs/pull/${job.work.subject.number}/head`
+          : undefined;
       const policyTime = yield* Clock.currentTimeMillis;
       if (
         !repositoryPolicy.accepted ||
@@ -44,16 +66,25 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         return true;
       }
       const retainWorkspace = yield* Ref.make(false);
-      const execution = workspaces
-        .withRepositoryLock(
-          job.work.repository,
+      const execution = locks
+        .withPermits(
+          canonicalRepository(job.work.repository),
+          1,
+        )(
           Effect.acquireUseRelease(
-            workspaces.create(job.id, job.work, repositoryPolicy),
+            workspaces.acquire(
+              {
+                id: job.id,
+                repository: job.work.repository,
+                ...(ref === undefined ? {} : { ref }),
+              },
+              repositoryPolicy,
+            ),
             (workspace) =>
               executor
                 .execute(
                   job.work,
-                  workspace.worktreePath,
+                  workspace.path,
                   repositoryPolicy.maxDurationMs,
                   job.id,
                   job.attempts,
@@ -66,11 +97,11 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
                       : Effect.void,
                   ),
                 ),
-            (workspace, exit) =>
+            (_workspace, exit) =>
               Ref.get(retainWorkspace)
                 .pipe(
                   Effect.flatMap((retain) =>
-                    workspaces.cleanup(workspace, retain || Exit.isFailure(exit)),
+                    workspaces.release(job.id, { retain: retain || Exit.isFailure(exit) }),
                   ),
                 )
                 .pipe(

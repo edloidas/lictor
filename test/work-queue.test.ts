@@ -22,6 +22,7 @@ const config = (databasePath: string) =>
     agentWorkdir: '.',
     executorTimeoutMs: 1000,
     executorOutputBytes: 1024,
+    gitTimeoutMs: 180_000,
     workerPollMs: 10,
     workerMaxAttempts: 3,
     workerRetryBaseMs: 100,
@@ -656,6 +657,81 @@ describe('WorkQueue', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  // ! Liveness feeds the sweep predicate, where absence means deletable. The
+  // ! result must therefore be exhaustive over every non-terminal status — a
+  // ! page cap here would name live sessions dead — while every terminal
+  // ! status is absent. Live ids span both ends of the table so a
+  // ! newest-first limit of any small size would miss one. `recoverStale`
+  // ! recovers every stale running job, so the interrupted fixture lives in a
+  // ! scope of its own rather than beside the others.
+  it('lists live job ids exhaustively across non-terminal statuses', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const now = yield* Clock.currentTimeMillis;
+
+        // ! Dead-letter first: its recovery passes would flip any other
+        // ! running job, so nothing else may be running yet.
+        yield* queue.enqueue(work('j-dead'));
+        for (let cycle = 0; cycle < 3; cycle++) {
+          const claimed = yield* queue.claim;
+          yield* queue.recoverStale((claimed?.leaseExpiresAt ?? 0) + 1);
+        }
+
+        yield* queue.enqueue(work('j-running'));
+        const running = yield* queue.claim;
+
+        yield* queue.enqueue(work('j-completed'));
+        const completed = yield* queue.claim;
+        yield* queue.complete(completed?.id ?? -1, completed?.attempts ?? -1, 'done');
+
+        yield* queue.enqueue(work('j-failed'));
+        const failed = yield* queue.claim;
+        yield* queue.fail(failed?.id ?? -1, failed?.attempts ?? -1, 'final');
+
+        yield* queue.enqueue(work('j-retry'));
+        const retried = yield* queue.claim;
+        yield* queue.fail(retried?.id ?? -1, retried?.attempts ?? -1, 'temporary', now + 60_000);
+
+        const pending = yield* queue.enqueue(work('j-pending'));
+
+        return {
+          live: yield* queue.liveJobIds,
+          counts: yield* queue.counts,
+          liveIds: [pending.jobId, running?.id, retried?.id].filter(
+            (id): id is number => id !== undefined,
+          ),
+          deadIds: [completed?.id, failed?.id].filter((id): id is number => id !== undefined),
+        };
+      }),
+    );
+
+    expect(result.counts).toMatchObject({
+      pending: 1,
+      running: 1,
+      retry: 1,
+      completed: 1,
+      failed: 1,
+      dead_letter: 1,
+    });
+    expect(result.live).toEqual(new Set(result.liveIds));
+    for (const id of result.deadIds) {
+      expect(result.live.has(id)).toBe(false);
+    }
+
+    const interruptedResult = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(work('j-interrupted'));
+        const claimed = yield* queue.claim;
+        yield* queue.recoverStale((claimed?.leaseExpiresAt ?? 0) + 1);
+        return { live: yield* queue.liveJobIds, counts: yield* queue.counts };
+      }),
+    );
+    expect(interruptedResult.counts).toMatchObject({ interrupted: 1 });
+    expect(interruptedResult.live.size).toBe(1);
   });
 
   it('prunes completed jobs at the retention boundary and reports size', async () => {

@@ -12,15 +12,15 @@ A local GitHub automation daemon that gives Codex durable, policy-scoped work.
 
 Lictor polls the GitHub notifications API, commits each thread to SQLite before
 marking it read, acknowledges accepted work with an eyes reaction, and runs it in
-an isolated repository worktree. GitHub credentials stay in the daemon; agent
+a disposable clone of the repository. GitHub credentials stay in the daemon; agent
 GitHub operations pass through a job-scoped, audited capability broker.
 
 ```text
 GitHub notifications <- poll -- durable inbox -> qualify -> policy -> queue
-                                     |                                 |
-                             mark read after commit          isolated worktree
-                                                                       |
-                                                             Codex + broker tools
+                                      |                                 |
+                              mark read after commit         disposable session
+                                                                        |
+                                                              Codex + broker tools
 ```
 
 ## Requirements
@@ -108,10 +108,18 @@ merge = false
 
 When cloning is allowed, Lictor passes the token to Git as an `Authorization`
 header injected per command, without storing it in the remote URL or credential
-store. Clones live under `workspaces/` beside the configured SQLite database,
-one directory per `owner/name`, on a path the daemon computes rather than one
-policy names. A directory there that is not a repository is discarded and cloned
-again, so an interrupted clone costs one job, not the repository.
+store. Every job gets its own disposable session: one full clone under
+`sessions/` beside the configured SQLite database, on a path keyed by job id that
+the daemon computes rather than one policy names. The session is deleted when the
+job finishes; if it failed, the tree is kept under a `.failed-` name for
+forensics instead, capped by count so a repeatedly failing repository cannot fill
+the disk. Sessions left behind by a crash are swept by job id at startup and
+hourly thereafter. Network git operations (`clone`, `fetch`) are bounded by
+`LICTOR_GIT_TIMEOUT_MS`.
+
+Upgrading from an earlier version: clones used to live under `workspaces/`
+beside the configured SQLite database. That tree is no longer used and can be
+removed by hand (`rm -rf <directory-of-LICTOR_DATABASE_PATH>/workspaces`).
 
 Run a policy check before activation:
 
@@ -165,7 +173,9 @@ completedDays = 30
 failedDays = 90
 ```
 
-`bun cli prune` applies the configured windows and checkpoints the WAL. The
+`bun cli prune` applies the configured windows and checkpoints the WAL; it does
+not touch sessions, which are managed by the daemon itself — swept when their
+job is gone, with failed sessions retained up to a count cap for forensics. The
 `backup` command uses SQLite's online backup path after a full WAL checkpoint,
 then creates the destination with mode `0600`.
 
