@@ -50,10 +50,20 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       // ! the PR head from the base repository, so it works for forks too, and
       // ! landing on the default branch would review the wrong tree. An issue
       // ! job passes no ref — the clone already sits on the default HEAD.
-      const ref =
-        job.work.subject.kind === 'pull_request'
-          ? `refs/pull/${job.work.subject.number}/head`
-          : undefined;
+      // ! A branch a previous interaction on this subject created wins over
+      // ! both: continuing her own work beats re-reading a moved head.
+      const priorBranch = yield* queue.branchForSubject(
+        job.work.repository,
+        job.work.subject.kind,
+        job.work.subject.number,
+      );
+      let ref: string | undefined;
+      if (priorBranch !== undefined) {
+        // Stored bare; the workspace fetches full refs.
+        ref = `refs/heads/${priorBranch}`;
+      } else if (job.work.subject.kind === 'pull_request') {
+        ref = `refs/pull/${job.work.subject.number}/head`;
+      }
       const policyTime = yield* Clock.currentTimeMillis;
       if (
         !repositoryPolicy.accepted ||

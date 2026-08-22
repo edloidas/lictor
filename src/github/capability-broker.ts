@@ -242,9 +242,6 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
         const auditIdentity = {
           jobId: request.jobId,
           repository: job.work.repository,
-          ...(job.work.installationId === undefined
-            ? {}
-            : { installationId: job.work.installationId }),
           actor: yield* actor,
           capability: request.name,
           input: auditInput,
@@ -392,17 +389,40 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
               })
               .pipe(Effect.zipRight(Effect.fail(error))),
           onSuccess: (result) =>
-            queue
-              .recordAudit({
-                ...auditIdentity,
-                outcome: 'ok',
-              })
-              .pipe(
-                Effect.catchAll((cause) =>
-                  Effect.logError('Could not finalize capability audit', cause),
-                ),
-                Effect.as(result),
+            // ! A branch she created outlives the session, so its name is
+            // ! durable state, not a log line: the next interaction with this
+            // ! subject clones onto it and continues the work. Recording must
+            // ! never fail an already-successful call.
+            (request.name === 'create_branch' &&
+            typeof request.input.ref === 'string' &&
+            request.input.ref.startsWith('refs/heads/')
+              ? queue
+                  .recordSubjectBranch({
+                    repository: job.work.repository,
+                    subjectKind: job.work.subject.kind,
+                    subjectNumber: job.work.subject.number,
+                    branch: request.input.ref.slice('refs/heads/'.length),
+                  })
+                  .pipe(
+                    Effect.catchAll((cause) =>
+                      Effect.logError('Could not record created branch').pipe(
+                        Effect.annotateLogs({ job: request.jobId, error: cause.message }),
+                      ),
+                    ),
+                  )
+              : Effect.void
+            ).pipe(
+              Effect.zipRight(
+                queue
+                  .recordAudit({ ...auditIdentity, outcome: 'ok' })
+                  .pipe(
+                    Effect.catchAll((cause) =>
+                      Effect.logError('Could not finalize capability audit', cause),
+                    ),
+                  ),
               ),
+              Effect.as(result),
+            ),
         });
       });
 

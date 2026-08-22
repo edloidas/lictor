@@ -6,6 +6,7 @@ import { LictorConfig } from '../config.ts';
 import { ProcessRunner } from '../executor/process-runner.ts';
 import { GitHubCredential } from '../github/credential.ts';
 import { canonicalRepository, isSafeRepository, type RepositoryPolicy } from '../policy.ts';
+import { WorkQueue } from '../queue/work-queue.ts';
 
 export class WorkspaceError extends Data.TaggedError('WorkspaceError')<{
   readonly code: string;
@@ -179,6 +180,7 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
       const processes = yield* ProcessRunner;
       const disk = yield* DiskStat;
       const credential = yield* GitHubCredential;
+      const queue = yield* WorkQueue;
       /**
        * Job ids this daemon has handed out and not yet taken back.
        *
@@ -468,11 +470,44 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
           }
 
           const authorization = yield* credential.gitAuthHeader;
+          // ! The credential reaches git as an environment header only — argv
+          // ! stays clean, so the audit row can carry the command verbatim.
+          const audited = (
+            capability: string,
+            argv: readonly string[],
+            cwd: string,
+            env?: Record<string, string>,
+          ) =>
+            Effect.gen(function* () {
+              const result = yield* command(
+                [...argv],
+                cwd,
+                config.gitTimeoutMs,
+                ...(env === undefined ? [] : [env]),
+              );
+              yield* queue
+                .recordAudit({
+                  jobId: job.id,
+                  repository,
+                  actor: config.expectedLogin,
+                  capability,
+                  input: JSON.stringify(argv),
+                  outcome: result.exitCode === 0 ? 'ok' : `exit_${result.exitCode}`,
+                })
+                .pipe(
+                  Effect.catchAll((cause) =>
+                    Effect.logWarning('Could not audit a git invocation').pipe(
+                      Effect.annotateLogs({ job: job.id, capability, error: cause.message }),
+                    ),
+                  ),
+                );
+              return result;
+            });
           const populate = Effect.gen(function* () {
-            const result = yield* command(
+            const result = yield* audited(
+              'git_clone',
               ['git', 'clone', `https://github.com/${repository}.git`, sessionPath],
               root,
-              config.gitTimeoutMs,
               authEnv(authorization),
             );
             if (result.exitCode !== 0) {
@@ -486,10 +521,10 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
               // ! Fetch the exact thing asked for and detach onto it. A ref that
               // ! cannot be fetched or checked out fails the job — silently
               // ! landing on the default branch would review the wrong tree.
-              const fetch = yield* command(
+              const fetch = yield* audited(
+                'git_fetch',
                 ['git', 'fetch', 'origin', job.ref],
                 sessionPath,
-                config.gitTimeoutMs,
                 authEnv(authorization),
               );
               if (fetch.exitCode !== 0) {
@@ -502,10 +537,10 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
                   retryable: false,
                 });
               }
-              const checkout = yield* command(
+              const checkout = yield* audited(
+                'git_checkout',
                 ['git', 'checkout', '--detach', 'FETCH_HEAD'],
                 sessionPath,
-                config.gitTimeoutMs,
               );
               if (checkout.exitCode !== 0) {
                 return yield* new WorkspaceError({
@@ -678,6 +713,7 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
       ProcessRunner.Default,
       DiskStat.Default,
       GitHubCredential.Default,
+      WorkQueue.Default,
     ],
   },
 ) {}

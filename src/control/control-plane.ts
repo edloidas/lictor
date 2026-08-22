@@ -48,9 +48,6 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
         yield* queue.recordAudit({
           jobId: id,
           repository: before.work.repository,
-          ...(before.work.installationId === undefined
-            ? {}
-            : { installationId: before.work.installationId }),
           capability: `control.${action}`,
           input: '{}',
           outcome: changed ? 'ok' : 'no_change',

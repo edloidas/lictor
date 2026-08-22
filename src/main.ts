@@ -30,7 +30,7 @@ const ClientLive = GitHubClient.DefaultWithoutDependencies.pipe(
 );
 const WorkspaceLive = RepositoryWorkspace.DefaultWithoutDependencies.pipe(
   Layer.provide(
-    Layer.mergeAll(ConfigLive, ProcessRunner.Default, DiskStat.Default, CredentialLive),
+    Layer.mergeAll(ConfigLive, ProcessRunner.Default, DiskStat.Default, CredentialLive, QueueLive),
   ),
 );
 const IdentityLive = GitHubIdentity.DefaultWithoutDependencies.pipe(

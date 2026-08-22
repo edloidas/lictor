@@ -31,7 +31,6 @@ export type WorkItem = {
   readonly deliveryId: string;
   readonly interactionId: string;
   readonly repository: string;
-  readonly installationId?: number;
   readonly approvalRequired?: boolean;
   readonly sender: string;
   readonly targets: readonly string[];
@@ -62,7 +61,6 @@ export const WorkItemSchema: Schema.Schema<WorkItem> = Schema.Struct({
   deliveryId: Schema.String,
   interactionId: Schema.String,
   repository: Schema.String,
-  installationId: Schema.optionalWith(Schema.Number, { exact: true }),
   approvalRequired: Schema.optionalWith(Schema.Boolean, { exact: true }),
   sender: Schema.String,
   targets: Schema.Array(Schema.String),
