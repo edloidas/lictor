@@ -328,4 +328,33 @@ describe('Worker.runOnce', () => {
     expect(acquireCalls.length).toBe(1);
     expect(acquireCalls[0]?.ref).toBeUndefined();
   });
+
+  // ! A branch a previous interaction created wins over the PR head: continuing
+  // ! her own work beats re-reading a head that may have moved.
+  it('clones at the branch a prior interaction on this subject created', async () => {
+    const acquireCalls: Parameters<InstanceType<typeof RepositoryWorkspace>['acquire']>[0][] = [];
+    await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(prWork);
+        yield* queue.recordSubjectBranch({
+          repository: prWork.repository,
+          subjectKind: 'pull_request',
+          subjectNumber: 42,
+          branch: 'lictor-issue-42',
+        });
+        const worker = yield* Worker;
+        return yield* worker.runOnce;
+      }),
+      () => Effect.succeed({ status: 'completed', summary: 'done' }),
+      3,
+      true,
+      (request) => {
+        acquireCalls.push(request);
+        return Effect.succeed({ path: '/tmp/lictor-job' });
+      },
+    );
+
+    expect(acquireCalls[0]?.ref).toBe('refs/heads/lictor-issue-42');
+  });
 });

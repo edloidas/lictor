@@ -111,14 +111,15 @@ const migrate = (database: Database) => {
   // ! use of it — which is exactly the failure the v6 equality guard used to
   // ! cause, one version later.
   if (
-    version.user_version === 7 &&
+    version.user_version === 8 &&
     deliveriesHaveSource() &&
     hasColumn('capability_audit', 'actor') &&
     hasTable('notification_cursors') &&
-    hasTable('poller_state')
+    hasTable('poller_state') &&
+    hasTable('subject_branches')
   )
     return;
-  if (version.user_version > 7) {
+  if (version.user_version > 8) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -256,6 +257,16 @@ const migrate = (database: Database) => {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS capability_audit_job ON capability_audit(job_id, id);
+      -- Branch a job created for its subject, so a later interaction continues
+      -- on that branch instead of restarting from the default one.
+      CREATE TABLE IF NOT EXISTS subject_branches (
+        repository TEXT NOT NULL,
+        subject_kind TEXT NOT NULL,
+        subject_number INTEGER NOT NULL,
+        branch TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (repository, subject_kind, subject_number)
+      );
       CREATE TABLE IF NOT EXISTS notification_cursors (
         thread_id TEXT PRIMARY KEY,
         last_activity_at INTEGER NOT NULL,
@@ -266,7 +277,7 @@ const migrate = (database: Database) => {
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         last_modified TEXT
       );
-      PRAGMA user_version = 7;
+      PRAGMA user_version = 8;
     `);
     // ! Condemned, not drained. `DeliverySource` no longer has a `webhook`
     // ! member, so nothing can decode these bodies — leaving one claimable
@@ -826,7 +837,6 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
     const recordAudit = (entry: {
       readonly jobId: number;
       readonly repository: string;
-      readonly installationId?: number;
       readonly actor?: string;
       readonly capability: string;
       readonly input: string;
@@ -839,12 +849,11 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             .query(
               `INSERT INTO capability_audit
                 (job_id, repository, installation_id, actor, capability, input, outcome, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+               VALUES (?, ?, NULL, ?, ?, ?, ?, ?)`,
             )
             .run(
               entry.jobId,
               entry.repository,
-              entry.installationId ?? null,
               entry.actor ?? null,
               entry.capability,
               entry.input,
@@ -854,18 +863,66 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         });
       });
 
+    /**
+     * Remembers the branch a job created for its subject. The broker records on
+     * every successful `create_branch`; the worker reads it back as the clone
+     * ref of the next interaction with the same subject, so a follow-up builds
+     * on the branch the first one started rather than the default HEAD.
+     */
+    const recordSubjectBranch = (input: {
+      readonly repository: string;
+      readonly subjectKind: 'issue' | 'pull_request';
+      readonly subjectNumber: number;
+      readonly branch: string;
+    }) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        yield* attempt('record subject branch', () => {
+          database
+            .query(
+              `INSERT INTO subject_branches (repository, subject_kind, subject_number, branch, created_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(repository, subject_kind, subject_number)
+                 DO UPDATE SET branch = excluded.branch, created_at = excluded.created_at`,
+            )
+            .run(
+              input.repository.toLowerCase(),
+              input.subjectKind,
+              input.subjectNumber,
+              input.branch,
+              now,
+            );
+        });
+      });
+
+    const branchForSubject = (
+      repository: string,
+      subjectKind: 'issue' | 'pull_request',
+      subjectNumber: number,
+    ) =>
+      attempt('look up subject branch', () => {
+        const row = database
+          .query(
+            `SELECT branch FROM subject_branches
+             WHERE repository = ? AND subject_kind = ? AND subject_number = ?`,
+          )
+          .get(repository.toLowerCase(), subjectKind, subjectNumber) as
+          | { branch: string }
+          | undefined;
+        return row?.branch;
+      });
+
     const auditLog = (jobId: number) =>
       attempt(
         'list capability audit',
         () =>
           database
             .query(
-              `SELECT repository, installation_id AS installationId, actor, capability, input, outcome,
+              `SELECT repository, actor, capability, input, outcome,
                  created_at AS createdAt FROM capability_audit WHERE job_id = ? ORDER BY id`,
             )
             .all(jobId) as readonly {
             readonly repository: string;
-            readonly installationId: number | null;
             readonly actor: string | null;
             readonly capability: string;
             readonly input: string;
@@ -1084,6 +1141,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       maintenance,
       recordAudit,
       auditLog,
+      recordSubjectBranch,
+      branchForSubject,
       listJobs,
       job,
       liveJobIds,

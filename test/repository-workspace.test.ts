@@ -1,3 +1,4 @@
+import { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
 import {
   existsSync,
@@ -15,6 +16,7 @@ import { LictorConfig } from '../src/config.ts';
 import { type ProcessRequest, ProcessRunner } from '../src/executor/process-runner.ts';
 import { GitHubCredential } from '../src/github/credential.ts';
 import type { RepositoryPolicy } from '../src/policy.ts';
+import { WorkQueue } from '../src/queue/work-queue.ts';
 import { DiskStat, RepositoryWorkspace } from '../src/workspace/repository-workspace.ts';
 
 const job = { id: 10, repository: 'edloidas/lictor' };
@@ -86,6 +88,13 @@ const service = (
         }),
       ),
     ),
+    // Real queue over the temp home's database: git invocations land in
+    // `capability_audit`, asserted by reading the file after the run.
+    Layer.provide(
+      WorkQueue.DefaultWithoutDependencies.pipe(
+        Layer.provide(Layer.succeed(LictorConfig, config(home))),
+      ),
+    ),
   );
 
 const withHome = async <A>(body: (home: string) => Promise<A>): Promise<A> => {
@@ -138,6 +147,45 @@ describe('RepositoryWorkspace', () => {
       expect(calls.some((call) => call.command.includes('--depth'))).toBe(false);
       expect(calls.some((call) => call.command.includes('--filter'))).toBe(false);
       expect(calls.some((call) => call.command.includes('--single-branch'))).toBe(false);
+    });
+  });
+
+  it('audits every git subprocess invocation with the command verbatim', async () => {
+    await withHome(async (home) => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const manager = yield* RepositoryWorkspace;
+          yield* manager.acquire({ ...job, ref: 'refs/pull/9/head' }, policy('allowed'));
+        }).pipe(Effect.provide(service(home, () => Effect.sync(() => ok())))),
+      );
+
+      const database = new Database(join(home, 'lictor.sqlite'), { readonly: true });
+      try {
+        const rows = database
+          .query(
+            `SELECT capability, outcome, input, actor FROM capability_audit
+             WHERE job_id = ? ORDER BY id`,
+          )
+          .all(job.id) as
+          | readonly { capability: string; outcome: string; input: string; actor: string }[]
+          | [];
+        expect([...rows].map((row) => row.capability)).toEqual([
+          'git_clone',
+          'git_fetch',
+          'git_checkout',
+        ]);
+        for (const row of rows) {
+          expect(row.outcome).toBe('ok');
+          // The daemon's own credential is the actor; the token never appears
+          // in the argv an audit row carries.
+          expect(row.actor).toBe('adiutriel');
+          const argv = JSON.parse(row.input) as string[];
+          expect(argv[0]).toBe('git');
+          expect(argv.some((part) => part.includes('secret-token'))).toBe(false);
+        }
+      } finally {
+        database.close();
+      }
     });
   });
 

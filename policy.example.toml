@@ -2,12 +2,14 @@
 execution = "automatic"
 clone = "allowed"
 
-# Narrowest useful capability set: investigate and reply. Widen per repository
-# only when a phase needs it — branches and pullRequests for code changes,
-# issues for assignment work.
+# Investigate, reply, and ship code changes as branches and pull requests.
+# `issues`, `merge`, `forcePush`, and `deleteBranches` stay denied until a
+# later phase earns them.
 [defaults.capabilities]
 read = true
 comment = true
+branches = true
+pullRequests = true
 scripts = []
 
 # Every repository is named in full. There are no owner wildcards here: an

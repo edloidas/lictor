@@ -13,7 +13,6 @@ const work: WorkItem = {
   deliveryId: 'delivery-13',
   interactionId: 'interaction-13',
   repository: 'edloidas/lictor',
-  installationId: 42,
   sender: 'edloidas',
   targets: ['adiutriel'],
   reasons: ['assigned'],
@@ -234,7 +233,7 @@ describe('CapabilityBroker', () => {
     expect(result.requests).toHaveLength(0);
   });
 
-  it('executes an allowed read with the job installation and audits it', async () => {
+  it('executes an allowed read and audits it with the authenticated actor', async () => {
     const result = await run(
       Effect.gen(function* () {
         const broker = yield* CapabilityBroker;
@@ -255,15 +254,62 @@ describe('CapabilityBroker', () => {
     expect(result.requests[0]).toContain('/repos/edloidas/lictor/issues/13');
     expect(result.value.audit.at(-1)).toMatchObject({
       repository: 'edloidas/lictor',
-      installationId: 42,
-      // ! A polled notification never populates installationId — it is App-era
-      // ! residue — so on a real delivery the actor is the only identity an audit
-      // ! row carries.
+      // ! The actor is the only identity an audit row carries: the PAT acts as
+      // ! one account, so attribution is the verified login, never a payload
+      // ! field.
       actor: 'adiutriel',
       capability: 'get_issue',
       outcome: 'ok',
     });
     expect(JSON.stringify(result.value.response)).not.toContain('ghs_');
+  });
+
+  it('remembers a branch a job created for its subject', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        const response = yield* broker.callTool({
+          jobId: enqueued.jobId,
+          attemptNumber: claimed?.attempts ?? -1,
+          workerId: claimed?.workerId ?? '',
+          name: 'create_branch',
+          input: { ref: 'refs/heads/lictor-issue-13' },
+        });
+        return {
+          response,
+          branch: yield* queue.branchForSubject('edloidas/lictor', 'issue', 13),
+        };
+      }),
+      '[defaults.capabilities]\nread = true\nbranches = true',
+    );
+    expect(result.value.response).toMatchObject({ ok: true });
+    expect(result.value.branch).toBe('lictor-issue-13');
+  });
+
+  it('leaves the subject branch untouched when a denied call fails', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        yield* Effect.exit(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'create_branch',
+            input: { ref: 'refs/heads/lictor-issue-13' },
+          }),
+        );
+        return yield* queue.branchForSubject('edloidas/lictor', 'issue', 13);
+      }),
+      '[defaults.capabilities]\nread = true\nbranches = false',
+    );
+    expect(result.value).toBeUndefined();
   });
 
   it('fails closed for a forbidden mutation and records the denial', async () => {

@@ -14,7 +14,6 @@ const work: WorkItem = {
   deliveryId: 'control-delivery',
   interactionId: 'control-interaction',
   repository: 'edloidas/lictor',
-  installationId: 42,
   approvalRequired: true,
   sender: 'edloidas',
   targets: ['adiutriel'],
