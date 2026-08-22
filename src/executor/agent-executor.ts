@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { Data, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
-import type { WorkItem } from '../webhook/qualification.ts';
+import type { WorkItem } from '../work-item.ts';
 import { ProcessRunner } from './process-runner.ts';
 
 export class ExecutorError extends Data.TaggedError('ExecutorError')<{

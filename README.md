@@ -10,29 +10,28 @@ A local GitHub automation daemon that gives Codex durable, policy-scoped work.
   <a href="https://bun.sh/"><img src="https://img.shields.io/badge/bun-%E2%89%A5%201.3.14-fbf0df" alt="Bun >= 1.3.14"></a>
 </p>
 
-Lictor verifies signed GitHub webhooks, commits each delivery to SQLite before
-acknowledging it, and runs qualifying work in an isolated repository worktree.
-GitHub credentials stay in the daemon; agent GitHub operations pass through a
-job-scoped, audited capability broker.
+Lictor polls the GitHub notifications API, commits each thread to SQLite before
+marking it read, acknowledges accepted work with an eyes reaction, and runs it in
+an isolated repository worktree. GitHub credentials stay in the daemon; agent
+GitHub operations pass through a job-scoped, audited capability broker.
 
 ```text
-GitHub -> tunnel -> webhook -> durable inbox -> policy -> queue
-                                                       |
-                                              isolated worktree
-                                                       |
-                                             Codex + broker tools
+GitHub notifications <- poll -- durable inbox -> qualify -> policy -> queue
+                                     |                                 |
+                             mark read after commit          isolated worktree
+                                                                       |
+                                                             Codex + broker tools
 ```
 
 ## Requirements
 
 - Bun 1.3.14 or newer
 - a classic `repo`-scope personal access token for the account the daemon acts as
-- a webhook on each managed repository, delivering to the route below
 - the Codex CLI, authenticated on the daemon machine
-- a tunnel such as `cloudflared` for the public webhook route
 
-Only `POST /webhooks/github` and the minimal `GET /health` liveness endpoint
-are public. Readiness and management use an owner-only local Unix socket.
+Nothing needs to reach the machine from outside. Only the minimal `GET /health`
+liveness endpoint is public; readiness and management use an owner-only local
+Unix socket.
 
 ## Start safely
 
@@ -57,8 +56,8 @@ directory, startup refuses rather than opening a fresh database beside it.
 
 The example environment starts with `LICTOR_EXECUTOR=disabled`, empty trusted
 principals, and no implicit GitHub mutation authority. This lets you verify token
-authentication, webhook signatures, durable receipt, and policy loading before
-Codex can claim work.
+authentication, polling, durable receipt, and policy loading before Codex can
+claim work.
 
 Create the token from the account's Developer settings, set it as
 `LICTOR_GITHUB_TOKEN`, and put that account's login in `LICTOR_GITHUB_LOGIN` —
@@ -69,17 +68,14 @@ everything the account reaches, which includes its own repositories and anything
 granted through organization membership or a team. Use a dedicated account whose
 entire access you control, not a personal one.
 
-Add a webhook to each repository you intend to manage with the same secret, and
-subscribe only to the issue, pull-request, review, and comment events you use.
-Set its content type to `application/json` — the default urlencoded body passes
-signature verification and then fails to parse. Point its payload URL at:
+Nothing has to be configured per repository to make her *notice* — mentioning her
+notifies her account, and notifications reach exactly as far as her membership
+graph does. A repository webhook would instead need admin on that repository, so
+it would be scoped to whatever the operator can administer rather than to what she
+can reach.
 
-```text
-https://<your-tunnel>/webhooks/github
-```
-
-Start the tunnel with `bun tunnel`. A GitHub `ping` confirms the route and
-signature configuration.
+Watch the log on the first mention. `Committed notifications` confirms polling and
+credential scope; `Queued GitHub interaction` confirms qualification and policy.
 
 ## Activate repository policy
 
@@ -130,8 +126,9 @@ SQLite database and is never taken from a managed repository:
 CODEX_HOME=~/.lictor/codex codex login
 ```
 
-Then set `GITHUB_TRUSTED_SENDERS`, `GITHUB_TARGET_USERS`, and
-`LICTOR_EXECUTOR=codex` in `.env`, and restart the daemon.
+Then set `GITHUB_TRUSTED_SENDERS` and `LICTOR_EXECUTOR=codex` in `.env`, and
+restart the daemon. There is no separate list of who may be mentioned: the account
+the token belongs to is the only target, confirmed by `GET /user` at startup.
 
 ## Operate the daemon
 
@@ -184,20 +181,25 @@ running. SQLite state and its WAL must be treated as one consistency boundary.
 
 ## Failure guarantees and limits
 
-- `202 Accepted` means the exact signed delivery is durably committed.
-- Storage failure returns `503`. GitHub does not retry a failed delivery on its
-  own, so recovery is a manual redelivery from the webhook's delivery log.
-- Duplicate delivery and interaction identities are idempotent.
+- A notification thread is marked read only after its row is durably committed,
+  so a crash mid-sweep leaves the item with GitHub rather than losing it.
+- Storage failure leaves the thread unread and the sweep retries it. So does a
+  full queue: the depth limit is checked before anything is marked read, which
+  makes GitHub the overflow buffer.
+- Duplicate delivery and interaction identities are idempotent. A replayed
+  thread produces no second job and no second reaction.
+- An eyes reaction on the triggering comment is best-effort acknowledgement, not
+  a receipt: the job is committed whether or not the reaction lands.
 - One daemon owns the database; worker attempts use renewable fenced leases.
 - Expired work is retried within its attempt budget, then dead-lettered.
 - Queue depth, job age, per-repository attempts, and execution duration are
   policy limits, not prompt instructions.
-- Codex receives an allowlisted environment without the access token, webhook
-  secret, or ambient `gh` credentials. Every write goes through the broker.
+- Codex receives an allowlisted environment without the access token or ambient
+  `gh` credentials. Every write goes through the broker.
 - Logs use stable error codes and omit raw payloads, parse values, credentials,
   and agent stderr.
 
-The public request body limit defaults to 1 MiB. Configure operational limits
+The stored delivery body limit defaults to 1 MiB. Configure operational limits
 in policy:
 
 ```toml

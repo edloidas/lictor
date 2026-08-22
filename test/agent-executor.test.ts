@@ -3,13 +3,11 @@ import { Effect, Redacted, Ref } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { AgentExecutor, buildPrompt } from '../src/executor/agent-executor.ts';
 import { type ProcessRequest, ProcessRunner } from '../src/executor/process-runner.ts';
-import type { WorkItem } from '../src/webhook/qualification.ts';
+import type { WorkItem } from '../src/work-item.ts';
 
 const work: WorkItem = {
   deliveryId: 'delivery-1',
   interactionId: 'interaction-1',
-  event: 'issue_comment',
-  action: 'created',
   repository: 'edloidas/lictor',
   sender: 'edloidas',
   targets: ['adiutriel'],
@@ -27,9 +25,7 @@ const config = (executor: 'codex' | 'disabled' = 'codex') =>
   LictorConfig.make({
     githubToken: Redacted.make('test-token'),
     expectedLogin: 'adiutriel',
-    webhookSecret: Redacted.make('unused'),
     trustedSenders: ['edloidas'],
-    targetUsers: ['adiutriel'],
     databasePath: ':memory:',
     policyPath: 'policy.toml',
     controlSocketPath: '/tmp/lictor.sock',
@@ -42,6 +38,7 @@ const config = (executor: 'codex' | 'disabled' = 'codex') =>
     workerPollMs: 10,
     workerMaxAttempts: 3,
     workerRetryBaseMs: 100,
+    notificationPollMs: 60_000,
   });
 
 const runWith = <A, E>(

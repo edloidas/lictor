@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Clock, Data, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
-import { type WorkItem, WorkItemSchema } from '../webhook/qualification.ts';
+import { type WorkItem, WorkItemSchema } from '../work-item.ts';
 
 const WORKER_LEASE_MS = 60_000;
 const DAEMON_LEASE_MS = 30_000;
@@ -15,13 +15,19 @@ export type InboxStatus = 'pending' | 'processing' | 'completed' | 'failed';
  * The producer that stored a delivery. One per transport; a consumer that
  * decodes stored bodies switches over this instead of assuming an envelope.
  * Grows when a second producer lands.
+ *
+ * ! `webhook` is gone rather than retained, so no decoder has to exist for a
+ * ! transport with no producer. The v7 migration condemns the rows it left
+ * ! behind — see `migrate` — because a `claimDelivery` returning a source
+ * ! nothing can decode is a defect, not a failure.
  */
-export type DeliverySource = 'webhook';
+export type DeliverySource = 'notification';
 
 export type ReceivedDelivery = {
   readonly id: string;
   readonly event: string;
   readonly body: string;
+  readonly source: DeliverySource;
 };
 
 export type InboxDelivery = ReceivedDelivery & {
@@ -86,8 +92,26 @@ const migrate = (database: Database) => {
     (database.query('PRAGMA table_info(deliveries)').all() as { name: string }[]).some(
       (column) => column.name === 'source',
     );
-  if (version.user_version === 6 && deliveriesHaveSource()) return;
-  if (version.user_version > 6) {
+  const hasTable = (name: string) =>
+    database.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !==
+    null;
+  const hasColumn = (table: string, column: string) =>
+    (database.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(
+      (existing) => existing.name === column,
+    );
+  // ! Every v7 artifact, not a sample of them. A database stamped 7 that is
+  // ! missing one table or one column returns early here and then fails on every
+  // ! use of it — which is exactly the failure the v6 equality guard used to
+  // ! cause, one version later.
+  if (
+    version.user_version === 7 &&
+    deliveriesHaveSource() &&
+    hasColumn('capability_audit', 'actor') &&
+    hasTable('notification_cursors') &&
+    hasTable('poller_state')
+  )
+    return;
+  if (version.user_version > 7) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -190,9 +214,13 @@ const migrate = (database: Database) => {
           WHERE status = 'running' AND lease_expires_at IS NULL;
       `);
     }
-    // The block below creates `capability_audit` for every path that predates
-    // it, so only a schema that already has the table needs the new column.
-    if (version.user_version === 4) {
+    // ! Column presence, not the version stamp, for the same reason the guard
+    // ! above checks artifacts rather than trusting `user_version`: a database
+    // ! stamped past 4 whose `capability_audit` lacks `actor` would leave this
+    // ! migration unrepaired, and every `recordAudit` — which names the column —
+    // ! then fails. The block below creates the table for every path that
+    // ! predates it, so only a schema that already has it can need the column.
+    if (hasTable('capability_audit') && !hasColumn('capability_audit', 'actor')) {
       database.exec('ALTER TABLE capability_audit ADD COLUMN actor TEXT');
     }
     // ! The check sits after the `CREATE TABLE IF NOT EXISTS` above, which is
@@ -221,8 +249,29 @@ const migrate = (database: Database) => {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS capability_audit_job ON capability_audit(job_id, id);
-      PRAGMA user_version = 6;
+      CREATE TABLE IF NOT EXISTS notification_cursors (
+        thread_id TEXT PRIMARY KEY,
+        last_activity_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS notification_cursors_stale ON notification_cursors(updated_at);
+      CREATE TABLE IF NOT EXISTS poller_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        last_modified TEXT
+      );
+      PRAGMA user_version = 7;
     `);
+    // ! Condemned, not drained. `DeliverySource` no longer has a `webhook`
+    // ! member, so nothing can decode these bodies — leaving one claimable
+    // ! means the delivery worker looks up a decoder that is not there and
+    // ! dies on a defect every cycle. `failed` is terminal and `last_error`
+    // ! says why, which is the most an upgrade can honestly offer.
+    database.exec(
+      `UPDATE deliveries
+       SET status = 'failed', processed_at = unixepoch('subsec') * 1000,
+           last_error = 'webhook transport removed'
+       WHERE source = 'webhook' AND status IN ('pending', 'processing')`,
+    );
   })();
 };
 
@@ -349,13 +398,14 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         return yield* attempt('receive delivery', () => {
           const result = database
             .query(
-              `INSERT INTO deliveries (id, event, body, status, received_at)
-               VALUES (?, ?, ?, 'pending', ?)
+              `INSERT INTO deliveries (id, event, body, source, status, received_at)
+               VALUES (?, ?, ?, ?, 'pending', ?)
               ON CONFLICT(id) DO UPDATE SET event = excluded.event, body = excluded.body,
-                status = 'pending', claimed_at = NULL, processed_at = NULL, last_error = NULL
+                source = excluded.source, status = 'pending', claimed_at = NULL,
+                processed_at = NULL, last_error = NULL
               WHERE deliveries.status = 'failed'`,
             )
-            .run(delivery.id, delivery.event, delivery.body, now);
+            .run(delivery.id, delivery.event, delivery.body, delivery.source, now);
           return { inserted: result.changes === 1 } as const;
         });
       });
@@ -427,6 +477,71 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             readonly status: InboxStatus;
           } | null,
       ).pipe(Effect.map((row) => row?.status));
+
+    /**
+     * Newest activity already turned into work for one notification thread.
+     *
+     * ! Not an optimisation. A notification says a thread changed, never which
+     * ! comment changed it, so the qualifier scans comments newer than this to
+     * ! find the one that mentioned her. Without it the only available anchor is
+     * ! `latest_comment_url`, which points at the newest comment rather than the
+     * ! triggering one — two comments inside one poll window would then be
+     * ! attributed to the wrong author, and the sender check would run against a
+     * ! sender who never mentioned anybody.
+     */
+    const notificationCursor = (threadId: string) =>
+      attempt(
+        'read notification cursor',
+        () =>
+          database
+            .query(
+              'SELECT last_activity_at AS lastActivityAt FROM notification_cursors WHERE thread_id = ?',
+            )
+            .get(threadId) as { readonly lastActivityAt: number } | null,
+      ).pipe(Effect.map((row) => row?.lastActivityAt));
+
+    const advanceNotificationCursor = (threadId: string, lastActivityAt: number) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        yield* attempt('advance notification cursor', () => {
+          database
+            .query(
+              `INSERT INTO notification_cursors (thread_id, last_activity_at, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(thread_id) DO UPDATE SET
+                 last_activity_at = MAX(notification_cursors.last_activity_at, excluded.last_activity_at),
+                 updated_at = excluded.updated_at`,
+            )
+            .run(threadId, lastActivityAt, now);
+        });
+      });
+
+    /**
+     * `Last-Modified` from the most recent successful poll.
+     *
+     * Replayed back as `If-Modified-Since`, whose 304 costs nothing against the
+     * rate limit. Durable rather than in-memory so a restart does not re-read
+     * the whole notification list against the budget.
+     */
+    const pollerCursor = attempt(
+      'read poller cursor',
+      () =>
+        database
+          .query('SELECT last_modified AS lastModified FROM poller_state WHERE singleton = 1')
+          .get() as {
+          readonly lastModified: string | null;
+        } | null,
+    ).pipe(Effect.map((row) => row?.lastModified ?? undefined));
+
+    const setPollerCursor = (lastModified: string) =>
+      attempt('write poller cursor', () => {
+        database
+          .query(
+            `INSERT INTO poller_state (singleton, last_modified) VALUES (1, ?)
+             ON CONFLICT(singleton) DO UPDATE SET last_modified = excluded.last_modified`,
+          )
+          .run(lastModified);
+      });
 
     const enqueue = (work: WorkItem, maxDepth = 10_000) =>
       Effect.gen(function* () {
@@ -690,6 +805,11 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
              (status = 'failed' AND processed_at < ?)`,
           )
           .run(completedBefore, failedBefore);
+        // ! Pruned on the failed window, the longer of the two. A cursor is the
+        // ! only record of what a thread already produced, so dropping one early
+        // ! makes the qualifier rescan from the beginning of the thread and
+        // ! re-attribute an old comment as fresh activity.
+        database.query('DELETE FROM notification_cursors WHERE updated_at < ?').run(failedBefore);
         database.exec('PRAGMA wal_checkpoint(PASSIVE)');
         const sizeBytes =
           config.databasePath === ':memory:' ? 0 : statSync(config.databasePath).size;
@@ -855,6 +975,33 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         );
       });
 
+    /**
+     * Work already accepted and not yet finished: active jobs plus deliveries
+     * the worker has not drained.
+     *
+     * ! The poller checks this before storing anything, because the depth limit
+     * ! itself lives in `enqueue` — which the poller never calls. By the time
+     * ! `enqueue` refuses, the notification is already committed and the thread
+     * ! already marked read, so GitHub has forgotten it and the overflow has
+     * ! nowhere left to sit. Measured here instead, an over-depth sweep simply
+     * ! leaves the threads unread and GitHub holds them until the queue drains.
+     * !
+     * ! A delivery being handed off to a job is counted twice for that moment.
+     * ! Deliberate: erring toward a smaller sweep costs a poll interval, erring
+     * ! the other way costs whatever the queue could not hold.
+     */
+    const backlog = attempt('measure backlog', () => {
+      const jobs = database
+        .query(
+          "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('pending', 'retry', 'interrupted', 'running')",
+        )
+        .get() as { count: number };
+      const deliveries = database
+        .query("SELECT COUNT(*) AS count FROM deliveries WHERE status IN ('pending', 'processing')")
+        .get() as { count: number };
+      return jobs.count + deliveries.count;
+    });
+
     const diagnostics = Effect.gen(function* () {
       const jobCounts = yield* counts;
       return yield* attempt('queue diagnostics', () => {
@@ -895,6 +1042,11 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       finishDelivery,
       retryDelivery,
       deliveryStatus,
+      notificationCursor,
+      advanceNotificationCursor,
+      pollerCursor,
+      setPollerCursor,
+      backlog,
       enqueue,
       claim,
       claimFor,

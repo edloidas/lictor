@@ -6,15 +6,13 @@ import { join } from 'node:path';
 import { Clock, Effect, Layer, Redacted } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
-import type { WorkItem } from '../src/webhook/qualification.ts';
+import type { WorkItem } from '../src/work-item.ts';
 
 const config = (databasePath: string) =>
   LictorConfig.make({
     githubToken: Redacted.make('test-token'),
     expectedLogin: 'adiutriel',
-    webhookSecret: Redacted.make('unused'),
     trustedSenders: ['edloidas'],
-    targetUsers: ['adiutriel'],
     databasePath,
     policyPath: 'policy.toml',
     controlSocketPath: '/tmp/lictor.sock',
@@ -27,6 +25,7 @@ const config = (databasePath: string) =>
     workerPollMs: 10,
     workerMaxAttempts: 3,
     workerRetryBaseMs: 100,
+    notificationPollMs: 60_000,
   });
 
 const queueLayer = (databasePath = ':memory:') =>
@@ -40,8 +39,6 @@ const run = <A, E>(effect: Effect.Effect<A, E, WorkQueue>) =>
 const work = (deliveryId: string): WorkItem => ({
   deliveryId,
   interactionId: `interaction-${deliveryId}`,
-  event: 'issues',
-  action: 'assigned',
   repository: 'edloidas/lictor',
   sender: 'edloidas',
   targets: ['adiutriel'],
@@ -59,7 +56,12 @@ describe('WorkQueue', () => {
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
-        const delivery = { id: 'delivery-1', event: 'issues', body: '{"action":"opened"}' };
+        const delivery = {
+          id: 'delivery-1',
+          event: 'notification',
+          body: '{"action":"opened"}',
+          source: 'notification',
+        } as const;
         const first = yield* queue.receiveDelivery(delivery);
         const duplicate = yield* queue.receiveDelivery(delivery);
         const claimed = yield* queue.claimDelivery;
@@ -72,7 +74,7 @@ describe('WorkQueue', () => {
     expect(result.duplicate.inserted).toBe(false);
     expect(result.claimed).toMatchObject({
       id: 'delivery-1',
-      source: 'webhook',
+      source: 'notification',
       status: 'processing',
       attempts: 1,
     });
@@ -83,10 +85,20 @@ describe('WorkQueue', () => {
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
-        yield* queue.receiveDelivery({ id: 'completed', event: 'ping', body: '{}' });
+        yield* queue.receiveDelivery({
+          id: 'completed',
+          event: 'notification',
+          body: '{}',
+          source: 'notification',
+        });
         yield* queue.claimDelivery;
         yield* queue.finishDelivery('completed', 'completed');
-        yield* queue.receiveDelivery({ id: 'failed', event: 'issues', body: '{}' });
+        yield* queue.receiveDelivery({
+          id: 'failed',
+          event: 'notification',
+          body: '{}',
+          source: 'notification',
+        });
         yield* queue.claimDelivery;
         yield* queue.finishDelivery('failed', 'failed', 'invalid payload');
         return {
@@ -103,7 +115,12 @@ describe('WorkQueue', () => {
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
-        const delivery = { id: 'redelivery', event: 'issues', body: '{"version":1}' };
+        const delivery = {
+          id: 'redelivery',
+          event: 'notification',
+          body: '{"version":1}',
+          source: 'notification',
+        } as const;
         yield* queue.receiveDelivery(delivery);
         yield* queue.claimDelivery;
         yield* queue.finishDelivery(delivery.id, 'failed', 'old decoder');
@@ -324,7 +341,12 @@ describe('WorkQueue', () => {
         Effect.scoped(
           Effect.gen(function* () {
             const queue = yield* WorkQueue;
-            yield* queue.receiveDelivery({ id: 'delivery-1', event: 'ping', body: '{}' });
+            yield* queue.receiveDelivery({
+              id: 'delivery-1',
+              event: 'notification',
+              body: '{}',
+              source: 'notification',
+            });
             yield* queue.claimDelivery;
           }).pipe(Effect.provide(queueLayer(path))),
         ),
@@ -388,6 +410,110 @@ describe('WorkQueue', () => {
     }
   });
 
+  // ! The migration guard checks artifacts, not the version stamp, so a database
+  // ! stamped current but missing one of them must still be repaired. Every
+  // ! `recordAudit` names `actor`, so an unrepaired column fails every
+  // ! acknowledgement — and the guard is the only thing standing between the two.
+  it.each(['notification_cursors', 'poller_state', 'capability_audit.actor'])(
+    'repairs a database stamped current but missing %s',
+    async (artifact) => {
+      const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+      const path = join(directory, 'queue.sqlite');
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(WorkQueue, (queue) => queue.counts).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+      const database = new Database(path);
+      if (artifact === 'capability_audit.actor') {
+        database.exec('ALTER TABLE capability_audit DROP COLUMN actor');
+      } else {
+        database.exec(`DROP TABLE ${artifact}`);
+      }
+      database.close();
+
+      try {
+        const repaired = await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const queue = yield* WorkQueue;
+              const enqueued = yield* queue.enqueue(work('delivery-repair'), 10);
+              yield* queue.recordAudit({
+                jobId: enqueued.jobId,
+                repository: 'edloidas/lictor',
+                actor: 'daemon',
+                capability: 'react',
+                input: '{}',
+                outcome: 'ok',
+              });
+              yield* queue.advanceNotificationCursor('14567', 1);
+              yield* queue.setPollerCursor('Thu, 21 Aug 2026 10:00:00 GMT');
+              return {
+                audit: yield* queue.auditLog(enqueued.jobId),
+                cursor: yield* queue.notificationCursor('14567'),
+                poller: yield* queue.pollerCursor,
+              };
+            }).pipe(Effect.provide(queueLayer(path))),
+          ),
+        );
+
+        expect(repaired.audit.at(-1)).toMatchObject({ actor: 'daemon', capability: 'react' });
+        expect(repaired.cursor).toBe(1);
+        expect(repaired.poller).toBe('Thu, 21 Aug 2026 10:00:00 GMT');
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  // ! `DeliverySource` no longer has a `webhook` member, so a leftover
+  // ! claimable row would make the delivery worker look up a decoder that is
+  // ! not there and die on a defect every cycle. The upgrade condemns them
+  // ! instead, and says why in `last_error`.
+  it('condemns undrained webhook deliveries when the transport is removed', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(WorkQueue, (queue) => queue.counts).pipe(Effect.provide(queueLayer(path))),
+      ),
+    );
+    const database = new Database(path);
+    database.exec(
+      `INSERT INTO deliveries (id, event, body, source, status, received_at)
+       VALUES ('legacy-pending', 'issues', '{}', 'webhook', 'pending', 1),
+              ('legacy-processing', 'issues', '{}', 'webhook', 'processing', 2),
+              ('legacy-done', 'issues', '{}', 'webhook', 'completed', 3)`,
+    );
+    database.exec('PRAGMA user_version = 6');
+    database.close();
+
+    try {
+      const statuses = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            return {
+              pending: yield* queue.deliveryStatus('legacy-pending'),
+              processing: yield* queue.deliveryStatus('legacy-processing'),
+              done: yield* queue.deliveryStatus('legacy-done'),
+              claimed: yield* queue.claimDelivery,
+            };
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(statuses.pending).toBe('failed');
+      expect(statuses.processing).toBe('failed');
+      // ! A row already drained is history, not a hazard — leave it alone so the
+      // ! retention window prunes it on schedule.
+      expect(statuses.done).toBe('completed');
+      expect(statuses.claimed).toBeUndefined();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   // ! Every delivery stored before sources existed came from the webhook, so
   // ! the migration must backfill the column rather than leave old rows
   // ! unreadable by a consumer that switches over it. The seeds rewind to
@@ -419,13 +545,18 @@ describe('WorkQueue', () => {
           Effect.scoped(
             Effect.gen(function* () {
               const queue = yield* WorkQueue;
-              yield* queue.receiveDelivery({ id: 'delivery-source', event: 'issues', body: '{}' });
+              yield* queue.receiveDelivery({
+                id: 'delivery-source',
+                event: 'notification',
+                body: '{}',
+                source: 'notification',
+              });
               return yield* queue.claimDelivery;
             }).pipe(Effect.provide(queueLayer(path))),
           ),
         );
 
-        expect(claimed).toMatchObject({ id: 'delivery-source', source: 'webhook' });
+        expect(claimed).toMatchObject({ id: 'delivery-source', source: 'notification' });
       } finally {
         rmSync(directory, { recursive: true, force: true });
       }

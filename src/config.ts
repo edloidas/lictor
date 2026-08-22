@@ -103,8 +103,8 @@ const positiveInteger = (name: string, fallback: number, maximum: number) =>
  * Environment-backed configuration. Bun loads `.env` automatically, so nothing
  * here needs a dotenv shim — see `.env.example` for the expected keys.
  *
- * Both secrets are `Redacted`, which keeps them out of logs and error traces
- * even when a service is printed whole.
+ * The token is `Redacted`, which keeps it out of logs and error traces even when
+ * a service is printed whole.
  */
 export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig', {
   effect: Effect.gen(function* () {
@@ -130,12 +130,8 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
           validation: (login) => login.length > 0,
         }),
       ),
-      /** Shared secret GitHub signs each delivery with. */
-      webhookSecret: yield* Config.redacted('GITHUB_WEBHOOK_SECRET'),
       /** GitHub users whose activity may create work. Empty trusts nobody. */
       trustedSenders: yield* loginList('GITHUB_TRUSTED_SENDERS'),
-      /** GitHub users whose assignments and mentions may create work. */
-      targetUsers: yield* loginList('GITHUB_TARGET_USERS'),
       /**
        * Local SQLite file used for durable work.
        *
@@ -176,6 +172,19 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
         'LICTOR_WORKER_RETRY_BASE_MS',
         30_000,
         24 * 60 * 60 * 1000,
+      ),
+      /**
+       * Floor for the gap between notification polls.
+       *
+       * ! A floor, not the interval. GitHub returns `X-Poll-Interval` and asks
+       * ! callers to honour it; polling faster than it says is what earns a
+       * ! secondary rate limit. This only stops a header that is absent or
+       * ! implausibly small from turning the loop into a spin.
+       */
+      notificationPollMs: yield* positiveInteger(
+        'LICTOR_NOTIFICATION_POLL_MS',
+        60_000,
+        60 * 60 * 1000,
       ),
     };
   }),

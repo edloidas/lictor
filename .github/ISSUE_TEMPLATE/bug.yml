@@ -8,7 +8,7 @@ body:
     attributes:
       label: What triggered it
       description: The event, payload, or request that causes the problem. Redact secrets.
-      placeholder: POST /webhooks/github with X-GitHub-Event=issues, action=opened
+      placeholder: notification thread 14567, reason=mention, on edloidas/sandbox#7
       render: text
     validations:
       required: true
@@ -52,6 +52,6 @@ body:
     id: context
     attributes:
       label: Additional context
-      description: Anything else worth knowing — tunnel in use, App permissions, delivery id.
+      description: Anything else worth knowing — thread id, delivery id, poll interval in use.
     validations:
       required: false

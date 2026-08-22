@@ -11,6 +11,7 @@ import { CapabilityBroker } from './github/capability-broker.ts';
 import { GitHubClient } from './github/client.ts';
 import { GitHubCredential } from './github/credential.ts';
 import { GitHubIdentity } from './github/identity.ts';
+import { NotificationPoller } from './notifications/poller.ts';
 import { Policy } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 import { Server } from './server.ts';
@@ -48,6 +49,9 @@ const WorkerLive = Worker.DefaultWithoutDependencies.pipe(
 const DeliveryWorkerLive = DeliveryWorker.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.mergeAll(ConfigLive, ClientLive, IdentityLive, PolicyLive, QueueLive)),
 );
+const PollerLive = NotificationPoller.DefaultWithoutDependencies.pipe(
+  Layer.provide(Layer.mergeAll(ConfigLive, ClientLive, QueueLive, PolicyLive)),
+);
 const Services = Layer.mergeAll(
   ConfigLive,
   ClientLive,
@@ -60,6 +64,7 @@ const Services = Layer.mergeAll(
   ControlServerLive,
   WorkerLive,
   DeliveryWorkerLive,
+  PollerLive,
 );
 /**
  * Runs work that must not end quietly, and stops the daemon if it does.
@@ -68,8 +73,8 @@ const Services = Layer.mergeAll(
  * distinct outcome and two of them are invisible without this:
  *
  * - a defect bypasses `tapError` and `ignore` alike, so an unobserved dead fiber
- *   looks exactly like a healthy idle one while the socket keeps answering 202
- *   to deliveries nothing drains;
+ *   looks exactly like a healthy idle one while the health probe keeps answering
+ *   ok and nothing is polled, drained, or run;
  * - a loop that *succeeds* has also stopped, and `forever` returning is a bug
  *   whether or not anything failed — which is what `completes` distinguishes,
  *   since one-shot startup work returning is exactly what should happen;
@@ -121,12 +126,12 @@ const Application = Layer.merge(
       yield* Effect.logInfo('Work queue ready').pipe(Effect.annotateLogs(counts));
       const worker = yield* Worker;
       const deliveryWorker = yield* DeliveryWorker;
-      // ! Forked, not awaited: the socket must bind and daemon ownership must
-      // ! renew whether or not GitHub is answering, and a delivery refused at an
-      // ! unbound socket is lost for good. But the worker starts *inside* this
+      const poller = yield* NotificationPoller;
+      // ! Forked, not awaited: the health socket must bind and daemon ownership
+      // ! must renew whether or not GitHub is answering. But the worker starts *inside* this
       // ! fiber, after the account is confirmed — it clones and pushes with the
       // ! token, and doing that before `GET /user` agrees on who owns it is the
-      // ! exact misattribution the check exists to prevent. Deliveries queue in
+      // ! exact misattribution the check exists to prevent. Nothing is polled in
       // ! the meantime and jobs stay pending, which costs nothing.
       yield* Effect.forkScoped(
         identity.verified.pipe(
@@ -138,28 +143,34 @@ const Application = Layer.merge(
               }),
             ),
           ),
-          // ! Both workers, for the same reason: qualification awaits this same
-          // ! verdict, so a delivery it cannot qualify would be reclaimed and
-          // ! retried forever for a daemon-side problem.
+          // ! All three loops behind it, for the same reason: qualification awaits
+          // ! this same verdict, so a delivery it cannot qualify would be reclaimed
+          // ! and retried forever for a daemon-side problem.
           // !
           // ! Forked separately rather than through one `Effect.all`, whose
           // ! fail-fast semantics make a defect in either loop interrupt the
           // ! other. `Worker.run` recovers typed failures only, so a thrown
           // ! exception escaping any `Effect.try` would take delivery processing
           // ! down with it — and a `Die` cause bypasses `tapError`, leaving the
-          // ! daemon binding the socket, renewing its lease, and answering 202
-          // ! to deliveries nothing drains, silently and indefinitely.
+          // ! daemon binding the socket and renewing its lease while nothing polls
+          // ! GitHub or drains the inbox, silently and indefinitely.
           Effect.zipRight(
             Effect.all([
               Effect.forkScoped(supervised('worker', 'never', worker.run)),
               Effect.forkScoped(supervised('delivery worker', 'never', deliveryWorker.run)),
+              // ! Behind the same verdict, and for a sharper reason than the
+              // ! other two: the poller marks threads read, which is destructive
+              // ! and irreversible. Doing that with a credential `GET /user` has
+              // ! not yet agreed on is how a wrong token silently empties the
+              // ! wrong account's inbox.
+              Effect.forkScoped(supervised('notification poller', 'never', poller.run)),
             ]),
           ),
           // ! Supervised like the loops it starts, and for the same reason: a
           // ! credential that can never work is not survivable, and a *defect*
-          // ! while verifying would otherwise kill this fiber before either
-          // ! worker is forked, leaving the daemon acknowledging deliveries
-          // ! nothing will ever drain.
+          // ! while verifying would otherwise kill this fiber before any loop is
+          // ! forked, leaving a daemon that answers its health probe and does
+          // ! nothing else.
           (verification) => supervised('credential verification', 'once', verification),
         ),
       );

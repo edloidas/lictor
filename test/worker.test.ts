@@ -4,15 +4,13 @@ import { LictorConfig } from '../src/config.ts';
 import { AgentExecutor, ExecutorError } from '../src/executor/agent-executor.ts';
 import { Policy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
-import type { WorkItem } from '../src/webhook/qualification.ts';
+import type { WorkItem } from '../src/work-item.ts';
 import { Worker } from '../src/worker.ts';
 import { RepositoryWorkspace, WorkspaceError } from '../src/workspace/repository-workspace.ts';
 
 const work: WorkItem = {
   deliveryId: 'delivery-1',
   interactionId: 'interaction-1',
-  event: 'issues',
-  action: 'assigned',
   repository: 'edloidas/lictor',
   sender: 'edloidas',
   targets: ['adiutriel'],
@@ -29,9 +27,7 @@ const config = (maxAttempts = 3) =>
   LictorConfig.make({
     githubToken: Redacted.make('test-token'),
     expectedLogin: 'adiutriel',
-    webhookSecret: Redacted.make('unused'),
     trustedSenders: ['edloidas'],
-    targetUsers: ['adiutriel'],
     databasePath: ':memory:',
     policyPath: 'policy.toml',
     controlSocketPath: '/tmp/lictor.sock',
@@ -44,6 +40,7 @@ const config = (maxAttempts = 3) =>
     workerPollMs: 10,
     workerMaxAttempts: maxAttempts,
     workerRetryBaseMs: 100,
+    notificationPollMs: 60_000,
   });
 
 const run = <A, E>(
