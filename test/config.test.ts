@@ -64,6 +64,18 @@ describe('LictorConfig', () => {
     expect(config.policyPath).toBe('/srv/~backup/policy.toml');
   });
 
+  test('defaults codexHome to empty so the executor derives it from the database', async () => {
+    expect((await Effect.runPromise(load(required))).codexHome).toBe('');
+  });
+
+  test('expands a leading tilde in LICTOR_CODEX_HOME', async () => {
+    const config = await Effect.runPromise(
+      load(new Map([...required, ['LICTOR_CODEX_HOME', '~/.codex']])),
+    );
+
+    expect(config.codexHome).toBe(join(homedir(), '.codex'));
+  });
+
   test.each([
     ['LICTOR_WORKER_POLL_MS', '0'],
     ['LICTOR_WORKER_MAX_ATTEMPTS', '-1'],

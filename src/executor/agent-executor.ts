@@ -58,10 +58,13 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
     const processes = yield* ProcessRunner;
     const mcpClientPath = join(import.meta.dir, '../github/mcp-client.ts');
     const controlSocketPath = resolve(config.controlSocketPath);
-    // ! Derived from the database's directory rather than configured, so the
-    // ! agent's home always follows daemon state. With the default that is
-    // ! `~/.lictor/codex`, which is the path `codex login` has to be run against.
-    const codexHome = join(dirname(resolve(config.databasePath)), 'codex');
+    const codexHome =
+      config.codexHome ||
+      // ! Derived from the database's directory rather than configured, so the
+      // ! agent's home always follows daemon state. With the default that is
+      // ! `~/.lictor/codex`, which is the path `codex login` has to be run
+      // ! against. Overridden wholesale by LICTOR_CODEX_HOME.
+      join(dirname(resolve(config.databasePath)), 'codex');
     yield* Effect.sync(() => mkdirSync(codexHome, { recursive: true, mode: 0o700 }));
 
     const execute = (
@@ -102,8 +105,8 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                     workerId ?? '',
                   ])}`,
                 ]),
-            '--sandbox',
-            'workspace-write',
+            // ! --approve-for-me implies the workspace-write sandbox; passing
+            // ! --sandbox alongside it is a clap conflict on codex >= 0.147.
             '--approve-for-me',
             '--cd',
             workdir,

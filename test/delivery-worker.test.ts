@@ -22,6 +22,7 @@ const config = LictorConfig.make({
   deliveryMaxBytes: 1024 * 1024,
   executor: 'disabled',
   codexModel: 'gpt-5.6-luna',
+  codexHome: '',
   agentWorkdir: '.',
   executorTimeoutMs: 1000,
   executorOutputBytes: 1024,
