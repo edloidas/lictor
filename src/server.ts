@@ -24,9 +24,10 @@ export const Server = HttpServer.serve(router, HttpMiddleware.logger).pipe(
 /**
  * Server layer for route tests and embedding without a worker.
  *
- * `GitHubIdentity` is deliberately left out: building it calls `GET /user`, so
- * baking it in would put a live network request behind every route test. The
- * caller provides it — a stub in tests, the verified live layer in `main.ts`.
+ * `GitHubIdentity` is deliberately left out: its verdict comes from a live
+ * `GET /user` probe, and baking it in would put a network call behind every
+ * route test that touches a credential. The caller provides it — a stub in
+ * tests, the verified live layer in `main.ts`.
  */
 export const ServerLive = Server.pipe(
   Layer.provide(GitHubClient.Default),

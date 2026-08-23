@@ -205,7 +205,10 @@ export class DeliveryWorker extends Effect.Service<DeliveryWorker>()('DeliveryWo
           // ! delivery. Same reasoning as the `QueueError` branch below.
           queue
             .retryDelivery(stored.id, String(error), false)
-            .pipe(Effect.zipRight(Effect.sleep(Math.min(config.workerRetryBaseMs, 60_000)))),
+            // ! A flat wait, not a backoff: this branch is not retry-counted at
+            // ! all, so there is no curve to climb — the pause only keeps the
+            // ! drain loop from spinning against a credential that cannot work.
+            .pipe(Effect.zipRight(Effect.sleep(config.workerRetryBaseMs))),
         ),
         Effect.catchTag('QueueError', (error) =>
           queue
