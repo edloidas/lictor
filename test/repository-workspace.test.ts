@@ -46,6 +46,7 @@ const config = (home: string) =>
     githubToken: Redacted.make('test-token'),
     expectedLogin: 'adiutriel',
     trustedSenders: ['edloidas'],
+    autoAcceptInviters: [],
     databasePath: join(home, 'lictor.sqlite'),
     policyPath: join(home, 'policy.toml'),
     controlSocketPath: join(home, 'lictor.sock'),

@@ -7,7 +7,12 @@ import { NotificationPoller } from '../src/notifications/poller.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 
-const config = (overrides: { readonly notificationPollMs?: number } = {}) =>
+const config = (
+  overrides: {
+    readonly notificationPollMs?: number;
+    readonly autoAcceptInviters?: readonly string[];
+  } = {},
+) =>
   LictorConfig.make({
     githubToken: Redacted.make('pat-value'),
     expectedLogin: 'adiutriel',
@@ -27,6 +32,7 @@ const config = (overrides: { readonly notificationPollMs?: number } = {}) =>
     workerMaxAttempts: 3,
     workerRetryBaseMs: 1,
     notificationPollMs: overrides.notificationPollMs ?? 60_000,
+    autoAcceptInviters: [...(overrides.autoAcceptInviters ?? [])],
   });
 
 const thread = (id: string, updatedAt = '2026-08-21T10:00:00Z') => ({
@@ -55,6 +61,9 @@ type Reply = {
   readonly headers?: Record<string, string>;
 };
 
+const isInvitationList = (url: string): boolean =>
+  url.includes('/user/repository_invitations') && !/\/repository_invitations\//.test(url);
+
 /**
  * Runs one or more sweeps against a scripted sequence of list responses.
  *
@@ -70,6 +79,12 @@ const run = (
     readonly maxQueueDepth?: number;
     readonly notificationPollMs?: number;
     readonly markReadStatus?: number;
+    readonly inviters?: readonly string[];
+    readonly invitationReplies?: readonly Reply[];
+    /** Runs the invitation pass once after the sweeps and reports its exit. */
+    readonly acceptInvitations?: boolean;
+    /** Runs the invitation pass *before* the sweeps. */
+    readonly acceptFirst?: boolean;
   } = {},
 ) => {
   const calls: string[] = [];
@@ -79,12 +94,19 @@ const run = (
       Effect.gen(function* () {
         const poller = yield* NotificationPoller;
         const queue = yield* WorkQueue;
+        if (options.acceptFirst) {
+          yield* poller.acceptInvitations.pipe(Effect.ignore);
+        }
         const outcomes = [];
         for (let sweep = 0; sweep < (options.sweeps ?? 1); sweep += 1) {
           outcomes.push(yield* poller.pollOnce);
         }
+        const accepted = options.acceptInvitations
+          ? yield* Effect.either(poller.acceptInvitations)
+          : undefined;
         return {
           outcomes,
+          accepted,
           calls,
           headersSeen,
           cursor: yield* queue.pollerCursor,
@@ -100,6 +122,7 @@ const run = (
                 ...(options.notificationPollMs === undefined
                   ? {}
                   : { notificationPollMs: options.notificationPollMs }),
+                ...(options.inviters === undefined ? {} : { autoAcceptInviters: options.inviters }),
               }),
             );
             // ! The store is recorded into the same log as the HTTP calls, because
@@ -122,6 +145,22 @@ const run = (
             );
             const client = HttpClient.make((request) => {
               calls.push(`${request.method} ${request.url}`);
+              if (isInvitationList(request.url)) {
+                const index = Math.min(
+                  calls.filter((call) => isInvitationList(call)).length - 1,
+                  (options.invitationReplies?.length ?? 1) - 1,
+                );
+                const reply = options.invitationReplies?.[index] ?? {};
+                return Effect.succeed(
+                  HttpClientResponse.fromWeb(
+                    request,
+                    new Response(JSON.stringify(reply.body ?? []), {
+                      status: reply.status ?? 200,
+                      headers: { 'content-type': 'application/json', ...reply.headers },
+                    }),
+                  ),
+                );
+              }
               if (isList(request.url)) {
                 headersSeen.push({ 'if-modified-since': request.headers['if-modified-since'] });
                 const index = Math.min(
@@ -352,5 +391,70 @@ describe('NotificationPoller', () => {
 
     expect(result.outcomes[0]?.stored).toBe(1);
     expect(result.backlog).toBe(1);
+  });
+
+  const invitation = (id: number, login: string, repo = 'edloidas/lictor') => ({
+    id,
+    inviter: { login },
+    repository: { full_name: repo },
+    permissions: 'write',
+  });
+
+  const accepts = (calls: readonly string[]) =>
+    calls.filter(
+      (call) => call.startsWith('PATCH') && call.includes('/user/repository_invitations/'),
+    );
+
+  it('accepts invitations from the allow-list and leaves the rest pending', async () => {
+    const result = await run([{ body: [] }], {
+      inviters: ['edloidas'],
+      invitationReplies: [
+        {
+          body: [invitation(1, 'edloidas'), invitation(2, 'stranger'), invitation(3, 'Edloidas')],
+        },
+      ],
+      acceptInvitations: true,
+    });
+
+    expect(result.accepted?._tag).toBe('Right');
+    // ! Case-insensitive on the inviter, like every other login comparison.
+    expect(accepts(result.calls)).toHaveLength(2);
+    expect(result.calls.some((call) => call.includes('/repository_invitations/2'))).toBe(false);
+  });
+
+  it('makes no calls when the allow-list is empty', async () => {
+    const result = await run([{ body: [] }], {
+      invitationReplies: [{ body: [invitation(1, 'edloidas')] }],
+      acceptInvitations: true,
+    });
+
+    expect(result.accepted?._tag).toBe('Right');
+    expect(result.calls.some((call) => call.includes('/user/repository_invitations'))).toBe(false);
+  });
+
+  it('logs and moves on when listing invitations fails', async () => {
+    const result = await run([{ body: [] }], {
+      inviters: ['edloidas'],
+      invitationReplies: [{ status: 404 }],
+      acceptInvitations: true,
+    });
+
+    expect(result.accepted?._tag).toBe('Right');
+    expect(accepts(result.calls)).toHaveLength(0);
+  });
+
+  // ! A refused credential suspends notification polling globally through the
+  // ! shared ref — the invitation pass must trip that same wire, or it keeps
+  // ! calling GitHub every cadence after the sweep went quiet.
+  it('suspends on a 401 from the invitation list', async () => {
+    const result = await run([{ body: [thread('1')] }], {
+      inviters: ['edloidas'],
+      invitationReplies: [{ status: 401 }],
+      acceptFirst: true,
+    });
+
+    expect(result.calls.some((call) => call.includes('/user/repository_invitations'))).toBe(true);
+    // ! The sweep that follows the suspension must not reach GitHub at all.
+    expect(result.calls.some((call) => isList(call))).toBe(false);
   });
 });

@@ -12,6 +12,7 @@ const ConfigLive = Layer.succeed(
     githubToken: Redacted.make('pat-value'),
     expectedLogin: 'adiutriel',
     trustedSenders: ['edloidas'],
+    autoAcceptInviters: [],
     databasePath: ':memory:',
     policyPath: 'unused',
     controlSocketPath: '/tmp/lictor-client.sock',

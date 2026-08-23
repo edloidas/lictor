@@ -133,6 +133,11 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       /** GitHub users whose activity may create work. Empty trusts nobody. */
       trustedSenders: yield* loginList('GITHUB_TRUSTED_SENDERS'),
       /**
+       * GitHub users whose repository invitations are accepted automatically.
+       * Empty accepts nothing; nobody is ever declined.
+       */
+      autoAcceptInviters: yield* loginList('LICTOR_AUTO_ACCEPT_INVITERS'),
+      /**
        * Local SQLite file used for durable work.
        *
        * `CODEX_HOME` is derived from this path's directory, so moving it moves

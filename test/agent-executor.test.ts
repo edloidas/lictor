@@ -26,6 +26,7 @@ const config = (executor: 'codex' | 'disabled' = 'codex') =>
     githubToken: Redacted.make('test-token'),
     expectedLogin: 'adiutriel',
     trustedSenders: ['edloidas'],
+    autoAcceptInviters: [],
     databasePath: ':memory:',
     policyPath: 'policy.toml',
     controlSocketPath: '/tmp/lictor.sock',
