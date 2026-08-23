@@ -77,6 +77,25 @@ const Comment = Schema.Struct({
   updated_at: Schema.String,
 });
 
+/**
+ * One issue-timeline event — the only record of who assigned her or requested
+ * her review.
+ *
+ * ! The notification names a thread, never an actor: an assignment carries no
+ * ! comment whose author could be trusted, so the actor is resolved from the
+ * ! timeline. `requested_reviewer` is checked rather than trusted blindly — a
+ * ! `review_requested` event naming a team says nothing about her.
+ */
+const TimelineEvent = Schema.Struct({
+  id: Schema.Number,
+  event: Schema.String,
+  actor: Schema.optionalWith(User, { nullable: true }),
+  assignee: Schema.optionalWith(User, { nullable: true }),
+  review_requester: Schema.optionalWith(User, { nullable: true }),
+  requested_reviewer: Schema.optionalWith(User, { nullable: true }),
+  created_at: Schema.String,
+});
+
 // All login comparison in this module is lowercase-trimmed.
 const normalizeLogin = (login: string): string => login.trim().toLowerCase();
 
@@ -291,6 +310,68 @@ const fetchReviews = <E>(
   fetchNewestFirst(client, `/repos/${repository}/pulls/${number}/reviews`, Review, undefined);
 
 /**
+ * The newest in-window timeline event that put her on this thread.
+ *
+ * `assigned` matches when she is the assignee; `review_requested` when she is
+ * the requested reviewer. Returns the newest event whose causer is a trusted
+ * sender — trust first, newest second, exactly like the mention path — or
+ * `undefined` when there is nothing worth acting on.
+ */
+const fetchTriggeringEvent = <E>(
+  client: Authenticated<E>,
+  repository: string,
+  number: number,
+  reason: 'assign' | 'review_requested',
+  selfLogin: string,
+  trusted: ReadonlySet<string>,
+  since: number | undefined,
+): Effect.Effect<Schema.Schema.Type<typeof TimelineEvent> | undefined, NotificationError> =>
+  Effect.gen(function* () {
+    const wanted = reason === 'assign' ? 'assigned' : 'review_requested';
+    const events = yield* fetchNewestFirst(
+      client,
+      `/repos/${repository}/issues/${number}/events`,
+      TimelineEvent,
+      undefined,
+    );
+    const inWindow = events.filter((event) => {
+      if (event.event !== wanted) return false;
+      const at = parseDate(event.created_at);
+      if (at === undefined || (since !== undefined && at < since)) return false;
+      return reason === 'assign'
+        ? normalizeLogin(event.assignee?.login ?? '') === selfLogin
+        : // ! A team request names no individual, so there is nobody to trust
+          // ! and nobody to attribute — skipped rather than guessed.
+          normalizeLogin(event.requested_reviewer?.login ?? '') === selfLogin;
+    });
+    // ! Trust first, newest second. Picking the newest match and then trusting
+    // ! it would let an untrusted assigner silence a trusted one with
+    // ! assign → unassign → assign.
+    const eligible = inWindow.filter((event) => {
+      const causer = reason === 'assign' ? event.actor?.login : event.review_requester?.login;
+      const author = normalizeLogin(causer ?? '');
+      return author !== '' && author !== selfLogin && trusted.has(author);
+    });
+    const chosen = eligible.at(-1);
+    if (chosen === undefined) return undefined;
+    // ! Authority that was withdrawn is not authority. A withdrawal naming her
+    // ! after the chosen trigger cancels it — the thread is marked read once
+    // ! committed, so acting anyway would spend work nobody asked for.
+    // ! Compared by position, not timestamp: GitHub's timeline arrives in
+    // ! chronological order while its timestamps carry only second granularity,
+    // ! which cannot order events inside one second.
+    const chosenIndex = events.indexOf(chosen);
+    const rescinded = events.some((event, index) => {
+      if (index <= chosenIndex) return false;
+      return reason === 'assign'
+        ? event.event === 'unassigned' && normalizeLogin(event.assignee?.login ?? '') === selfLogin
+        : event.event === 'review_request_removed' &&
+            normalizeLogin(event.requested_reviewer?.login ?? '') === selfLogin;
+    });
+    return rescinded ? undefined : chosen;
+  });
+
+/**
  * ! `created_at`, not `updated_at`, and this is a security property rather than a
  * ! preference. `comment.user` is who *wrote* the comment and REST reports no
  * ! editor for it, so keying on `updated_at` lets anyone able to edit a comment —
@@ -332,6 +413,10 @@ const rankOf = (candidate: Candidate): readonly [number, number] => {
       return [2, candidate.ref.id];
     case 'review':
       return [3, candidate.ref.id];
+    case 'assigned':
+      return [4, candidate.ref.id];
+    case 'review_requested':
+      return [5, candidate.ref.id];
   }
 };
 
@@ -454,49 +539,117 @@ export const qualifyNotification = (input: {
       );
 
       const selfLogin = normalizeLogin(input.policy.selfLogin);
+      const trusted = new Set(input.policy.trustedSenders.map(normalizeLogin));
       const matching = usable.filter(
         (candidate) => candidate.body !== undefined && mentions(candidate.body, selfLogin),
       );
-
-      if (matching.length === 0) {
-        yield* Effect.logDebug(
-          'Notification did not become work: no candidate mentions the target user',
-        ).pipe(Effect.annotateLogs({ threadId: input.thread.id }));
-        return { work: undefined, lastActivityAt };
-      }
 
       // ! The newest *trusted* mention triggers, not the newest mention. Letting
       // ! an untrusted one win and then refusing it hands every repository
       // ! participant a mute button. Her own activity is excluded structurally
       // ! rather than by configuration, so a loop cannot be configured into
       // ! existence.
-      const trusted = new Set(input.policy.trustedSenders.map(normalizeLogin));
       const eligible = matching.filter((candidate) => {
         const author = normalizeLogin(candidate.author);
         return author !== selfLogin && trusted.has(author);
       });
+      const mentionTrigger = eligible.reduce<(typeof usable)[number] | undefined>(
+        (best, candidate) =>
+          best === undefined ||
+          candidate.at > best.at ||
+          (candidate.at === best.at && outranks(candidate, best))
+            ? candidate
+            : best,
+        undefined,
+      );
 
-      if (eligible.length === 0) {
-        yield* Effect.logInfo('Notification dropped: no trusted sender mentioned her').pipe(
-          Effect.annotateLogs({
-            repository,
-            senders: [...new Set(matching.map((candidate) => normalizeLogin(candidate.author)))]
-              .sort()
-              .join(','),
-          }),
-        );
+      // ! An assignment carries no comment at all, so the mention scan cannot
+      // ! see it — the actor comes from the issue timeline instead of a comment
+      // ! body. Fetched even when a mention matched, because the two paths pick
+      // ! their trigger independently: an untrusted participant must not be able
+      // ! to mute a trusted assignment with one throwaway mention.
+      const reason = input.thread.reason;
+      const assignedEvent =
+        reason === 'assign' || reason === 'review_requested'
+          ? yield* fetchTriggeringEvent(
+              client,
+              repository,
+              ref.number,
+              reason,
+              selfLogin,
+              trusted,
+              since,
+            )
+          : undefined;
+
+      if (mentionTrigger === undefined && assignedEvent === undefined) {
+        if (matching.length > 0) {
+          yield* Effect.logInfo('Notification dropped: no trusted sender mentioned her').pipe(
+            Effect.annotateLogs({
+              repository,
+              senders: [...new Set(matching.map((candidate) => normalizeLogin(candidate.author)))]
+                .sort()
+                .join(','),
+            }),
+          );
+        } else {
+          yield* Effect.logDebug(
+            'Notification did not become work: no candidate mentions the target user',
+          ).pipe(Effect.annotateLogs({ threadId: input.thread.id }));
+        }
         return { work: undefined, lastActivityAt };
       }
 
-      const triggering = eligible.reduce((best, candidate) =>
-        candidate.at > best.at || (candidate.at === best.at && outranks(candidate, best))
-          ? candidate
-          : best,
-      );
-      const sender = normalizeLogin(triggering.author);
+      // ! A tie goes to the timeline event: its timestamp is GitHub's own record
+      // ! of why the thread went unread, while a mention's had to be recovered
+      // ! from a scan.
+      const useAssigned =
+        assignedEvent !== undefined &&
+        (mentionTrigger === undefined || Date.parse(assignedEvent.created_at) >= mentionTrigger.at);
 
-      const work: WorkItem = {
+      const common = {
         deliveryId: input.deliveryId,
+        repository,
+        targets: [selfLogin],
+        subject: {
+          kind: ref.kind,
+          number: ref.number,
+          title: subject.title,
+          url: subject.html_url,
+        },
+      } as const;
+
+      if (useAssigned && assignedEvent !== undefined) {
+        // ! Trust was already applied inside `fetchTriggeringEvent`, so the
+        // ! causer here is a confirmed trusted sender.
+        const causer =
+          reason === 'assign' ? assignedEvent.actor?.login : assignedEvent.review_requester?.login;
+        const sender = normalizeLogin(causer ?? '');
+        const contextKind = reason === 'assign' ? 'assigned' : 'review_requested';
+        const work: WorkItem = {
+          ...common,
+          interactionId: JSON.stringify([
+            repository,
+            ref.kind,
+            ref.number,
+            contextKind,
+            assignedEvent.id,
+            sender,
+            selfLogin,
+          ]),
+          sender,
+          reasons: [contextKind],
+          contextUrl: subject.html_url,
+          context: { kind: contextKind, id: assignedEvent.id, number: ref.number },
+        };
+        return { work, lastActivityAt };
+      }
+
+      const triggering = mentionTrigger;
+      if (triggering === undefined) return { work: undefined, lastActivityAt };
+      const sender = normalizeLogin(triggering.author);
+      const work: WorkItem = {
+        ...common,
         // Identities only: one job per thread per activity window means no
         // timestamp and no html url, or every edit becomes a new job.
         interactionId: JSON.stringify([
@@ -508,16 +661,8 @@ export const qualifyNotification = (input: {
           sender,
           selfLogin,
         ]),
-        repository,
         sender,
-        targets: [selfLogin],
         reasons: ['mentioned'],
-        subject: {
-          kind: ref.kind,
-          number: ref.number,
-          title: subject.title,
-          url: subject.html_url,
-        },
         contextUrl: triggering.url,
         context: triggering.ref,
       };

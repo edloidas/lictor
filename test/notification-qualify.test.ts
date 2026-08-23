@@ -130,7 +130,9 @@ describe('qualifyNotification', () => {
         policy,
         cursorMs: undefined,
       }),
-      issueRoutes(issue(), [comment()]),
+      // ! The assignment path runs alongside the mention scan now, so the
+      // ! timeline route must answer even when a mention decides the trigger.
+      [['/issues/7/events', { body: [] }], ...issueRoutes(issue(), [comment()])],
     );
 
     expect(qualified(result.exit).work?.sender).toBe('edloidas');
@@ -659,5 +661,282 @@ describe('qualifyNotification', () => {
     );
 
     expect(qualified(result.exit).work).toBeUndefined();
+  });
+
+  const event = (overrides: Record<string, unknown> = {}) => ({
+    id: 3001,
+    event: 'assigned',
+    actor: { login: 'edloidas' },
+    assignee: { login: 'adiutriel' },
+    created_at: '2026-08-21T10:00:00Z',
+    ...overrides,
+  });
+  const eventsRoute = (events: readonly Record<string, unknown>[]) =>
+    // ! Before `/issues/7`: the fragment matcher picks the first substring hit,
+    // ! and the events path contains the subject path.
+    [['/issues/7/events', { body: events }], ...issueRoutes(issue(), [])] as const;
+
+  // ! The whole point of the timeline fetch: an assignment carries no comment,
+  // ! so the mention scan cannot see it and the actor must come from `assigned`.
+  it('acts on a trusted assignment with no mention anywhere', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'assign' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      eventsRoute([event()]),
+    );
+
+    const work = qualified(result.exit).work;
+    expect(work?.sender).toBe('edloidas');
+    expect(work?.reasons).toEqual(['assigned']);
+    expect(work?.context).toEqual({ kind: 'assigned', id: 3001, number: 7 });
+    expect(work?.contextUrl).toBe('https://github.com/edloidas/sandbox/issues/7');
+  });
+
+  it('drops an assignment from an untrusted actor', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'assign' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      eventsRoute([event({ actor: { login: 'stranger' } })]),
+    );
+
+    expect(qualified(result.exit).work).toBeUndefined();
+  });
+
+  it('drops her own assignment structurally', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'assign' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      eventsRoute([event({ actor: { login: 'adiutriel' } })]),
+    );
+
+    expect(qualified(result.exit).work).toBeUndefined();
+  });
+
+  it('ignores an assignment that predates the window', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'assign' }),
+        policy,
+        cursorMs: Date.parse('2026-08-22T00:00:00Z'),
+      }),
+      eventsRoute([event()]),
+    );
+
+    expect(qualified(result.exit).work).toBeUndefined();
+  });
+
+  it('acts on a trusted review request naming her individually', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'review_requested' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      eventsRoute([
+        event({
+          event: 'review_requested',
+          review_requester: { login: 'friend' },
+          requested_reviewer: { login: 'adiutriel' },
+          assignee: null,
+        }),
+      ]),
+    );
+
+    const work = qualified(result.exit).work;
+    expect(work?.sender).toBe('friend');
+    expect(work?.reasons).toEqual(['review_requested']);
+    expect(work?.context).toEqual({ kind: 'review_requested', id: 3001, number: 7 });
+  });
+
+  // ! A team request names no individual reviewer, so there is nobody to
+  // ! attribute and nobody to trust — skipped rather than guessed.
+  it('skips a review request aimed at a team', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'review_requested' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      eventsRoute([
+        event({
+          event: 'review_requested',
+          review_requester: { login: 'edloidas' },
+          requested_reviewer: null,
+          assignee: null,
+        }),
+      ]),
+    );
+
+    expect(qualified(result.exit).work).toBeUndefined();
+  });
+
+  // ! A withdrawal of the other kind does not cancel: she can be assigned and
+  // ! review-requested on the same pull request, and dropping one must not
+  // ! silence the other.
+  it('keeps a review request alive when her assignment is withdrawn', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'review_requested' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      eventsRoute([
+        event({ created_at: '2026-08-21T09:00:00Z' }),
+        event({
+          id: 3002,
+          event: 'unassigned',
+          actor: { login: 'edloidas' },
+          created_at: '2026-08-21T10:30:00Z',
+        }),
+        event({
+          id: 3003,
+          event: 'review_requested',
+          review_requester: { login: 'friend' },
+          requested_reviewer: { login: 'adiutriel' },
+          assignee: null,
+          created_at: '2026-08-21T10:00:00Z',
+        }),
+      ]),
+    );
+
+    const work = qualified(result.exit).work;
+    expect(work?.sender).toBe('friend');
+    expect(work?.reasons).toEqual(['review_requested']);
+  });
+
+  // ! Same-second events cannot be ordered by GitHub's timestamps, so the
+  // ! withdrawal scan compares positions in the timeline instead.
+  it('cancels a same-second assignment withdrawn after it', async () => {
+    const stamp = '2026-08-21T10:00:00Z';
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'assign' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      eventsRoute([
+        event({ created_at: stamp }),
+        event({
+          id: 3002,
+          event: 'unassigned',
+          actor: { login: 'edloidas' },
+          created_at: stamp,
+        }),
+      ]),
+    );
+
+    expect(qualified(result.exit).work).toBeUndefined();
+  });
+
+  // ! Bot churn — assign, unassign, reassign inside one second. The final
+  // ! assignment stands because its withdrawal precedes it positionally.
+  it('keeps a same-second assignment reassigned after a withdrawal', async () => {
+    const stamp = '2026-08-21T10:00:00Z';
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'assign' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      eventsRoute([
+        event({ created_at: stamp }),
+        event({
+          id: 3002,
+          event: 'unassigned',
+          actor: { login: 'edloidas' },
+          created_at: stamp,
+        }),
+        event({ id: 3003, created_at: stamp }),
+      ]),
+    );
+
+    expect(qualified(result.exit).work?.sender).toBe('edloidas');
+  });
+
+  // ! Authority that was withdrawn is not authority. The thread is marked read
+  // ! once committed, so acting on a rescinded assignment spends work nobody
+  // ! asked for by the time anyone could notice.
+  it('drops an assignment that was rescinded after it was made', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'assign' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      eventsRoute([
+        event(),
+        event({
+          id: 3002,
+          event: 'unassigned',
+          actor: { login: 'edloidas' },
+          created_at: '2026-08-21T10:30:00Z',
+        }),
+      ]),
+    );
+
+    expect(qualified(result.exit).work).toBeUndefined();
+  });
+
+  // ! Trust first, newest second. Newest-then-trust would let an untrusted
+  // ! assigner silence a trusted one with assign → unassign → assign.
+  it('lets the newest trusted assignment win when an untrusted one is newer', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'assign' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      eventsRoute([
+        event({ created_at: '2026-08-21T09:00:00Z' }),
+        event({
+          id: 3011,
+          actor: { login: 'stranger' },
+          created_at: '2026-08-21T11:00:00Z',
+        }),
+      ]),
+    );
+
+    expect(qualified(result.exit).work?.sender).toBe('edloidas');
+  });
+
+  // ! The mute-button guard, timeline edition: an untrusted throwaway mention
+  // ! must not suppress a trusted assignment in the same window.
+  it('prefers a trusted assignment over an untrusted mention in the window', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'assign' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      [
+        ['/issues/7/events', { body: [event()] }],
+        ...issueRoutes(issue(), [comment({ user: { login: 'stranger' } })]),
+      ],
+    );
+
+    const work = qualified(result.exit).work;
+    expect(work?.sender).toBe('edloidas');
+    expect(work?.reasons).toEqual(['assigned']);
   });
 });
