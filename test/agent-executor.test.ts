@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'bun:test';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Effect, Redacted, Ref } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { AgentExecutor, buildPrompt } from '../src/executor/agent-executor.ts';
@@ -21,13 +24,13 @@ const work: WorkItem = {
   contextUrl: 'https://github.com/edloidas/lictor/issues/17#issuecomment-1',
 };
 
-const config = (executor: 'codex' | 'disabled' = 'codex') =>
+const config = (executor: 'codex' | 'disabled' = 'codex', databasePath = ':memory:') =>
   LictorConfig.make({
     githubToken: Redacted.make('test-token'),
     expectedLogin: 'adiutriel',
     trustedSenders: ['edloidas'],
     autoAcceptInviters: [],
-    databasePath: ':memory:',
+    databasePath,
     policyPath: 'policy.toml',
     controlSocketPath: '/tmp/lictor.sock',
     deliveryMaxBytes: 1024,
@@ -48,14 +51,40 @@ const runWith = <A, E>(
   effect: Effect.Effect<A, E, AgentExecutor>,
   runner: InstanceType<typeof ProcessRunner>,
   executor: 'codex' | 'disabled' = 'codex',
+  databasePath = ':memory:',
 ) =>
   Effect.runPromise(
     effect.pipe(
       Effect.provide(AgentExecutor.DefaultWithoutDependencies),
       Effect.provideService(ProcessRunner, runner),
-      Effect.provideService(LictorConfig, config(executor)),
+      Effect.provideService(LictorConfig, config(executor, databasePath)),
     ),
   );
+
+/** Runs one job through a stdin-capturing runner and returns what Codex got. */
+const captureInput = (
+  executor: 'codex' | 'disabled' = 'codex',
+  databasePath = ':memory:',
+): Promise<string | undefined> => {
+  let observed: ProcessRequest | undefined;
+  return runWith(
+    Effect.flatMap(AgentExecutor, (agent) => agent.execute(work)),
+    ProcessRunner.make({
+      run: (request) =>
+        Effect.sync(() => {
+          observed = request;
+          return {
+            exitCode: 0,
+            stdout: '{"status":"completed","summary":"completed"}',
+            stderr: '',
+            outputTruncated: false,
+          };
+        }),
+    }),
+    executor,
+    databasePath,
+  ).then(() => observed?.input);
+};
 
 describe('buildPrompt', () => {
   it('contains bounded normalized metadata and explicit trust boundaries', () => {
@@ -82,6 +111,16 @@ describe('buildPrompt', () => {
 });
 
 describe('AgentExecutor', () => {
+  it('prepends a present SOUL.md ahead of the untrusted prompt', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lictor-soul-'));
+    await Bun.write(join(dir, 'SOUL.md'), 'Always answer in Latin.');
+
+    const input = await captureInput('codex', join(dir, 'lictor.sqlite'));
+
+    expect(input?.startsWith('Always answer in Latin.\n\nYou are handling')).toBe(true);
+    expect(input).toContain('$(touch /tmp/nope)');
+  });
+
   it('passes the prompt to Codex as stdin with fixed arguments', async () => {
     const request = await Effect.runPromise(
       Effect.gen(function* () {
