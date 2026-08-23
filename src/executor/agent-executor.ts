@@ -66,6 +66,20 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
       // ! against. Overridden wholesale by LICTOR_CODEX_HOME.
       join(dirname(resolve(config.databasePath)), 'codex');
     yield* Effect.sync(() => mkdirSync(codexHome, { recursive: true, mode: 0o700 }));
+    // ! Operator-authored standing instructions for the agent, beside the
+    // ! database like the codex home. This is the one trusted prose in the
+    // ! prompt, so it is prepended ahead of the untrusted JSON, never inside
+    // ! it. A missing file means no persona; every other read failure is
+    // ! treated the same way — a broken SOUL.md must not take the queue down.
+    const soulPath = join(dirname(resolve(config.databasePath)), 'SOUL.md');
+    const readSoul = Effect.tryPromise({
+      try: () => Bun.file(soulPath).text(),
+      catch: (cause) =>
+        new ExecutorError({ message: `Could not read ${soulPath}`, retryable: false, cause }),
+    }).pipe(
+      Effect.catchAll(() => Effect.succeed('')),
+      Effect.map((soul) => bounded(soul, 32 * 1024)),
+    );
 
     const execute = (
       work: WorkItem,
@@ -81,8 +95,8 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
         );
       }
 
-      return processes
-        .run({
+      return Effect.flatMap(readSoul, (soul) =>
+        processes.run({
           command: [
             'codex',
             'exec',
@@ -113,7 +127,11 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
             '-',
           ],
           cwd: workdir,
-          input: `${buildPrompt(work)}\n\nReturn only JSON matching {"status":"completed|needs_input|rejected|failed","summary":"bounded summary","artifacts":["relative/path"]}.`,
+          input: `${[soul, buildPrompt(work)]
+            .filter(Boolean)
+            .join(
+              '\n\n',
+            )}\n\nReturn only JSON matching {"status":"completed|needs_input|rejected|failed","summary":"bounded summary","artifacts":["relative/path"]}.`,
           timeoutMs: Math.min(timeoutMs, config.executorTimeoutMs),
           outputLimitBytes: config.executorOutputBytes,
           env: {
@@ -126,47 +144,47 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
             // ! blocking on a prompt until the executor timeout.
             GIT_TERMINAL_PROMPT: '0',
           },
-        })
-        .pipe(
-          Effect.flatMap((result) =>
-            result.exitCode === 0
-              ? Effect.try({
-                  try: () => JSON.parse(result.stdout) as unknown,
-                  catch: (cause) =>
-                    new ExecutorError({
-                      message: 'Codex returned a malformed result',
-                      retryable: false,
-                      cause,
-                    }),
-                }).pipe(
-                  Effect.flatMap(Schema.decodeUnknown(ExecutorResult)),
-                  Effect.map((value) => ({
-                    ...value,
-                    summary: bounded(value.summary, 4096),
-                    ...(value.artifacts === undefined
-                      ? {}
-                      : {
-                          artifacts: value.artifacts.slice(0, 50).map((path) => bounded(path, 512)),
-                        }),
-                  })),
-                )
-              : Effect.fail(
+        }),
+      ).pipe(
+        Effect.flatMap((result) =>
+          result.exitCode === 0
+            ? Effect.try({
+                try: () => JSON.parse(result.stdout) as unknown,
+                catch: (cause) =>
                   new ExecutorError({
-                    message: `Codex exited with status ${result.exitCode}`,
-                    retryable: true,
+                    message: 'Codex returned a malformed result',
+                    retryable: false,
+                    cause,
                   }),
-                ),
-          ),
-          Effect.mapError((cause) =>
-            cause instanceof ExecutorError
-              ? cause
-              : new ExecutorError({
-                  message: cause.message,
+              }).pipe(
+                Effect.flatMap(Schema.decodeUnknown(ExecutorResult)),
+                Effect.map((value) => ({
+                  ...value,
+                  summary: bounded(value.summary, 4096),
+                  ...(value.artifacts === undefined
+                    ? {}
+                    : {
+                        artifacts: value.artifacts.slice(0, 50).map((path) => bounded(path, 512)),
+                      }),
+                })),
+              )
+            : Effect.fail(
+                new ExecutorError({
+                  message: `Codex exited with status ${result.exitCode}`,
                   retryable: true,
-                  cause,
                 }),
-          ),
-        );
+              ),
+        ),
+        Effect.mapError((cause) =>
+          cause instanceof ExecutorError
+            ? cause
+            : new ExecutorError({
+                message: cause.message,
+                retryable: true,
+                cause,
+              }),
+        ),
+      );
     };
 
     return { enabled: config.executor !== 'disabled', execute };
