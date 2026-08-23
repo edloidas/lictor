@@ -195,7 +195,10 @@ const Application = Layer.merge(
             Effect.logInfo('Authenticated as a GitHub account').pipe(
               Effect.annotateLogs({
                 login: verified.login,
-                expires: verified.tokenExpiresAt === undefined ? 'never' : verified.tokenExpiresAt,
+                expires:
+                  verified.tokenExpiresAt === undefined
+                    ? 'never'
+                    : new Date(verified.tokenExpiresAt).toISOString(),
               }),
             ),
           ),
