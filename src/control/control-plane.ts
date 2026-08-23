@@ -3,6 +3,7 @@ import { dirname } from 'node:path';
 import { Clock, Data, Effect } from 'effect';
 import { LictorConfig } from '../config.ts';
 import { CapabilityBroker } from '../github/capability-broker.ts';
+import { CredentialHealth } from '../github/credential-health.ts';
 import { Policy } from '../policy.ts';
 import { WorkQueue } from '../queue/work-queue.ts';
 
@@ -35,6 +36,7 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
     const policy = yield* Policy;
     const queue = yield* WorkQueue;
     const broker = yield* CapabilityBroker;
+    const health = yield* CredentialHealth;
 
     const mutate = (action: 'approve' | 'cancel' | 'retry', id: number) =>
       Effect.gen(function* () {
@@ -74,7 +76,12 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
                   cause,
                 }),
             });
-            return { ...diagnostics, executor: config.executor, diskAvailableBytes };
+            return {
+              ...diagnostics,
+              executor: config.executor,
+              diskAvailableBytes,
+              credentialRejected: yield* health.isRejected,
+            };
           }
           case 'job.list':
             return yield* queue.listJobs(Number(args[0] ?? 100));
@@ -155,7 +162,13 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
       });
     return { execute };
   }),
-  dependencies: [LictorConfig.Default, Policy.Default, WorkQueue.Default, CapabilityBroker.Default],
+  dependencies: [
+    LictorConfig.Default,
+    Policy.Default,
+    WorkQueue.Default,
+    CapabilityBroker.Default,
+    CredentialHealth.Default,
+  ],
 }) {}
 
 export class ControlServer extends Effect.Service<ControlServer>()('ControlServer', {

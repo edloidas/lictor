@@ -3,6 +3,7 @@ import { HttpClient, HttpClientRequest, HttpClientResponse } from '@effect/platf
 import { Effect, Layer, Logger, Redacted } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { GitHubClient } from '../src/github/client.ts';
+import { CredentialHealth } from '../src/github/credential-health.ts';
 import { NotificationPoller } from '../src/notifications/poller.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
@@ -202,7 +203,13 @@ const run = (
                 `[limits]\nmaxQueueDepth = ${options.maxQueueDepth ?? 10_000}\n[repositories]\nallow = ["edloidas/lictor"]`,
               ).pipe(Effect.map(Policy.make)),
             );
-            const Services = Layer.mergeAll(ConfigLive, QueueLive, GitHubLive, PolicyLive);
+            const Services = Layer.mergeAll(
+              ConfigLive,
+              QueueLive,
+              GitHubLive,
+              PolicyLive,
+              CredentialHealth.Default,
+            );
             return Layer.merge(
               NotificationPoller.DefaultWithoutDependencies.pipe(Layer.provide(Services)),
               Services,

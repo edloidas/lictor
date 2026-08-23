@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { Effect, Layer, Redacted } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { AgentExecutor, ExecutorError } from '../src/executor/agent-executor.ts';
+import { CredentialHealth } from '../src/github/credential-health.ts';
 import { Policy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
@@ -59,7 +60,7 @@ const config = (maxAttempts = 3) =>
   });
 
 const run = <A, E>(
-  effect: Effect.Effect<A, E, Worker | WorkQueue>,
+  effect: Effect.Effect<A, E, Worker | WorkQueue | CredentialHealth>,
   execute: InstanceType<typeof AgentExecutor>['execute'],
   maxAttempts = 3,
   enabled = true,
@@ -104,13 +105,22 @@ const run = <A, E>(
       sweep: () => Effect.void,
     }),
   );
+  const HealthLive = CredentialHealth.Default;
   const WorkerLive = Worker.DefaultWithoutDependencies.pipe(
-    Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, ExecutorLive, PolicyLive, WorkspaceLive)),
+    Layer.provide(
+      Layer.mergeAll(ConfigLive, QueueLive, ExecutorLive, PolicyLive, WorkspaceLive, HealthLive),
+    ),
   );
 
   return Effect.runPromise(
     Effect.scoped(
-      effect.pipe(Effect.provide(Layer.merge(QueueLive, WorkerLive)), Effect.provide(ConfigLive)),
+      effect.pipe(
+        // ! Health merged outside too, so the test body and the worker share
+        // ! one latch instance — suspending in the test must be visible to the
+        // ! loop under test.
+        Effect.provide(Layer.mergeAll(QueueLive, WorkerLive, HealthLive)),
+        Effect.provide(ConfigLive),
+      ),
     ),
   );
 };
@@ -163,6 +173,59 @@ describe('Worker.runOnce', () => {
 
     expect(counts.failed).toBe(1);
     expect(counts.retry).toBe(0);
+  });
+
+  // ! The whole point of the daemon-wide latch: while the credential is dead,
+  // ! claims stop *before* an attempt is spent, so queued work survives a token
+  // ! rotation instead of draining into failures.
+  it('stops claiming while the credential is rejected', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const health = yield* CredentialHealth;
+        const worker = yield* Worker;
+        yield* queue.enqueue(work);
+        yield* health.suspend;
+        const worked = yield* worker.runOnce;
+        return { worked, counts: yield* queue.counts };
+      }),
+      () => Effect.die('must not execute'),
+    );
+
+    expect(result.worked).toBe(false);
+    expect(result.counts.pending).toBe(1);
+  });
+
+  it('latches the breaker when git reports a refused credential', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const health = yield* CredentialHealth;
+        const worker = yield* Worker;
+        yield* queue.enqueue(work);
+        const first = yield* worker.runOnce;
+        const latched = yield* health.isRejected;
+        // ! No second claim: the retained job must not spend another attempt.
+        const second = yield* worker.runOnce;
+        return { first, latched, second, counts: yield* queue.counts };
+      }),
+      () => Effect.die('must not execute'),
+      3,
+      true,
+      () =>
+        Effect.fail(
+          new WorkspaceError({
+            code: 'WORKSPACE_CREDENTIAL_REJECTED',
+            message: 'GitHub rejected the daemon credential',
+            retryAfterMs: 300_000,
+          }),
+        ),
+    );
+
+    expect(result.first).toBe(true);
+    expect(result.latched).toBe(true);
+    expect(result.second).toBe(false);
+    expect(result.counts.retry).toBe(1);
   });
 
   it('leaves queued work pending while execution is disabled', async () => {

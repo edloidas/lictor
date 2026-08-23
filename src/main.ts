@@ -1,6 +1,6 @@
 import { FetchHttpClient } from '@effect/platform';
 import { BunHttpServer, BunRuntime } from '@effect/platform-bun';
-import { Cause, Clock, Effect, Exit, Layer } from 'effect';
+import { Cause, Clock, Effect, Exit, Layer, Option } from 'effect';
 import { LictorConfig, legacyStateConflict, port } from './config.ts';
 import { ControlPlane, ControlServer } from './control/control-plane.ts';
 import { DeliveryWorker } from './delivery-worker.ts';
@@ -10,6 +10,7 @@ import { ProcessRunner } from './executor/process-runner.ts';
 import { CapabilityBroker } from './github/capability-broker.ts';
 import { GitHubClient } from './github/client.ts';
 import { GitHubCredential } from './github/credential.ts';
+import { CredentialHealth } from './github/credential-health.ts';
 import { GitHubIdentity } from './github/identity.ts';
 import { NotificationPoller } from './notifications/poller.ts';
 import { Policy } from './policy.ts';
@@ -37,22 +38,37 @@ const IdentityLive = GitHubIdentity.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.merge(ConfigLive, ClientLive)),
 );
 const BrokerLive = CapabilityBroker.DefaultWithoutDependencies.pipe(
-  Layer.provide(Layer.mergeAll(ClientLive, IdentityLive, PolicyLive, QueueLive)),
+  Layer.provide(
+    Layer.mergeAll(ClientLive, IdentityLive, PolicyLive, QueueLive, CredentialHealth.Default),
+  ),
 );
 const ControlLive = ControlPlane.DefaultWithoutDependencies.pipe(
-  Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, BrokerLive)),
+  Layer.provide(
+    Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, BrokerLive, CredentialHealth.Default),
+  ),
 );
 const ControlServerLive = ControlServer.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.merge(ConfigLive, ControlLive)),
 );
 const WorkerLive = Worker.DefaultWithoutDependencies.pipe(
-  Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, ExecutorLive, WorkspaceLive)),
+  Layer.provide(
+    Layer.mergeAll(
+      ConfigLive,
+      PolicyLive,
+      QueueLive,
+      ExecutorLive,
+      WorkspaceLive,
+      CredentialHealth.Default,
+    ),
+  ),
 );
 const DeliveryWorkerLive = DeliveryWorker.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.mergeAll(ConfigLive, ClientLive, IdentityLive, PolicyLive, QueueLive)),
 );
 const PollerLive = NotificationPoller.DefaultWithoutDependencies.pipe(
-  Layer.provide(Layer.mergeAll(ConfigLive, ClientLive, QueueLive, PolicyLive)),
+  Layer.provide(
+    Layer.mergeAll(ConfigLive, ClientLive, QueueLive, PolicyLive, CredentialHealth.Default),
+  ),
 );
 const Services = Layer.mergeAll(
   ConfigLive,
@@ -61,6 +77,7 @@ const Services = Layer.mergeAll(
   PolicyLive,
   QueueLive,
   WorkspaceLive,
+  CredentialHealth.Default,
   BrokerLive,
   ControlLive,
   ControlServerLive,
@@ -217,6 +234,20 @@ const Application = Layer.merge(
         Effect.forever(
           Effect.gen(function* () {
             yield* Effect.sleep('10 seconds');
+            const health = yield* CredentialHealth;
+            // ! Expiry watch. `verified` is deliberately memoized for the process
+            // ! lifetime, so a token that expires mid-run is noticed here from
+            // ! the verdict it already carries — no re-probe, one comparison per
+            // ! heartbeat tick. Revocation has no local signal at all; the next
+            // ! GitHub call's 401 latches the same breaker.
+            const verified = yield* identity.verified.pipe(Effect.option);
+            if (
+              Option.isSome(verified) &&
+              verified.value.tokenExpiresAt !== undefined &&
+              verified.value.tokenExpiresAt <= (yield* Clock.currentTimeMillis)
+            ) {
+              yield* health.suspend;
+            }
             yield* queue.heartbeatDaemon;
             yield* queue.recoverStale(yield* Clock.currentTimeMillis);
           }),

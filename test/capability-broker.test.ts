@@ -4,6 +4,7 @@ import { Effect, Layer, Redacted, Ref } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { CapabilityBroker } from '../src/github/capability-broker.ts';
 import { GitHubClient } from '../src/github/client.ts';
+import { CredentialHealth } from '../src/github/credential-health.ts';
 import { GitHubIdentity } from '../src/github/identity.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
@@ -105,7 +106,15 @@ const run = <A, E>(
           }),
         );
         const BrokerLive = CapabilityBroker.DefaultWithoutDependencies.pipe(
-          Layer.provide(Layer.mergeAll(GitHubLive, IdentityLive, PolicyLive, QueueLive)),
+          Layer.provide(
+            Layer.mergeAll(
+              GitHubLive,
+              IdentityLive,
+              PolicyLive,
+              QueueLive,
+              CredentialHealth.Default,
+            ),
+          ),
         );
         const value = yield* effect.pipe(Effect.provide(Layer.merge(BrokerLive, QueueLive)));
         return { value, requests: yield* Ref.get(requests), bodies: yield* Ref.get(bodies) };

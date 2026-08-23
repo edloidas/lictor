@@ -3,6 +3,7 @@ import { Clock, Data, Effect } from 'effect';
 import { Policy } from '../policy.ts';
 import { WorkQueue } from '../queue/work-queue.ts';
 import { GitHubClient } from './client.ts';
+import { CredentialHealth } from './credential-health.ts';
 import { GitHubIdentity } from './identity.ts';
 import { DEFAULT_THROTTLE_WAIT_MS, isSecondaryRateLimit, retryAfterMs } from './retry-after.ts';
 
@@ -160,6 +161,12 @@ const route = (repository: string, tool: BrokerTool, input: Readonly<Record<stri
   }
 };
 
+/** `remaining quota N` when GitHub reported the bucket, for non-2xx diagnostics. */
+const quotaNote = (headers: Record<string, string | undefined>): string | undefined => {
+  const remaining = headers['x-ratelimit-remaining'];
+  return remaining === undefined ? undefined : `remaining quota ${remaining}`;
+};
+
 const sanitized = (input: Readonly<Record<string, unknown>>): string => {
   const clean = Object.fromEntries(
     Object.entries(input).map(([key, value]) => [
@@ -192,6 +199,7 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
   effect: Effect.gen(function* () {
     const github = yield* GitHubClient;
     const identity = yield* GitHubIdentity;
+    const health = yield* CredentialHealth;
     // ! Resolved per call rather than at construction, so building the broker
     // ! costs no network. The first call pays for the probe; the rest share it.
     const actor = identity.verified.pipe(
@@ -328,12 +336,13 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
             // ! does. Collapsing a 401 into a generic failure spends every
             // ! remaining attempt, and each one costs a full clone cycle.
             if (response.status === 401) {
-              yield* Effect.logError('GitHub rejected the daemon credential').pipe(
-                Effect.annotateLogs({ job: request.jobId, capability: request.name }),
-              );
+              yield* health.suspend;
               return yield* new CapabilityError({
                 code: 'CAPABILITY_CREDENTIAL_REJECTED',
                 message: 'GitHub rejected the daemon credential',
+                ...(quotaNote(response.headers) === undefined
+                  ? {}
+                  : { cause: quotaNote(response.headers) }),
               });
             }
             // ! A 429 is definitive on its own; a 403 also means "forbidden", so
@@ -358,13 +367,20 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
             if (wait !== undefined) {
               return yield* new CapabilityError({
                 code: 'CAPABILITY_RATE_LIMITED',
-                message: `GitHub rate limit reached; retry in ${Math.ceil(wait / 1000)}s`,
+                message: `GitHub rate limit reached; retry in ${Math.ceil(wait / 1000)}s${
+                  quotaNote(response.headers) === undefined
+                    ? ''
+                    : `, ${quotaNote(response.headers)}`
+                }`,
                 retryAfterMs: wait,
               });
             }
             return yield* new CapabilityError({
               code: 'CAPABILITY_GITHUB_FAILED',
               message: `GitHub returned status ${response.status}`,
+              ...(quotaNote(response.headers) === undefined
+                ? {}
+                : { cause: quotaNote(response.headers) }),
             });
           }
           return boundedJson(yield* response.json);
@@ -556,5 +572,11 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
 
     return { callTool, handleMcp, listTools };
   }),
-  dependencies: [GitHubClient.Default, GitHubIdentity.Default, Policy.Default, WorkQueue.Default],
+  dependencies: [
+    GitHubClient.Default,
+    GitHubIdentity.Default,
+    Policy.Default,
+    WorkQueue.Default,
+    CredentialHealth.Default,
+  ],
 }) {}

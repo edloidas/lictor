@@ -6,6 +6,7 @@ import { Effect, Layer, Redacted } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { ControlPlane, type ControlRequest, ControlServer } from '../src/control/control-plane.ts';
 import { CapabilityBroker } from '../src/github/capability-broker.ts';
+import { CredentialHealth } from '../src/github/credential-health.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
@@ -82,6 +83,7 @@ describe('local control plane', () => {
       parsePolicy('[defaults]\nexecution = "approval"').pipe(Effect.map(Policy.make)),
     );
     const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
+    const HealthLive = CredentialHealth.Default;
     const BrokerLive = Layer.succeed(
       CapabilityBroker,
       CapabilityBroker.make({
@@ -91,7 +93,7 @@ describe('local control plane', () => {
       }),
     );
     const PlaneLive = ControlPlane.DefaultWithoutDependencies.pipe(
-      Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, BrokerLive)),
+      Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, BrokerLive, HealthLive)),
     );
     const ServerLive = ControlServer.DefaultWithoutDependencies.pipe(
       Layer.provide(Layer.merge(ConfigLive, PlaneLive)),
@@ -102,7 +104,9 @@ describe('local control plane', () => {
           Effect.gen(function* () {
             const server = yield* ControlServer;
             const queue = yield* WorkQueue;
+            const health = yield* CredentialHealth;
             const enqueued = yield* queue.enqueue(work);
+            yield* health.suspend;
             const approved = yield* call(server.path, {
               command: 'job.approve',
               args: [String(enqueued.jobId)],
@@ -114,11 +118,14 @@ describe('local control plane', () => {
               claimed: yield* queue.claim,
               mode: statSync(server.path).mode & 0o777,
             };
-          }).pipe(Effect.provide(Layer.merge(ServerLive, QueueLive))),
+          }).pipe(Effect.provide(Layer.mergeAll(ServerLive, QueueLive, HealthLive))),
         ),
       );
       expect(result.approved).toMatchObject({ ok: true, result: { changed: true, jobId: 1 } });
-      expect(result.status).toMatchObject({ ok: true, result: { executor: 'disabled' } });
+      expect(result.status).toMatchObject({
+        ok: true,
+        result: { executor: 'disabled', credentialRejected: true },
+      });
       expect(result.claimed?.work.approvalRequired).toBe(false);
       expect(result.mode).toBe(0o600);
     } finally {

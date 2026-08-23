@@ -1,7 +1,8 @@
 import { HttpClientRequest } from '@effect/platform';
-import { Clock, Data, Duration, Effect, Ref, Schema } from 'effect';
+import { Clock, Data, Duration, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
 import { GitHubClient } from '../github/client.ts';
+import { CredentialHealth } from '../github/credential-health.ts';
 import {
   DEFAULT_THROTTLE_WAIT_MS,
   isSecondaryRateLimit,
@@ -67,15 +68,13 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
     const github = yield* GitHubClient;
     const queue = yield* WorkQueue;
     const policy = yield* Policy;
+    const health = yield* CredentialHealth;
 
     /**
-     * Set once a 401 is confirmed, and never cleared.
-     *
-     * A credential GitHub refuses does not heal without an operator changing
-     * it, and repeating the same rejected request every minute forever buries
-     * the one log line that says why nothing is happening.
+     * The daemon-wide credential latch. A 401 anywhere — this loop, a broker
+     * call, a clone — suspends everything that talks to GitHub through one
+     * shared ref instead of three private ones.
      */
-    const suspended = yield* Ref.make(false);
     // ! One sweep at a time. The loop is sequential on its own, but `pollOnce`
     // ! is also callable directly, and two concurrent sweeps would each read
     // ! the same threads and race on marking them read.
@@ -122,7 +121,7 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
 
     const sweep = Effect.gen(function* () {
       const floor = config.notificationPollMs;
-      if (yield* Ref.get(suspended)) return { waitMs: floor, stored: 0, deferred: false };
+      if (yield* health.isRejected) return { waitMs: floor, stored: 0, deferred: false };
 
       // ! Checked before anything is fetched, not after. The depth limit lives
       // ! in `enqueue`, which runs a stage later — by then the thread is stored
@@ -172,10 +171,7 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
         }
 
         if (response.status === 401) {
-          yield* Ref.set(suspended, true);
-          yield* Effect.logError(
-            'Notification polling suspended: GitHub refused the configured credential. Replace LICTOR_GITHUB_TOKEN and restart the daemon.',
-          );
+          yield* health.suspend;
           return { waitMs: floor, stored: 0, deferred: false };
         }
 
@@ -192,14 +188,24 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
           // ! must not advance over them.
           truncated = true;
           yield* Effect.logWarning('Backing off from notification polling').pipe(
-            Effect.annotateLogs({ status: response.status, waitMs: Math.max(backoffMs, floor) }),
+            Effect.annotateLogs({
+              status: response.status,
+              waitMs: Math.max(backoffMs, floor),
+              ...(response.headers['x-ratelimit-remaining'] === undefined
+                ? {}
+                : { remainingQuota: response.headers['x-ratelimit-remaining'] }),
+            }),
           );
           break;
         }
 
         if (response.status < 200 || response.status >= 300) {
           return yield* new PollError({
-            message: `Polling notifications returned status ${response.status}`,
+            message: `Polling notifications returned status ${response.status}${
+              response.headers['x-ratelimit-remaining'] === undefined
+                ? ''
+                : `, remaining quota ${response.headers['x-ratelimit-remaining']}`
+            }`,
           });
         }
 
@@ -287,7 +293,7 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
      */
     const acceptInvitations = Effect.gen(function* () {
       if (config.autoAcceptInviters.length === 0) return;
-      if (yield* Ref.get(suspended)) return;
+      if (yield* health.isRejected) return;
 
       const client = yield* github.authenticated;
       // ponytail: one page of 100; a live backlog past that wants the sweep's paging loop
@@ -305,10 +311,7 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
       );
 
       if (response.status === 401) {
-        yield* Ref.set(suspended, true);
-        yield* Effect.logError(
-          'Invitation acceptance suspended: GitHub refused the configured credential. Replace LICTOR_GITHUB_TOKEN and restart the daemon.',
-        );
+        yield* health.suspend;
         return;
       }
       if (response.status < 200 || response.status >= 300) {
@@ -402,5 +405,11 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
 
     return { pollOnce, run, acceptInvitations };
   }),
-  dependencies: [LictorConfig.Default, GitHubClient.Default, WorkQueue.Default, Policy.Default],
+  dependencies: [
+    LictorConfig.Default,
+    GitHubClient.Default,
+    WorkQueue.Default,
+    Policy.Default,
+    CredentialHealth.Default,
+  ],
 }) {}
