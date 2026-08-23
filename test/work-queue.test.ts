@@ -13,6 +13,7 @@ const config = (databasePath: string) =>
     githubToken: Redacted.make('test-token'),
     expectedLogin: 'adiutriel',
     trustedSenders: ['edloidas'],
+    autoAcceptInviters: [],
     databasePath,
     policyPath: 'policy.toml',
     controlSocketPath: '/tmp/lictor.sock',

@@ -59,6 +59,7 @@ describe('local control plane', () => {
         githubToken: Redacted.make('test-token'),
         expectedLogin: 'adiutriel',
         trustedSenders: [],
+        autoAcceptInviters: [],
         databasePath,
         policyPath: 'unused',
         controlSocketPath: socketPath,

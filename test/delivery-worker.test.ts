@@ -16,6 +16,7 @@ const config = LictorConfig.make({
   githubToken: Redacted.make('pat-value'),
   expectedLogin: 'adiutriel',
   trustedSenders: ['edloidas'],
+  autoAcceptInviters: [],
   databasePath: ':memory:',
   policyPath: 'unused',
   controlSocketPath: '/tmp/lictor-delivery.sock',

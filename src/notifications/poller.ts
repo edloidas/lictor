@@ -1,5 +1,5 @@
 import { HttpClientRequest } from '@effect/platform';
-import { Clock, Data, Duration, Effect, Ref } from 'effect';
+import { Clock, Data, Duration, Effect, Ref, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
 import { GitHubClient } from '../github/client.ts';
 import {
@@ -21,6 +21,14 @@ export const NOTIFICATION_EVENT = 'notification';
 
 /** Notifications requested per page. */
 const PAGE_SIZE = 50;
+
+/** The fields of a pending repository invitation the acceptance pass reads. */
+const RepositoryInvitation = Schema.Struct({
+  id: Schema.Number,
+  inviter: Schema.Struct({ login: Schema.String }),
+  repository: Schema.Struct({ full_name: Schema.String }),
+});
+const decodeInvitations = Schema.decodeUnknown(Schema.Array(RepositoryInvitation));
 
 /**
  * Pages fetched in one sweep.
@@ -267,29 +275,132 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
     const pollOnce: Effect.Effect<PollOutcome, PollError | QueueError> = gate.withPermits(1)(sweep);
 
     /**
+     * Accepts pending repository invitations from the allow-list, and leaves
+     * everything else pending.
+     *
+     * Runs on this loop's cadence because it is the same account and the same
+     * credential: a sweep's 401 suspends this pass too, through the shared
+     * ref. A declined invitation is destroyed, so untrusted ones are only
+     * ever logged — a pending invitation is a useful signal that somebody is
+     * trying to add her somewhere. Joining a repository arms nothing: no
+     * policy entry exists for it until an operator writes one.
+     */
+    const acceptInvitations = Effect.gen(function* () {
+      if (config.autoAcceptInviters.length === 0) return;
+      if (yield* Ref.get(suspended)) return;
+
+      const client = yield* github.authenticated;
+      // ponytail: one page of 100; a live backlog past that wants the sweep's paging loop
+      const list = HttpClientRequest.get('/user/repository_invitations').pipe(
+        HttpClientRequest.setUrlParams({ per_page: '100' }),
+      );
+      const response = yield* client.execute(list).pipe(
+        Effect.mapError(
+          (cause) =>
+            new PollError({
+              message: 'Could not reach GitHub for repository invitations',
+              cause,
+            }),
+        ),
+      );
+
+      if (response.status === 401) {
+        yield* Ref.set(suspended, true);
+        yield* Effect.logError(
+          'Invitation acceptance suspended: GitHub refused the configured credential. Replace LICTOR_GITHUB_TOKEN and restart the daemon.',
+        );
+        return;
+      }
+      if (response.status < 200 || response.status >= 300) {
+        yield* Effect.logWarning('Listing repository invitations failed').pipe(
+          Effect.annotateLogs({ status: response.status }),
+        );
+        return;
+      }
+
+      const invitations = yield* Effect.flatMap(response.json, decodeInvitations).pipe(
+        Effect.tapError((cause) =>
+          Effect.logWarning('Repository invitation list did not match its schema', { cause }),
+        ),
+        Effect.catchAll(() => Effect.succeed([])),
+      );
+
+      for (const invitation of invitations) {
+        const inviter = invitation.inviter.login.toLowerCase();
+        if (!config.autoAcceptInviters.includes(inviter)) {
+          yield* Effect.logDebug('Leaving a repository invitation pending').pipe(
+            Effect.annotateLogs({ inviter, repository: invitation.repository.full_name }),
+          );
+          continue;
+        }
+        const accepted = yield* client
+          .execute(HttpClientRequest.patch(`/user/repository_invitations/${invitation.id}`))
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new PollError({ message: `Could not accept invitation ${invitation.id}`, cause }),
+            ),
+            Effect.either,
+          );
+        if (accepted._tag === 'Left') {
+          yield* Effect.logWarning('Could not accept a repository invitation').pipe(
+            Effect.annotateLogs({ id: invitation.id, reason: accepted.left.message }),
+          );
+          continue;
+        }
+        // ! Any non-error status is success. GitHub answers with a bare no-content
+        // ! code; 404 means someone already declined or withdrew it, which is not
+        // ! worth distinguishing here.
+        if (accepted.right.status < 200 || accepted.right.status >= 300) {
+          yield* Effect.logWarning('Accepting a repository invitation failed').pipe(
+            Effect.annotateLogs({ id: invitation.id, status: accepted.right.status }),
+          );
+          continue;
+        }
+        yield* Effect.logInfo('Accepted a repository invitation').pipe(
+          Effect.annotateLogs({ inviter, repository: invitation.repository.full_name }),
+        );
+      }
+    });
+
+    /**
      * ! `Effect.forever` runs the body before it ever sleeps, so the first
      * ! sweep happens at startup. Waiting one interval first would lose the
      * ! whole point of acknowledging fast — a mention would sit unanswered for
      * ! a minute after every restart.
      */
     const run = Effect.forever(
-      pollOnce.pipe(
-        Effect.catchAll((error) =>
-          Effect.logError('Notification poll failed')
-            .pipe(Effect.annotateLogs({ reason: error.message }))
-            .pipe(
-              Effect.as({
-                waitMs: config.notificationPollMs,
-                stored: 0,
-                deferred: false,
-              } satisfies PollOutcome),
+      Effect.gen(function* () {
+        const outcome = yield* pollOnce.pipe(
+          Effect.catchAll((error) =>
+            Effect.logError('Notification poll failed')
+              .pipe(Effect.annotateLogs({ reason: error.message }))
+              .pipe(
+                Effect.as({
+                  waitMs: config.notificationPollMs,
+                  stored: 0,
+                  deferred: false,
+                } satisfies PollOutcome),
+              ),
+          ),
+        );
+        // ! After the sleep, not before: a backoff the sweep just accepted must
+        // ! cover this pass too — firing an unthrottled request into a declared
+        // ! backoff is what turns a throttle into a block.
+        yield* Effect.sleep(Duration.millis(outcome.waitMs));
+        // ! Never fatal: a failed pass costs one cadence, killing the loop costs
+        // ! polling itself.
+        yield* acceptInvitations.pipe(
+          Effect.catchAll((error) =>
+            Effect.logWarning('Invitation acceptance failed').pipe(
+              Effect.annotateLogs({ reason: error.message }),
             ),
-        ),
-        Effect.flatMap((outcome) => Effect.sleep(Duration.millis(outcome.waitMs))),
-      ),
+          ),
+        );
+      }),
     );
 
-    return { pollOnce, run };
+    return { pollOnce, run, acceptInvitations };
   }),
   dependencies: [LictorConfig.Default, GitHubClient.Default, WorkQueue.Default, Policy.Default],
 }) {}

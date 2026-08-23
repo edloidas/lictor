@@ -18,6 +18,7 @@ const ConfigLive = Layer.succeed(
     githubToken: Redacted.make('test-token'),
     expectedLogin: 'adiutriel',
     trustedSenders: ['edloidas'],
+    autoAcceptInviters: [],
     databasePath: ':memory:',
     policyPath: 'policy.toml',
     controlSocketPath: '/tmp/lictor.sock',

@@ -13,6 +13,7 @@ const config = (expectedLogin: string, trustedSenders: readonly string[] = []) =
       githubToken: Redacted.make('pat-value'),
       expectedLogin,
       trustedSenders: [...trustedSenders],
+      autoAcceptInviters: [],
       databasePath: ':memory:',
       policyPath: 'unused',
       controlSocketPath: '/tmp/lictor.sock',
