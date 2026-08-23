@@ -19,6 +19,7 @@ const config = (expectedLogin: string, trustedSenders: readonly string[] = []) =
       deliveryMaxBytes: 1024,
       executor: 'disabled',
       codexModel: 'gpt-5.6-luna',
+      codexHome: '',
       agentWorkdir: '.',
       executorTimeoutMs: 1000,
       executorOutputBytes: 1024,

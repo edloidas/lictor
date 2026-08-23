@@ -153,6 +153,14 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       codexModel: yield* Config.string('LICTOR_CODEX_MODEL').pipe(
         Config.withDefault('gpt-5.6-luna'),
       ),
+      /**
+       * Explicit `CODEX_HOME` for the executor. Empty falls back to a `codex`
+       * directory beside the database — see `src/executor/agent-executor.ts`.
+       */
+      codexHome: yield* Config.string('LICTOR_CODEX_HOME').pipe(
+        Config.withDefault(''),
+        Config.map(expandHome),
+      ),
       agentWorkdir: yield* Config.string('LICTOR_AGENT_WORKDIR').pipe(
         Config.withDefault(process.cwd()),
       ),
