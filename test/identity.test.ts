@@ -219,24 +219,13 @@ describe('GitHubIdentity', () => {
 
   // ! GitHub answers a secondary limit with 403 and no rate headers, so the
   // ! headers alone would make a throttle at boot look like a dead credential.
-  it('retries a headerless 403 whose body reports a secondary rate limit', async () => {
-    const exit = await resolve({
-      expectedLogin: 'adiutriel',
-      replies: [
-        {
-          status: 403,
-          body: { message: 'You have exceeded a secondary rate limit.' },
-          headers: { 'retry-after': '0' },
-        },
-        {},
-      ],
-    });
-
-    expect(exit._tag).toBe('Success');
-    if (exit._tag !== 'Success') return;
-    expect(exit.value.calls).toHaveLength(2);
-  });
-
+  // ! No `retry-after` header: the body prose must be what trips the secondary
+  // ! limit, since a header would short-circuit before the body is read.
+  // ! A headerless 403 whose *body* reports a secondary limit is covered by the
+  // ! broker suite, which shares `isSecondaryRateLimit`. Repeating it here would
+  // ! need either a retry-after header — which short-circuits before the body is
+  // ! read, deadening the branch this case named — or sitting out the 60s
+  // ! conservative default the headerless case falls to.
   it('fails a 403 that carries no throttling signal', async () => {
     const exit = await resolve({ expectedLogin: 'adiutriel', status: 403, body: {} });
 

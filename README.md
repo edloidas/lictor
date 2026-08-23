@@ -61,7 +61,10 @@ claim work.
 
 Create the token from the account's Developer settings, set it as
 `LICTOR_GITHUB_TOKEN`, and put that account's login in `LICTOR_GITHUB_LOGIN` —
-startup calls `GET /user` and refuses to run if the two disagree.
+startup calls `GET /user` and refuses to run if the two disagree. Startup also
+checks the token's scopes and refuses a classic token whose `x-oauth-scopes`
+lacks `repo`, naming what GitHub reported, so a mis-scoped credential fails
+loudly before it can clone or comment with half its reach missing.
 
 A classic token cannot be scoped to particular repositories: it reaches
 everything the account reaches, which includes its own repositories and anything
