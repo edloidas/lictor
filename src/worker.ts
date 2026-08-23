@@ -1,6 +1,7 @@
 import { Clock, Effect, Exit, PartitionedSemaphore, Ref } from 'effect';
 import { LictorConfig } from './config.ts';
 import { AgentExecutor, ExecutorError } from './executor/agent-executor.ts';
+import { CredentialHealth } from './github/credential-health.ts';
 import { canonicalRepository, Policy } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 import { RepositoryWorkspace, WorkspaceError } from './workspace/repository-workspace.ts';
@@ -12,6 +13,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
     const queue = yield* WorkQueue;
     const policy = yield* Policy;
     const workspaces = yield* RepositoryWorkspace;
+    const health = yield* CredentialHealth;
     // ! Worker-owned scheduling, not a workspace API. Despite the partitioned
     // ! key, `PartitionedSemaphore`'s permits are *global*, shared across all
     // ! keys round-robin — `permits: 1` is a daemon-wide mutex with fair
@@ -29,6 +31,11 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
 
     const runOnce = Effect.gen(function* () {
       if (!executor.enabled) return false;
+      // ! Before the claim, not after: a claimed job spends its attempt the
+      // ! moment it runs. While the credential is dead every GitHub-dependent
+      // ! job would burn its budget on clones that cannot push — leaving the
+      // ! rows untouched keeps them for the rotation instead.
+      if (yield* health.isRejected) return false;
       const job = yield* queue.claimFor(queue.ownerId, policy.maxJobAgeMs);
       if (job === undefined) return false;
       yield* Effect.logInfo('Claimed queued work').pipe(
@@ -144,6 +151,15 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
           ),
         );
       const result = yield* Effect.either(Effect.raceFirst(execution, keepLease));
+      // ! Git classifies a refused credential from its stderr prose; latch the
+      // ! daemon-wide breaker here so no further claim happens while it is dead.
+      if (
+        result._tag === 'Left' &&
+        result.left.cause instanceof WorkspaceError &&
+        result.left.cause.code === 'WORKSPACE_CREDENTIAL_REJECTED'
+      ) {
+        yield* health.suspend;
+      }
       if (result._tag === 'Right') {
         if (result.right.status === 'failed' || result.right.status === 'needs_input') {
           const retryAt =

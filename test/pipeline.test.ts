@@ -5,6 +5,7 @@ import { LictorConfig } from '../src/config.ts';
 import { DeliveryWorker } from '../src/delivery-worker.ts';
 import { AgentExecutor } from '../src/executor/agent-executor.ts';
 import { GitHubClient } from '../src/github/client.ts';
+import { CredentialHealth } from '../src/github/credential-health.ts';
 import { GitHubIdentity } from '../src/github/identity.ts';
 import { NotificationPoller } from '../src/notifications/poller.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
@@ -177,6 +178,7 @@ describe('notification-to-agent pipeline', () => {
             PolicyLive,
             ExecutorLive,
             WorkspaceLive,
+            CredentialHealth.Default,
           );
           const Runtime = Layer.mergeAll(
             Services,
