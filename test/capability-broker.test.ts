@@ -348,6 +348,33 @@ describe('CapabilityBroker', () => {
     expect(result.value.audit[0]?.input).toContain('[REDACTED]');
   });
 
+  // ! A continuation turn inherits its authority from the trigger that armed
+  // ! liveness, so it never reaches the escalation capabilities even where
+  // ! repository policy grants them to the operator.
+  it('strips escalation capabilities from continuation turns', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue({ ...work, continuation: true });
+        const claimed = yield* queue.claim;
+        const exit = yield* Effect.exit(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'merge_pull_request',
+            input: { number: 13 },
+          }),
+        );
+        return { exit };
+      }),
+      '[defaults.capabilities]\nread = true\ncomment = true\nmerge = true',
+    );
+    expect(String(result.value.exit)).toContain('CAPABILITY_DENIED');
+    expect(result.requests).toHaveLength(0);
+  });
+
   it('rejects attempts to address another repository', async () => {
     const result = await run(
       Effect.gen(function* () {

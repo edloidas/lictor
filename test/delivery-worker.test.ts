@@ -152,6 +152,7 @@ const run = (
               Policy,
               parsePolicy(
                 '[defaults]\nexecution = "automatic"\n[repositories]\nallow = ["edloidas/lictor"]',
+                ['edloidas'],
               ).pipe(Effect.map(Policy.make)),
             );
             const Services = Layer.mergeAll(

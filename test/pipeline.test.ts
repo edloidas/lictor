@@ -160,6 +160,7 @@ describe('notification-to-agent pipeline', () => {
             Policy,
             parsePolicy(
               '[defaults]\nexecution = "automatic"\n[repositories]\nallow = ["edloidas/lictor"]',
+              ['edloidas'],
             ).pipe(Effect.map(Policy.make)),
           );
           const WorkspaceLive = Layer.succeed(

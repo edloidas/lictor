@@ -49,6 +49,8 @@ const Subject = Schema.Struct({
   user: Schema.optionalWith(User, { nullable: true }),
   created_at: Schema.String,
   updated_at: Schema.String,
+  // 'open' | 'closed'. A closed subject ends its thread's live window.
+  state: Schema.optionalWith(Schema.String, { nullable: true }),
 });
 
 /**
@@ -432,6 +434,11 @@ export const qualifyNotification = (input: {
   readonly policy: QualificationPolicy;
   /** Newest activity already turned into work for this thread, epoch ms. */
   readonly cursorMs: number | undefined;
+  /**
+   * Whether a trusted trigger has armed this thread's live window. While true,
+   * replies from participants this policy does not trust continue the work.
+   */
+  readonly live?: boolean;
 }): Effect.Effect<QualifiedNotification, NotificationError, GitHubClient> =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -582,7 +589,25 @@ export const qualifyNotification = (input: {
             )
           : undefined;
 
-      if (mentionTrigger === undefined && assignedEvent === undefined) {
+      // ! While the thread is live, any non-self reply continues the work — the
+      // ! trust gate ran when the trigger armed liveness, and these replies
+      // ! inherit that authority at continuation strength. A closed subject ends
+      // ! the conversation regardless of the stored window. The body candidate
+      // ! is excluded: opening an issue is not replying to one.
+      const live = input.live === true && subject.state !== 'closed';
+      const continuationTrigger = live
+        ? usable.reduce<(typeof usable)[number] | undefined>((best, candidate) => {
+            if (candidate.ref.kind === 'body') return best;
+            if (normalizeLogin(candidate.author) === selfLogin) return best;
+            return best === undefined || candidate.at > best.at ? candidate : best;
+          }, undefined)
+        : undefined;
+
+      if (
+        mentionTrigger === undefined &&
+        assignedEvent === undefined &&
+        continuationTrigger === undefined
+      ) {
         if (matching.length > 0) {
           yield* Effect.logInfo('Notification dropped: no trusted sender mentioned her').pipe(
             Effect.annotateLogs({
@@ -600,12 +625,19 @@ export const qualifyNotification = (input: {
         return { work: undefined, lastActivityAt };
       }
 
-      // ! A tie goes to the timeline event: its timestamp is GitHub's own record
-      // ! of why the thread went unread, while a mention's had to be recovered
-      // ! from a scan.
-      const useAssigned =
-        assignedEvent !== undefined &&
-        (mentionTrigger === undefined || Date.parse(assignedEvent.created_at) >= mentionTrigger.at);
+      // ! A trusted trigger outranks any continuation, whatever the timestamps:
+      // ! a continuation inherits its authority from the trigger that armed
+      // ! liveness, so letting a stranger's later comment demote a trusted
+      // ! command to continuation strength would strip it without anyone having
+      // ! earned that. The window collapses to one turn, so the stranger's reply
+      // ! stays unread context in the thread rather than an executed instruction.
+      // ! Between trusted triggers, newest wins — the timeline event on ties,
+      // ! being GitHub's own record of why the thread went unread.
+      const assignedAt =
+        assignedEvent === undefined ? -1 : (parseDate(assignedEvent.created_at) ?? -1);
+      const useAssigned = assignedEvent !== undefined && assignedAt >= (mentionTrigger?.at ?? -1);
+      const hasTrustedTrigger = assignedEvent !== undefined || mentionTrigger !== undefined;
+      const useContinuation = !hasTrustedTrigger && continuationTrigger !== undefined;
 
       const common = {
         deliveryId: input.deliveryId,
@@ -645,9 +677,10 @@ export const qualifyNotification = (input: {
         return { work, lastActivityAt };
       }
 
-      const triggering = mentionTrigger;
+      const triggering = useContinuation ? continuationTrigger : mentionTrigger;
       if (triggering === undefined) return { work: undefined, lastActivityAt };
       const sender = normalizeLogin(triggering.author);
+      const continued = useContinuation;
       const work: WorkItem = {
         ...common,
         // Identities only: one job per thread per activity window means no
@@ -656,13 +689,14 @@ export const qualifyNotification = (input: {
           repository,
           ref.kind,
           ref.number,
-          'mentioned',
+          continued ? 'continued' : 'mentioned',
           triggering.ref,
           sender,
           selfLogin,
         ]),
         sender,
-        reasons: ['mentioned'],
+        reasons: [continued ? 'continued' : 'mentioned'],
+        ...(continued ? { continuation: true } : {}),
         contextUrl: triggering.url,
         context: triggering.ref,
       };

@@ -23,6 +23,8 @@ const RepositoryOverride = Schema.Struct({
   clone: Schema.optional(Clone),
   capabilities: Schema.optional(Capabilities),
   costs: Schema.optional(Costs),
+  /** Senders trusted for this repository alone, replacing every wider list. */
+  senders: Schema.optional(Schema.Array(Schema.String)),
 });
 const PolicyDocument = Schema.Struct({
   defaults: Schema.optional(
@@ -30,6 +32,8 @@ const PolicyDocument = Schema.Struct({
       execution: Schema.optional(Execution),
       clone: Schema.optional(Clone),
       capabilities: Schema.optional(Capabilities),
+      /** Replaces the environment list everywhere, owned repositories included. */
+      senders: Schema.optional(Schema.Array(Schema.String)),
     }),
   ),
   repositories: Schema.optional(
@@ -50,6 +54,8 @@ const PolicyDocument = Schema.Struct({
       maxQueueDepth: Schema.optional(Schema.Number),
       maxJobAgeMinutes: Schema.optional(Schema.Number),
       costs: Schema.optional(Costs),
+      /** How long a thread stays open to replies from untrusted participants. */
+      livenessHours: Schema.optional(Schema.Number),
     }),
   ),
 });
@@ -63,6 +69,8 @@ export type RepositoryPolicy = {
   readonly execution: 'automatic' | 'approval' | 'denied';
   readonly clone: 'allowed' | 'denied';
   readonly capabilities: Capabilities;
+  /** Senders whose activity may create work here, resolved for this repository. */
+  readonly trustedSenders: readonly string[];
   readonly maxAttempts: number;
   readonly maxDurationMs: number;
 };
@@ -166,10 +174,16 @@ export type AutomationPolicy = {
   readonly failedRetentionDays: number;
   readonly maxQueueDepth: number;
   readonly maxJobAgeMs: number;
+  /** How long a trusted trigger keeps its thread open to untrusted replies. */
+  readonly livenessMs: number;
   readonly forRepository: (repository: string) => RepositoryPolicy;
 };
 
-const makePolicy = (document: PolicyDocument): AutomationPolicy => {
+const makePolicy = (
+  document: PolicyDocument,
+  /** The environment list, applied as default to owned repositories only. */
+  environmentSenders: readonly string[] = [],
+): AutomationPolicy => {
   const defaults = document.defaults;
   const repositories = document.repositories;
   // ! Exact names only. An owner wildcard would arm every repository the
@@ -204,21 +218,43 @@ const makePolicy = (document: PolicyDocument): AutomationPolicy => {
   const forRepository = (input: string): RepositoryPolicy => {
     const repository = canonicalRepository(input);
     const denied = deny.some((pattern) => patternMatches(pattern, repository));
-    const allowed = isSafeRepository(repository) && allow.has(repository);
+    const owned = allow.has(repository);
+    const safe = isSafeRepository(repository);
     const override = overrides.get(repository);
-    const capabilities = {
-      ...defaultCapabilities,
-      ...defaults?.capabilities,
-      ...override?.capabilities,
-      scripts: override?.capabilities?.scripts ?? defaults?.capabilities?.scripts ?? [],
-    };
+    // ! Third-party tier. A repository the operator does not control is never
+    // ! granted the defaults wholesale: without an explicit override it caps at
+    // ! read and comment under approval execution, which bounds a stranger's
+    // ! prompt-injection blast radius to posting a comment after a human
+    // ! approved the job. Deny still subtracts first.
+    const thirdParty = !owned && override === undefined;
+    const capabilities = thirdParty
+      ? {
+          ...defaultCapabilities,
+          read: true,
+          comment: true,
+        }
+      : {
+          ...defaultCapabilities,
+          ...defaults?.capabilities,
+          ...override?.capabilities,
+          scripts: override?.capabilities?.scripts ?? defaults?.capabilities?.scripts ?? [],
+        };
+    const trustedSenders =
+      override?.senders ?? defaults?.senders ?? (owned ? environmentSenders : []);
 
     return {
       repository,
-      accepted: allowed && !denied,
-      execution: override?.execution ?? defaults?.execution ?? 'automatic',
-      clone: override?.clone ?? defaults?.clone ?? 'denied',
+      // ! Safe non-denied repositories are all accepted now; ownership decides
+      // ! the tier, not admission. An unlisted repository runs at the capped
+      // ! third-party tier above, so joining one (#29) still arms nothing a
+      // ! human does not approve.
+      accepted: safe && !denied,
+      execution: thirdParty
+        ? 'approval'
+        : (override?.execution ?? defaults?.execution ?? 'automatic'),
+      clone: thirdParty ? 'denied' : (override?.clone ?? defaults?.clone ?? 'denied'),
       capabilities,
+      trustedSenders,
       maxAttempts: positiveLimit(
         override?.costs?.maxAttempts,
         defaultMaxAttempts,
@@ -255,11 +291,17 @@ const makePolicy = (document: PolicyDocument): AutomationPolicy => {
         30 * 24 * 60,
         'limits.maxJobAgeMinutes',
       ) * 60_000,
+    livenessMs:
+      positiveLimit(document.limits?.livenessHours, 24, 720, 'limits.livenessHours') * 3_600_000,
     forRepository,
   };
 };
 
-export const parsePolicy = (source: string): Effect.Effect<AutomationPolicy, PolicyError> =>
+export const parsePolicy = (
+  source: string,
+  /** The environment list, applied as default to owned repositories only. */
+  environmentSenders: readonly string[] = [],
+): Effect.Effect<AutomationPolicy, PolicyError> =>
   Effect.try({
     try: () => Bun.TOML.parse(source),
     catch: (cause) => new PolicyError({ message: 'Could not parse policy TOML', cause }),
@@ -267,7 +309,7 @@ export const parsePolicy = (source: string): Effect.Effect<AutomationPolicy, Pol
     Effect.flatMap(Schema.decodeUnknown(PolicyDocument, { onExcessProperty: 'error' })),
     Effect.flatMap((document) =>
       Effect.try({
-        try: () => makePolicy(document),
+        try: () => makePolicy(document, environmentSenders),
         catch: (cause) =>
           cause instanceof PolicyError
             ? cause
@@ -289,7 +331,7 @@ export class Policy extends Effect.Service<Policy>()('Policy', {
       catch: (cause) =>
         new PolicyError({ message: `Could not read policy: ${config.policyPath}`, cause }),
     });
-    return yield* parsePolicy(source);
+    return yield* parsePolicy(source, config.trustedSenders);
   }),
   dependencies: [LictorConfig.Default],
 }) {}

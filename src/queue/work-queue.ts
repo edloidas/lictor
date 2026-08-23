@@ -106,20 +106,21 @@ const migrate = (database: Database) => {
     (database.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(
       (existing) => existing.name === column,
     );
-  // ! Every v7 artifact, not a sample of them. A database stamped 7 that is
+  // ! Every v9 artifact, not a sample of them. A database stamped 9 that is
   // ! missing one table or one column returns early here and then fails on every
   // ! use of it — which is exactly the failure the v6 equality guard used to
   // ! cause, one version later.
   if (
-    version.user_version === 8 &&
+    version.user_version === 9 &&
     deliveriesHaveSource() &&
     hasColumn('capability_audit', 'actor') &&
     hasTable('notification_cursors') &&
     hasTable('poller_state') &&
-    hasTable('subject_branches')
+    hasTable('subject_branches') &&
+    hasTable('thread_liveness')
   )
     return;
-  if (version.user_version > 8) {
+  if (version.user_version > 9) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -277,7 +278,17 @@ const migrate = (database: Database) => {
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         last_modified TEXT
       );
-      PRAGMA user_version = 8;
+      -- How long a subject stays open to replies from untrusted participants.
+      -- Armed when a trusted sender's interaction produces a job; expired rows
+      -- are swept by maintenance.
+      CREATE TABLE IF NOT EXISTS thread_liveness (
+        repository TEXT NOT NULL,
+        subject_kind TEXT NOT NULL,
+        subject_number INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        PRIMARY KEY (repository, subject_kind, subject_number)
+      );
+      PRAGMA user_version = 9;
     `);
     // ! Condemned, not drained. `DeliverySource` no longer has a `webhook`
     // ! member, so nothing can decode these bodies — leaving one claimable
@@ -802,6 +813,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
 
     const maintenance = (completedBefore: number, failedBefore: number) =>
       attempt('maintain queue', () => {
+        const now = Date.now();
         database
           .query(
             `DELETE FROM capability_audit WHERE job_id IN
@@ -828,6 +840,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         // ! makes the qualifier rescan from the beginning of the thread and
         // ! re-attribute an old comment as fresh activity.
         database.query('DELETE FROM notification_cursors WHERE updated_at < ?').run(failedBefore);
+        database.query('DELETE FROM thread_liveness WHERE expires_at < ?').run(now);
         database.exec('PRAGMA wal_checkpoint(PASSIVE)');
         const sizeBytes =
           config.databasePath === ':memory:' ? 0 : statSync(config.databasePath).size;
@@ -860,6 +873,58 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               entry.outcome,
               now,
             );
+        });
+      });
+
+    /**
+     * Arms one subject's live window: replies from untrusted participants may
+     * continue the work until it expires. Called when a trusted sender's
+     * interaction produces a job; a later trusted trigger extends the window.
+     */
+    const markLive = (input: {
+      readonly repository: string;
+      readonly subjectKind: 'issue' | 'pull_request';
+      readonly subjectNumber: number;
+      /** Epoch ms until which the thread accepts untrusted replies. */
+      readonly expiresAt: number;
+    }) =>
+      Effect.gen(function* () {
+        yield* attempt('arm thread liveness', () => {
+          database
+            .query(
+              `INSERT INTO thread_liveness (repository, subject_kind, subject_number, expires_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(repository, subject_kind, subject_number)
+                 DO UPDATE SET expires_at = MAX(thread_liveness.expires_at, excluded.expires_at)`,
+            )
+            .run(
+              input.repository.toLowerCase(),
+              input.subjectKind,
+              input.subjectNumber,
+              input.expiresAt,
+            );
+        });
+      });
+
+    const livenessFor = (
+      repository: string,
+      subjectKind: 'issue' | 'pull_request',
+      subjectNumber: number,
+    ) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        return yield* attempt('read thread liveness', () => {
+          // ! bun:sqlite answers null, not undefined, for a missing row.
+          const row = database
+            .query(
+              `SELECT expires_at AS expiresAt FROM thread_liveness
+               WHERE repository = ? AND subject_kind = ? AND subject_number = ?`,
+            )
+            .get(repository.toLowerCase(), subjectKind, subjectNumber) as
+            | { expiresAt: number }
+            | null
+            | undefined;
+          return row != null && row.expiresAt > now;
         });
       });
 
@@ -1143,6 +1208,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       auditLog,
       recordSubjectBranch,
       branchForSubject,
+      markLive,
+      livenessFor,
       listJobs,
       job,
       liveJobIds,

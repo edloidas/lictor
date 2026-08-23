@@ -5,7 +5,7 @@ import { describeCause } from './diagnostics.ts';
 import { GitHubClient } from './github/client.ts';
 import { GitHubIdentity, type GitHubIdentityError } from './github/identity.ts';
 import { type NotificationError, qualifyNotification } from './notifications/qualify.ts';
-import { decodeThread } from './notifications/thread.ts';
+import { decodeThread, subjectRef } from './notifications/thread.ts';
 import { Policy } from './policy.ts';
 import {
   type DeliverySource,
@@ -112,14 +112,24 @@ const processBySource: Record<
       const thread = yield* decodeThread(raw);
       const identity = yield* GitHubIdentity;
       const { login } = yield* identity.verified;
-      const config = yield* LictorConfig;
       const queue = yield* WorkQueue;
+      const policy = yield* Policy;
+      // ! Trust is resolved per repository, not globally: somebody trusted for
+      // ! one owner's repositories is not automatically trusted in an unrelated
+      // ! one she happens to have access to.
+      const threadPolicy = policy.forRepository(thread.repository.full_name);
       const cursorMs = yield* queue.notificationCursor(thread.id);
+      const subject = subjectRef(thread);
+      const live =
+        subject === undefined
+          ? false
+          : yield* queue.livenessFor(thread.repository.full_name, subject.kind, subject.number);
       const { work, lastActivityAt } = yield* qualifyNotification({
         deliveryId: stored.id,
         thread,
-        policy: { selfLogin: login, trustedSenders: config.trustedSenders },
+        policy: { selfLogin: login, trustedSenders: threadPolicy.trustedSenders },
         cursorMs,
+        live,
       });
       // ! Advanced only after the job is committed, never before. A cursor moved
       // ! ahead of a failed `enqueue` makes the retry scan from the wrong anchor
@@ -130,7 +140,6 @@ const processBySource: Record<
 
       if (work === undefined) return yield* advance;
 
-      const policy = yield* Policy;
       const repositoryPolicy = policy.forRepository(work.repository);
       if (!repositoryPolicy.accepted || repositoryPolicy.execution === 'denied') {
         yield* Effect.logInfo('Dropped notification denied by repository policy').pipe(
@@ -168,6 +177,33 @@ const processBySource: Record<
       // ! audit row would not be.
       if (enqueued.inserted && work.context !== undefined) {
         yield* acknowledge(work, work.context, enqueued.jobId);
+      }
+
+      // ! Armed by triggering turns only, never by continuations: an untrusted
+      // ! reply extends nobody's window, or one stranger could keep a thread
+      // ! open to every stranger forever.
+      // ! Best-effort like the acknowledgement above — the job is already
+      // ! durably committed, so a failed arming must not burn the delivery's
+      // ! attempt budget on work that exists; the next trusted trigger on this
+      // ! thread re-arms instead.
+      if (enqueued.inserted && work.continuation !== true && work.context !== undefined) {
+        yield* queue
+          .markLive({
+            repository: work.repository,
+            subjectKind: work.subject.kind,
+            subjectNumber: work.subject.number,
+            expiresAt: Date.now() + policy.livenessMs,
+          })
+          .pipe(
+            Effect.catchAll((error) =>
+              Effect.logWarning('Could not arm the thread live window').pipe(
+                Effect.annotateLogs({
+                  job: enqueued.jobId,
+                  reason: describeCause(Cause.fail(error)),
+                }),
+              ),
+            ),
+          );
       }
     }),
 };

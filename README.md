@@ -103,9 +103,22 @@ clone = "allowed"
 [repositories.overrides."edloidas/lictor".capabilities]
 read = true
 comment = true
+issues = true
 branches = true
 pullRequests = true
+merge = true
 ```
+
+Repositories in `allow` are the ones you control: they earn the environment
+sender list and the full capability set. Every other repository she can see is
+accepted at a capped third-party tier — `read` and `comment` only, execution
+under approval, cloning denied — unless an explicit override says otherwise, so
+a stranger's prompt injection is bounded to "posts a comment after a human
+approved it." A deny pattern still subtracts everywhere.
+
+Sender trust is per repository: `[defaults].senders` replaces the environment
+list everywhere, and `[repositories.overrides."repo"].senders` replaces it for
+one repository. The environment list applies only to owned repositories.
 
 Read and comment let her investigate and reply; `branches` and `pullRequests`
 let her ship code changes — branch, commit, open a pull request, continue on a
@@ -113,12 +126,17 @@ branch she already started for that subject. Assignment and review-request
 notifications are acted on when the assigner or requester is a trusted sender;
 grant `issues` for closing, labelling, and editing, and `merge` where the
 repository's policy allows it. `forcePush` and `deleteBranches` stay denied
-unless a specific repository asks for them. Commits always carry the daemon
-account's identity: agent-supplied `author`/`committer` fields are stripped,
-and every git subprocess invocation is audited beside the broker calls, so the
-credential has no unaudited use. Tool discovery is scoped the same way: a
-capability denied by policy is invisible to the agent, not merely refused at
-call time.
+unless a specific repository asks for them.
+
+A trusted trigger opens its thread's live window (`[limits].livenessHours`,
+default 24): while it is open — and the subject remains open — replies from any
+participant continue the work as *continuation turns*, which never reach
+`merge`, `forcePush`, or `deleteBranches` even where policy grants them.
+Commits always carry the daemon account's identity: agent-supplied
+`author`/`committer` fields are stripped, and every git subprocess invocation
+is audited beside the broker calls, so the credential has no unaudited use.
+Tool discovery is scoped the same way: a capability denied by policy is
+invisible to the agent, not merely refused at call time.
 
 When cloning is allowed, Lictor passes the token to Git as an `Authorization`
 header injected per command, without storing it in the remote URL or credential
