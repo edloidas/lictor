@@ -76,6 +76,7 @@ const run = <A, E>(
       failedRetentionDays: 90,
       maxQueueDepth: 1000,
       maxJobAgeMs: 86_400_000,
+      livenessMs: 24 * 60 * 60 * 1000,
       forRepository: (repository) => ({
         repository,
         accepted: true,
@@ -83,6 +84,7 @@ const run = <A, E>(
         clone: 'denied',
         maxAttempts: 3,
         maxDurationMs: 30 * 60 * 1000,
+        trustedSenders: ['edloidas'],
         capabilities: {
           read: true,
           comment: false,

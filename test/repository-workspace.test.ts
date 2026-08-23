@@ -27,6 +27,7 @@ const policy = (clone: 'allowed' | 'denied' = 'denied'): RepositoryPolicy => ({
   execution: 'automatic',
   clone,
   maxAttempts: 3,
+  trustedSenders: ['edloidas'],
   maxDurationMs: 30 * 60 * 1000,
   capabilities: {
     read: true,

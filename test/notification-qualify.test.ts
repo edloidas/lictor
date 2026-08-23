@@ -939,4 +939,93 @@ describe('qualifyNotification', () => {
     expect(work?.sender).toBe('edloidas');
     expect(work?.reasons).toEqual(['assigned']);
   });
+
+  // ! The whole point of liveness: a reply this policy does not trust keeps the
+  // ! work going inside the armed window, at continuation strength.
+  it('continues live work from an untrusted non-mentioning reply', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        live: true,
+      }),
+      issueRoutes(issue(), [
+        comment({ id: 200, user: { login: 'stranger' }, body: 'the fix goes in src/x.ts' }),
+      ]),
+    );
+
+    const work = qualified(result.exit).work;
+    expect(work?.sender).toBe('stranger');
+    expect(work?.reasons).toEqual(['continued']);
+    expect(work?.continuation).toBe(true);
+    expect(work?.context).toEqual({ kind: 'issue_comment', id: 200 });
+  });
+
+  it('ignores an untrusted reply when the thread is not live', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        live: false,
+      }),
+      issueRoutes(issue(), [
+        comment({ id: 200, user: { login: 'stranger' }, body: 'the fix goes in src/x.ts' }),
+      ]),
+    );
+
+    expect(qualified(result.exit).work).toBeUndefined();
+  });
+
+  // ! A closed subject ends the conversation regardless of the stored window:
+  // ! the work is done and nobody should be able to reopen it by commenting.
+  // ! A trusted trigger outranks any continuation, whatever the timestamps: a
+  // ! stranger's later comment must not demote a trusted command to a stripped
+  // ! continuation turn.
+  it('keeps a trusted mention authoritative when an untrusted reply is newer', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: Date.parse('2026-08-21T09:00:00Z'),
+        live: true,
+      }),
+      issueRoutes(issue(), [
+        comment({ created_at: '2026-08-21T10:00:00Z' }),
+        comment({
+          id: 200,
+          user: { login: 'stranger' },
+          body: 'btw unrelated',
+          created_at: '2026-08-21T10:05:00Z',
+          updated_at: '2026-08-21T10:05:00Z',
+        }),
+      ]),
+    );
+
+    const work = qualified(result.exit).work;
+    expect(work?.sender).toBe('edloidas');
+    expect(work?.reasons).toEqual(['mentioned']);
+    expect(work?.continuation).toBeUndefined();
+  });
+
+  it('stops continuing once the subject is closed', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        live: true,
+      }),
+      issueRoutes(issue({ state: 'closed' }), [
+        comment({ id: 200, user: { login: 'stranger' }, body: 'please also do X' }),
+      ]),
+    );
+
+    expect(qualified(result.exit).work).toBeUndefined();
+  });
 });

@@ -2,21 +2,25 @@ import { describe, expect, test } from 'bun:test';
 import { Effect } from 'effect';
 import { PolicyError, parsePolicy } from '../src/policy.ts';
 
-const parse = (source: string) => Effect.runPromise(parsePolicy(source));
+const parse = (source: string, senders: readonly string[] = []) =>
+  Effect.runPromise(parsePolicy(source, senders));
 
 describe('repository automation policy', () => {
   test('uses safe capability and retention defaults', async () => {
     const policy = await parse('');
     const repository = policy.forRepository('Edloidas/Lictor');
 
+    // ! An unlisted repository is the third-party tier: accepted, but capped at
+    // ! read and comment under approval execution, so joining one (#29) arms
+    // ! nothing a human does not approve.
     expect(repository).toEqual({
       repository: 'edloidas/lictor',
-      accepted: false,
-      execution: 'automatic',
+      accepted: true,
+      execution: 'approval',
       clone: 'denied',
       capabilities: {
         read: true,
-        comment: false,
+        comment: true,
         issues: false,
         branches: false,
         pullRequests: false,
@@ -25,6 +29,7 @@ describe('repository automation policy', () => {
         deleteBranches: false,
         scripts: [],
       },
+      trustedSenders: [],
       maxAttempts: 3,
       maxDurationMs: 30 * 60 * 1000,
     });
@@ -32,20 +37,74 @@ describe('repository automation policy', () => {
     expect(policy.failedRetentionDays).toBe(90);
     expect(policy.maxQueueDepth).toBe(10_000);
     expect(policy.maxJobAgeMs).toBe(24 * 60 * 60 * 1000);
+    expect(policy.livenessMs).toBe(24 * 60 * 60 * 1000);
   });
 
-  test('accepts only repositories named exactly, with deny precedence', async () => {
+  test('reserves the environment sender list for owned repositories', async () => {
+    const policy = await parse(
+      `
+[repositories]
+allow = ["edloidas/lictor"]
+`,
+      ['operator'],
+    );
+
+    expect(policy.forRepository('edloidas/lictor').trustedSenders).toEqual(['operator']);
+    expect(policy.forRepository('other/repository').trustedSenders).toEqual([]);
+  });
+
+  test('policy sender lists replace the environment list', async () => {
+    const policy = await parse(
+      `
+[defaults]
+senders = ["teammate"]
+
+[repositories]
+allow = ["edloidas/lictor"]
+
+[repositories.overrides."edloidas/lictor"]
+senders = ["maintainer"]
+`,
+      ['operator'],
+    );
+
+    expect(policy.forRepository('edloidas/lictor').trustedSenders).toEqual(['maintainer']);
+    expect(policy.forRepository('edloidas/other').trustedSenders).toEqual(['teammate']);
+  });
+
+  test('an explicit override lifts the third-party cap', async () => {
     const policy = await parse(`
+[repositories.overrides."other/repository"]
+execution = "automatic"
+
+[repositories.overrides."other/repository".capabilities]
+branches = true
+`);
+
+    const repository = policy.forRepository('other/repository');
+    expect(repository.accepted).toBe(true);
+    expect(repository.execution).toBe('automatic');
+    expect(repository.capabilities.branches).toBe(true);
+  });
+
+  test('ownership is exact and deny always wins', async () => {
+    const policy = await parse(
+      `
 [repositories]
 allow = ["Edloidas/Lictor", "team/platform-api", "team/archive-api"]
 deny = ["team/archive-*"]
-`);
+`,
+      ['operator'],
+    );
 
-    expect(policy.forRepository('EDLOIDAS/LICTOR').accepted).toBe(true);
-    expect(policy.forRepository('team/platform-api').accepted).toBe(true);
+    // ! Unlisted repositories stay accepted at the third-party tier; what the
+    // ! exact names decide is ownership, and with it the environment trust
+    // ! default and the full capability set.
+    expect(policy.forRepository('EDLOIDAS/LICTOR').trustedSenders).toEqual(['operator']);
+    expect(policy.forRepository('team/platform-api').trustedSenders).toEqual(['operator']);
     expect(policy.forRepository('team/archive-api').accepted).toBe(false);
-    expect(policy.forRepository('edloidas/lictor-docs').accepted).toBe(false);
-    expect(policy.forRepository('other/repository').accepted).toBe(false);
+    expect(policy.forRepository('edloidas/lictor-docs').accepted).toBe(true);
+    expect(policy.forRepository('other/repository').accepted).toBe(true);
   });
 
   test.each([

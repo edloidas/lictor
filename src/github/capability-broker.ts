@@ -273,13 +273,22 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
           }
           const repositoryPolicy = policy.forRepository(expectedRepository);
           const capability = capabilities[request.name];
+          // ! A continuation turn inherits its authority from the trigger that
+          // ! armed liveness, so it never reaches the escalation capabilities
+          // ! even where repository policy grants them to the operator.
+          const narrowed = job.work.continuation === true;
           const forcePushDenied =
-            request.name === 'update_branch' &&
-            request.input.force === true &&
-            repositoryPolicy.capabilities.forcePush !== true;
+            (request.name === 'update_branch' &&
+              request.input.force === true &&
+              repositoryPolicy.capabilities.forcePush !== true) ||
+            (narrowed && request.name === 'update_branch' && request.input.force === true);
           if (
             !repositoryPolicy.accepted ||
             repositoryPolicy.capabilities[capability] !== true ||
+            (narrowed &&
+              (capability === 'merge' ||
+                capability === 'forcePush' ||
+                capability === 'deleteBranches')) ||
             forcePushDenied
           ) {
             return yield* new CapabilityError({
@@ -469,9 +478,21 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
     // ! Discovery is scoped to the job's repository policy, so the agent never
     // ! sees a tool it could only ever fail: offering `merge_pull_request` to
     // ! a read+comment repository invites attempts whose denial is the feature.
-    const visibleTools = (repository: string) => {
+    const visibleTools = (repository: string, narrowed: boolean) => {
       const granted = policy.forRepository(repository.toLowerCase()).capabilities;
-      return listTools.filter((tool) => granted[capabilities[tool.name]] === true);
+      // ! Continuation turns inherit their authority from the trigger that armed
+      // ! liveness, so the escalation capabilities stay invisible — denied means
+      // ! unseen, not merely refused at call time.
+      return listTools.filter(
+        (tool) =>
+          granted[capabilities[tool.name]] === true &&
+          !(
+            narrowed &&
+            (capabilities[tool.name] === 'merge' ||
+              capabilities[tool.name] === 'forcePush' ||
+              capabilities[tool.name] === 'deleteBranches')
+          ),
+      );
     };
 
     const handleMcp = (
@@ -511,7 +532,7 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
               tools:
                 job === undefined || job.status !== 'running'
                   ? []
-                  : visibleTools(job.work.repository),
+                  : visibleTools(job.work.repository, job.work.continuation === true),
             },
           }),
         );

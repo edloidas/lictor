@@ -785,4 +785,25 @@ describe('WorkQueue', () => {
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  it('arms liveness per subject and reports it only inside the window', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.markLive({
+          repository: 'edloidas/lictor',
+          subjectKind: 'issue',
+          subjectNumber: 17,
+          expiresAt: (yield* Clock.currentTimeMillis) + 60_000,
+        });
+        const live = yield* queue.livenessFor('edloidas/lictor', 'issue', 17);
+        // ! Case-insensitive on the repository, like every other name compare.
+        const liveCanonical = yield* queue.livenessFor('EDLOIDAS/LICTOR', 'issue', 17);
+        const expired = yield* queue.livenessFor('edloidas/lictor', 'issue', 18);
+        return { live, liveCanonical, expired };
+      }),
+    );
+
+    expect(result).toEqual({ live: true, liveCanonical: true, expired: false });
+  });
 });
