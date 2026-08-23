@@ -10,9 +10,13 @@ const reactionPath = (repository: string, target: ContextRef): string => {
       return `/repos/${repository}/issues/comments/${target.id}/reactions`;
     case 'review_comment':
       return `/repos/${repository}/pulls/comments/${target.id}/reactions`;
-    // ! A review reacts on the pull request. GitHub has no reactions endpoint for
-    // ! a review, so this is the only place the acknowledgement can land.
+    // ! A review, an assignment, and a review request all react on the issue or
+    // ! pull request itself. GitHub has no reactions endpoint for a review, and
+    // ! a timeline event has no resource of its own to acknowledge — the subject
+    // ! is the only place the acknowledgement can land.
     case 'review':
+    case 'assigned':
+    case 'review_requested':
     case 'body':
       return `/repos/${repository}/issues/${target.number}/reactions`;
   }

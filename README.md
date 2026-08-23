@@ -106,12 +106,16 @@ pullRequests = true
 
 Read and comment let her investigate and reply; `branches` and `pullRequests`
 let her ship code changes — branch, commit, open a pull request, continue on a
-branch she already started for that subject. `merge` and `issues` stay denied
-until assignment handling is trusted. Commits always carry the daemon account's
-identity: agent-supplied `author`/`committer` fields are stripped, and every git
-subprocess invocation is audited beside the broker calls, so the credential has
-no unaudited use. Tool discovery is scoped the same way: a capability denied by
-policy is invisible to the agent, not merely refused at call time.
+branch she already started for that subject. Assignment and review-request
+notifications are acted on when the assigner or requester is a trusted sender;
+grant `issues` for closing, labelling, and editing, and `merge` where the
+repository's policy allows it. `forcePush` and `deleteBranches` stay denied
+unless a specific repository asks for them. Commits always carry the daemon
+account's identity: agent-supplied `author`/`committer` fields are stripped,
+and every git subprocess invocation is audited beside the broker calls, so the
+credential has no unaudited use. Tool discovery is scoped the same way: a
+capability denied by policy is invisible to the agent, not merely refused at
+call time.
 
 When cloning is allowed, Lictor passes the token to Git as an `Authorization`
 header injected per command, without storing it in the remote URL or credential

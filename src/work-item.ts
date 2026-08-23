@@ -25,6 +25,14 @@ export type ContextRef =
    * ! replay of the first.
    */
   | { readonly kind: 'review'; readonly id: number; readonly number: number }
+  /**
+   * ! An assignment or review request carries the timeline event's id for the
+   * ! same reason a review does: two assignments in one window are two jobs,
+   * ! not a replay. Both react on the issue itself — there is nothing else to
+   * ! acknowledge.
+   */
+  | { readonly kind: 'assigned'; readonly id: number; readonly number: number }
+  | { readonly kind: 'review_requested'; readonly id: number; readonly number: number }
   | { readonly kind: 'body'; readonly number: number };
 
 export type WorkItem = {
@@ -49,6 +57,12 @@ export const ContextRefSchema: Schema.Schema<ContextRef> = Schema.Union(
   Schema.Struct({ kind: Schema.Literal('issue_comment'), id: Schema.Number }),
   Schema.Struct({ kind: Schema.Literal('review_comment'), id: Schema.Number }),
   Schema.Struct({ kind: Schema.Literal('review'), id: Schema.Number, number: Schema.Number }),
+  Schema.Struct({ kind: Schema.Literal('assigned'), id: Schema.Number, number: Schema.Number }),
+  Schema.Struct({
+    kind: Schema.Literal('review_requested'),
+    id: Schema.Number,
+    number: Schema.Number,
+  }),
   Schema.Struct({ kind: Schema.Literal('body'), number: Schema.Number }),
 );
 
