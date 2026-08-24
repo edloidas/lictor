@@ -51,8 +51,8 @@ const thread = (id: string, updatedAt = '2026-08-21T10:00:00Z') => ({
   repository: { full_name: 'edloidas/lictor' },
 });
 
-// ! `setUrlParams` is serialized at execution time, so `request.url` carries no
-// ! query string — a matcher looking for one routes every list call elsewhere.
+// `setUrlParams` is serialized at execution time, so `request.url` carries no
+// query string — a matcher looking for one routes every list call elsewhere.
 const isList = (url: string): boolean =>
   url.includes('/notifications') && !url.includes('/notifications/threads');
 
@@ -126,10 +126,10 @@ const run = (
                 ...(options.inviters === undefined ? {} : { autoAcceptInviters: options.inviters }),
               }),
             );
-            // ! The store is recorded into the same log as the HTTP calls, because
-            // ! the invariant this suite exists to protect is an *ordering* — a
-            // ! count of PATCHes cannot tell store-then-mark from mark-then-store,
-            // ! and swapping the two lines in the poller left every test green.
+            // The store is recorded into the same log as the HTTP calls, because
+            // the invariant this suite exists to protect is an *ordering* — a
+            // count of PATCHes cannot tell store-then-mark from mark-then-store,
+            // and swapping the two lines in the poller left every test green.
             const QueueLive = Layer.effect(
               WorkQueue,
               Effect.map(WorkQueue, (queue) =>
@@ -233,20 +233,20 @@ describe('NotificationPoller', () => {
     expect(result.backlog).toBe(2);
   });
 
-  // ! The whole point of the synthetic delivery id. GitHub replays a thread
-  // ! whenever it gains activity, and re-reading one already stored must not
-  // ! create a second inbox row.
+  // The whole point of the synthetic delivery id. GitHub replays a thread
+  // whenever it gains activity, and re-reading one already stored must not
+  // create a second inbox row.
   it('is idempotent across sweeps for the same thread activity', async () => {
     const result = await run([{ body: [thread('1')] }], { sweeps: 2 });
 
     expect(result.backlog).toBe(1);
   });
 
-  // ! Stored, not filtered. `reason` describes the thread, not the activity that
-  // ! just landed on it: GitHub does not re-key an already-unread `assign` thread
-  // ! when a trusted mention arrives on it. Skipping on `reason` here would mark
-  // ! it read with nothing durable behind it and lose the mention on both sides,
-  // ! so the drop happens at qualification, where the row survives to say so.
+  // Stored, not filtered. `reason` describes the thread, not the activity that
+  // just landed on it: GitHub does not re-key an already-unread `assign` thread
+  // when a trusted mention arrives on it. Skipping on `reason` here would mark
+  // it read with nothing durable behind it and lose the mention on both sides,
+  // so the drop happens at qualification, where the row survives to say so.
   it('stores a thread whose reason this phase does not act on', async () => {
     const result = await run([{ body: [{ ...thread('1'), reason: 'assign' }, thread('2')] }]);
 
@@ -255,10 +255,10 @@ describe('NotificationPoller', () => {
     expect(result.backlog).toBe(2);
   });
 
-  // ! The code's own reason for sending `If-Modified-Since` on page 1 only: a
-  // ! later page answering 304 must not read as end-of-list, because the cursor
-  // ! would then advance past threads nobody fetched and the next poll answers
-  // ! 304 forever.
+  // The code's own reason for sending `If-Modified-Since` on page 1 only: a
+  // later page answering 304 must not read as end-of-list, because the cursor
+  // would then advance past threads nobody fetched and the next poll answers
+  // 304 forever.
   it('does not advance the cursor when a later page answers 304', async () => {
     const firstPage = Array.from({ length: 50 }, (_, index) => thread(String(index + 1)));
     const result = await run([
@@ -297,8 +297,8 @@ describe('NotificationPoller', () => {
     expect(result.outcomes[0]?.waitMs).toBe(120_000);
   });
 
-  // ! The floor is a floor, not a target. A header shorter than it — or a header
-  // ! GitHub omits — must not turn the loop into a spin.
+  // The floor is a floor, not a target. A header shorter than it — or a header
+  // GitHub omits — must not turn the loop into a spin.
   it('never waits less than the configured floor', async () => {
     const result = await run([{ body: [], headers: { 'x-poll-interval': '1' } }], {
       notificationPollMs: 30_000,
@@ -307,9 +307,9 @@ describe('NotificationPoller', () => {
     expect(result.outcomes[0]?.waitMs).toBe(30_000);
   });
 
-  // ! The whole durability guarantee, and the replacement for the webhook 202.
-  // ! Until the mark lands GitHub still owns the item; mark first and a crash
-  // ! between the two loses it outright.
+  // The whole durability guarantee, and the replacement for the webhook 202.
+  // Until the mark lands GitHub still owns the item; mark first and a crash
+  // between the two loses it outright.
   it('commits the row before marking the thread read', async () => {
     const result = await run([{ body: [thread('1')] }]);
 
@@ -323,10 +323,10 @@ describe('NotificationPoller', () => {
     expect(mark).toBeGreaterThan(store);
   });
 
-  // ! A refused PATCH must defer the sweep. The row is already committed, so
-  // ! nothing durable is lost — but advancing the cursor over a thread that is
-  // ! still unread turns the next poll into a 304, and the thread is never listed
-  // ! again until fresh activity lands on it.
+  // A refused PATCH must defer the sweep. The row is already committed, so
+  // nothing durable is lost — but advancing the cursor over a thread that is
+  // still unread turns the next poll into a 304, and the thread is never listed
+  // again until fresh activity lands on it.
   it('does not advance the cursor when marking a thread read fails', async () => {
     const result = await run(
       [{ body: [thread('1')], headers: { 'last-modified': 'Thu, 21 Aug 2026 10:00:00 GMT' } }],
@@ -338,9 +338,9 @@ describe('NotificationPoller', () => {
     expect(result.cursor).toBeUndefined();
   });
 
-  // ! A credential GitHub refuses does not heal, and repeating it every minute
-  // ! buries the one log line that says why nothing is happening. The second
-  // ! sweep must make no request at all.
+  // A credential GitHub refuses does not heal, and repeating it every minute
+  // buries the one log line that says why nothing is happening. The second
+  // sweep must make no request at all.
   it('suspends permanently on a 401 and stops calling GitHub', async () => {
     const result = await run([{ status: 401, body: { message: 'Bad credentials' } }], {
       sweeps: 3,
@@ -358,9 +358,9 @@ describe('NotificationPoller', () => {
     expect(result.outcomes[0]?.waitMs).toBe(300_000);
   });
 
-  // ! Marking read past the depth limit hands the overflow nowhere to sit:
-  // ! GitHub forgets the thread and `enqueue` refuses it a stage later. Leaving
-  // ! it unread is what makes GitHub the buffer.
+  // Marking read past the depth limit hands the overflow nowhere to sit:
+  // GitHub forgets the thread and `enqueue` refuses it a stage later. Leaving
+  // it unread is what makes GitHub the buffer.
   it('stores nothing and marks nothing read once the queue is full', async () => {
     const full = await run([{ body: [thread('1'), thread('2'), thread('3')] }], {
       maxQueueDepth: 2,
@@ -372,9 +372,9 @@ describe('NotificationPoller', () => {
     expect(marks(full.calls)).toHaveLength(2);
   });
 
-  // ! A deferred sweep must not advance the cursor. Advancing it turns the next
-  // ! poll into a 304 and the threads deliberately left unread are never
-  // ! fetched again.
+  // A deferred sweep must not advance the cursor. Advancing it turns the next
+  // poll into a 304 and the threads deliberately left unread are never
+  // fetched again.
   it('leaves the cursor alone when a sweep is deferred', async () => {
     const result = await run(
       [
@@ -390,9 +390,9 @@ describe('NotificationPoller', () => {
     expect(result.cursor).toBeUndefined();
   });
 
-  // ! The row is already durable, so a refused mark-read is a cosmetic problem
-  // ! only: the thread stays bold in her inbox and the next sweep upserts the
-  // ! same synthetic id. Failing the sweep here would lose the sweep instead.
+  // The row is already durable, so a refused mark-read is a cosmetic problem
+  // only: the thread stays bold in her inbox and the next sweep upserts the
+  // same synthetic id. Failing the sweep here would lose the sweep instead.
   it('keeps going when marking a thread read fails', async () => {
     const result = await run([{ body: [thread('1')] }], { markReadStatus: 500 });
 
@@ -424,7 +424,7 @@ describe('NotificationPoller', () => {
     });
 
     expect(result.accepted?._tag).toBe('Right');
-    // ! Case-insensitive on the inviter, like every other login comparison.
+    // Case-insensitive on the inviter, like every other login comparison.
     expect(accepts(result.calls)).toHaveLength(2);
     expect(result.calls.some((call) => call.includes('/repository_invitations/2'))).toBe(false);
   });
@@ -450,9 +450,9 @@ describe('NotificationPoller', () => {
     expect(accepts(result.calls)).toHaveLength(0);
   });
 
-  // ! A refused credential suspends notification polling globally through the
-  // ! shared ref — the invitation pass must trip that same wire, or it keeps
-  // ! calling GitHub every cadence after the sweep went quiet.
+  // A refused credential suspends notification polling globally through the
+  // shared ref — the invitation pass must trip that same wire, or it keeps
+  // calling GitHub every cadence after the sweep went quiet.
   it('suspends on a 401 from the invitation list', async () => {
     const result = await run([{ body: [thread('1')] }], {
       inviters: ['edloidas'],
@@ -461,7 +461,7 @@ describe('NotificationPoller', () => {
     });
 
     expect(result.calls.some((call) => call.includes('/user/repository_invitations'))).toBe(true);
-    // ! The sweep that follows the suspension must not reach GitHub at all.
+    // The sweep that follows the suspension must not reach GitHub at all.
     expect(result.calls.some((call) => isList(call))).toBe(false);
   });
 });

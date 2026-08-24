@@ -200,8 +200,8 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
     const github = yield* GitHubClient;
     const identity = yield* GitHubIdentity;
     const health = yield* CredentialHealth;
-    // ! Resolved per call rather than at construction, so building the broker
-    // ! costs no network. The first call pays for the probe; the rest share it.
+    // Resolved per call, not construction: building the broker costs no network;
+    // the first call pays for the probe.
     const actor = identity.verified.pipe(
       Effect.map(({ login }) => login),
       Effect.mapError(
@@ -273,9 +273,8 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
           }
           const repositoryPolicy = policy.forRepository(expectedRepository);
           const capability = capabilities[request.name];
-          // ! A continuation turn inherits its authority from the trigger that
-          // ! armed liveness, so it never reaches the escalation capabilities
-          // ! even where repository policy grants them to the operator.
+          // A continuation inherits its authority from the arming trigger: it
+          // never reaches escalation capabilities however generous policy is.
           const narrowed = job.work.continuation === true;
           const forcePushDenied =
             (request.name === 'update_branch' &&
@@ -341,9 +340,9 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
               : HttpClientRequest.bodyUnsafeJson(baseRequest, body);
           const response = yield* client.execute(httpRequest);
           if (response.status < 200 || response.status >= 300) {
-            // ! An installation token healed by re-minting; a revoked PAT never
-            // ! does. Collapsing a 401 into a generic failure spends every
-            // ! remaining attempt, and each one costs a full clone cycle.
+            // An installation token heals by re-minting; a revoked PAT never
+            // does. Collapsing a 401 into a generic failure spends every attempt,
+            // each one a full clone cycle.
             if (response.status === 401) {
               yield* health.suspend;
               return yield* new CapabilityError({
@@ -354,12 +353,9 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
                   : { cause: quotaNote(response.headers) }),
               });
             }
-            // ! A 429 is definitive on its own; a 403 also means "forbidden", so
-            // ! it needs evidence. Headers are the first source, the body the
-            // ! second: a secondary rate limit — the realistic tripwire for an
-            // ! agent creating content — is documented to answer 403 with
-            // ! neither rate header. Dropping either case into the generic branch
-            // ! tells the agent to retry at once against a closed bucket.
+            // A 429 is definitive alone; 403 needs evidence — headers first,
+            // prose second (a secondary limit answers with neither rate header).
+            // Retrying either against a closed bucket is a retry storm.
             const hinted =
               response.status === 403 || response.status === 429
                 ? retryAfterMs(response.headers, yield* Clock.currentTimeMillis)
@@ -367,8 +363,8 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
             const secondary =
               response.status === 403 &&
               hinted === undefined &&
-              // ! An exhausted bucket reported without a reset time is still an
-              // ! exhausted bucket, and a secondary limit says so only in prose.
+              // No reset time still means exhausted; secondary limits say so only
+              // in prose.
               (response.headers['x-ratelimit-remaining'] === '0' ||
                 isSecondaryRateLimit(yield* Effect.orElseSucceed(response.text, () => '')));
             const wait =
@@ -414,10 +410,8 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
               })
               .pipe(Effect.zipRight(Effect.fail(error))),
           onSuccess: (result) =>
-            // ! A branch she created outlives the session, so its name is
-            // ! durable state, not a log line: the next interaction with this
-            // ! subject clones onto it and continues the work. Recording must
-            // ! never fail an already-successful call.
+            // A branch she created outlives the session — durable state the next
+            // interaction continues from, never failed after a successful call.
             (request.name === 'create_branch' &&
             typeof request.input.ref === 'string' &&
             request.input.ref.startsWith('refs/heads/')
@@ -475,14 +469,12 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
       },
     }));
 
-    // ! Discovery is scoped to the job's repository policy, so the agent never
-    // ! sees a tool it could only ever fail: offering `merge_pull_request` to
-    // ! a read+comment repository invites attempts whose denial is the feature.
+    // Discovery is scoped to the job's repository policy: offering a tool that
+    // could only ever fail invites attempts whose denial is the feature.
     const visibleTools = (repository: string, narrowed: boolean) => {
       const granted = policy.forRepository(repository.toLowerCase()).capabilities;
-      // ! Continuation turns inherit their authority from the trigger that armed
-      // ! liveness, so the escalation capabilities stay invisible — denied means
-      // ! unseen, not merely refused at call time.
+      // Escalation capabilities stay invisible on continuations: denied means
+      // unseen, not merely refused at call time.
       return listTools.filter(
         (tool) =>
           granted[capabilities[tool.name]] === true &&
@@ -566,11 +558,9 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
           input,
         }),
         {
-          // ! The code stays the whole contract, because that is what the agent
-          // ! branches on. `data` appears only when there is something the agent
-          // ! can act on that the code cannot carry: telling it the bucket is
-          // ! closed without telling it for how long leaves it to guess, and its
-          // ! guess is a retry storm.
+          // The code is the whole contract — what the agent branches on. `data`
+          // carries only what the code cannot: a closed bucket without a wait
+          // leaves the agent guessing, and its guess is a retry storm.
           onFailure: (error) => ({
             jsonrpc: '2.0' as const,
             id: request.id,

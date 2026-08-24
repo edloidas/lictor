@@ -51,16 +51,8 @@ type PollOutcome = {
 /**
  * Polls `GET /notifications` and commits what arrives to the durable inbox.
  *
- * The only transport. A repository webhook needs admin on the repository, so it
- * is scoped to whatever the operator can administer rather than to what the
- * account can reach — the opposite of the requirement. Notifications reach
- * exactly as far as her membership graph does.
- *
- * A thread is marked read only after its row is committed, which is what the
- * webhook route's 202 used to mean. It is a stronger guarantee than webhooks
- * gave: a crash before the mark leaves the item with GitHub, where the next
- * sweep finds it, whereas a webhook delivery that failed needed a manual
- * redelivery inside thirty days.
+ * A thread is marked read only after its row is committed: a crash before the
+ * mark leaves the item with GitHub, where the next sweep finds it.
  */
 export class NotificationPoller extends Effect.Service<NotificationPoller>()('NotificationPoller', {
   effect: Effect.gen(function* () {
@@ -68,23 +60,21 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
     const github = yield* GitHubClient;
     const queue = yield* WorkQueue;
     const policy = yield* Policy;
-    const health = yield* CredentialHealth;
-
     /**
      * The daemon-wide credential latch. A 401 anywhere — this loop, a broker
      * call, a clone — suspends everything that talks to GitHub through one
      * shared ref instead of three private ones.
      */
-    // ! One sweep at a time. The loop is sequential on its own, but `pollOnce`
-    // ! is also callable directly, and two concurrent sweeps would each read
-    // ! the same threads and race on marking them read.
+    const health = yield* CredentialHealth;
+    // One sweep at a time: `pollOnce` is callable directly, and two concurrent
+    // sweeps would each read the same threads and race on marking them read.
     const gate = yield* Effect.makeSemaphore(1);
 
     const request = (page: number, lastModified: string | undefined) => {
       const base = HttpClientRequest.get('/notifications').pipe(
         HttpClientRequest.setUrlParams({ per_page: String(PAGE_SIZE), page: String(page) }),
       );
-      // ! Page 1 only — see the 304 branch in `sweep`.
+      // Page 1 only — see the 304 branch in `sweep`.
       return page === 1 && lastModified !== undefined
         ? HttpClientRequest.setHeader(base, 'if-modified-since', lastModified)
         : base;
@@ -96,21 +86,16 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
         const response = yield* client.execute(
           HttpClientRequest.patch(`/notifications/threads/${thread.id}`),
         );
-        // ! Any non-error status is success. GitHub answers this endpoint with a
-        // ! bare no-content code and the exact one is not worth encoding here; 304
-        // ! means someone else already read the thread and 404 means it is gone.
-        // ! None of the three is a reason to retry.
+        // Any non-error status is success; 304 means already read, 404 already
+        // gone — none of the three retries.
         if (response.status >= 400 && response.status !== 404) {
           return yield* new PollError({
             message: `Marking thread ${thread.id} read returned status ${response.status}`,
           });
         }
       }).pipe(
-        // ! Never fatal, and never silent either. The row is already committed,
-        // ! so a refused PATCH costs nothing durable — but it must be reported to
-        // ! the caller, because a sweep that advances the cursor over a thread
-        // ! still unread turns the next poll into a 304 and the thread is never
-        // ! listed again until fresh activity lands on it.
+        // ! Never fatal, never silent: if the sweep advances over a thread still
+        // ! unread, the next poll answers 304 and it is never listed again.
         Effect.catchAll((error) =>
           Effect.logWarning('Could not mark a notification thread read')
             .pipe(Effect.annotateLogs({ thread: thread.id, reason: error.message }))
@@ -123,10 +108,9 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
       const floor = config.notificationPollMs;
       if (yield* health.isRejected) return { waitMs: floor, stored: 0, deferred: false };
 
-      // ! Checked before anything is fetched, not after. The depth limit lives
-      // ! in `enqueue`, which runs a stage later — by then the thread is stored
-      // ! and marked read, and GitHub no longer holds the overflow. Refusing to
-      // ! sweep leaves it exactly where it can wait.
+      // ! Checked before anything is fetched: the depth check in `enqueue` runs
+      // ! a stage later, by which time the thread is stored, marked read, and no
+      // ! longer held by GitHub. Refusing to sweep leaves it where it can wait.
       let room = policy.maxQueueDepth - (yield* queue.backlog);
       if (room <= 0) {
         yield* Effect.logWarning('Deferring the notification sweep: the queue is full').pipe(
@@ -160,11 +144,9 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
           nextLastModified = response.headers['last-modified'];
         }
 
-        // ! End-of-list only on page 1. A later page answering 304 is
-        // ! indistinguishable from an empty page, so reading it as "no changes"
-        // ! would advance the cursor past threads nobody fetched — and every one
-        // ! of them has `updated_at` at or below the `Last-Modified` we just
-        // ! stored, so the next poll answers 304 and they never come back.
+        // ! End-of-list only on page 1: a later page answering 304 is
+        // ! indistinguishable from an empty page, and reading it as "no changes"
+        // ! advances past threads nobody ever fetches again.
         if (response.status === 304) {
           if (page > 1) truncated = true;
           break;
@@ -184,9 +166,7 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
             response.headers['x-ratelimit-remaining'] === '0' ||
             isSecondaryRateLimit(yield* Effect.orElseSucceed(response.text, () => ''));
           backoffMs = throttled ? (hinted ?? DEFAULT_THROTTLE_WAIT_MS) : floor;
-          // ! Truncated: pages after this one were never read, so the cursor
-          // ! must not advance over them.
-          truncated = true;
+          truncated = true; // pages after this were never read
           yield* Effect.logWarning('Backing off from notification polling').pipe(
             Effect.annotateLogs({
               status: response.status,
@@ -215,9 +195,8 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
               new PollError({ message: 'Notification list did not match its schema', cause }),
           ),
         );
-        // ! Keyed by thread id across pages. A thread that gained activity
-        // ! mid-sweep shifts position and can appear twice; without the map the
-        // ! second copy would be stored under a second synthetic id.
+        // Keyed by thread id across pages: a thread active mid-sweep shifts
+        // position and can appear twice.
         for (const thread of page_) threads.set(thread.id, thread);
         if (page_.length < PAGE_SIZE) break;
         if (page === PAGE_CEILING) truncated = true;
@@ -226,15 +205,9 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
       let stored = 0;
       let deferred = truncated;
       for (const thread of threads.values()) {
-        // ! Every thread is stored, including reasons this phase does not act on.
-        // ! Filtering on `reason` here would be cheaper, and is wrong: `reason`
-        // ! describes the *thread*, not the activity that just landed on it, and
-        // ! GitHub does not re-key an already-unread thread when a new kind of
-        // ! activity arrives. A thread that went unread as `assign` and then
-        // ! received a trusted mention still reports `assign` — skipping it here
-        // ! would mark it read with nothing durable behind it, and the mention
-        // ! would be gone from both sides. Qualification drops it a stage later
-        // ! instead, where the row survives to say so.
+        // Every thread is stored, reasons this phase ignores included: `reason`
+        // describes the thread, not the activity that landed (an exclusion list),
+        // so filtering here could mark read with nothing durable behind it.
         if (room <= 0) {
           deferred = true;
           yield* Effect.logWarning('Stopped the notification sweep: the queue filled up').pipe(
@@ -248,16 +221,15 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
           body: JSON.stringify(thread),
           source: 'notification',
         });
-        // ! After the row is committed, never before. This is what the 202 used
-        // ! to be: until the mark lands, GitHub still owns the item.
+        // ! After the row commits, never before: until the mark lands, GitHub
+        // ! still owns the item.
         if (!(yield* markRead(thread))) deferred = true;
         stored += 1;
         room -= 1;
       }
 
-      // ! Only a sweep that consumed everything it saw may advance the cursor.
-      // ! Advancing after an early stop turns the next poll into a 304 and the
-      // ! threads we deliberately left unread are never fetched again.
+      // ! Only a sweep that consumed everything it saw may advance the cursor:
+      // ! advancing early 304s away the threads we deliberately left unread.
       if (!deferred && nextLastModified !== undefined) {
         yield* queue.setPollerCursor(nextLastModified);
       }
@@ -268,9 +240,8 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
         );
       }
 
-      // ! A wait GitHub asked for beats both the header it advertises and the
-      // ! configured floor. Retrying sooner than a throttle said is what turns a
-      // ! throttle into a block.
+      // A wait GitHub asked for beats both the advertised header and the floor:
+      // retrying sooner than a throttle said turns a throttle into a block.
       return {
         waitMs: Math.max(backoffMs ?? requested ?? floor, floor),
         stored,
@@ -281,15 +252,9 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
     const pollOnce: Effect.Effect<PollOutcome, PollError | QueueError> = gate.withPermits(1)(sweep);
 
     /**
-     * Accepts pending repository invitations from the allow-list, and leaves
-     * everything else pending.
-     *
-     * Runs on this loop's cadence because it is the same account and the same
-     * credential: a sweep's 401 suspends this pass too, through the shared
-     * ref. A declined invitation is destroyed, so untrusted ones are only
-     * ever logged — a pending invitation is a useful signal that somebody is
-     * trying to add her somewhere. Joining a repository arms nothing: no
-     * policy entry exists for it until an operator writes one.
+     * Accepts pending repository invitations from the allow-list, leaves the
+     * rest pending (declining destroys them — a pending one is a useful signal).
+     * Shares this loop's credential, so a sweep's 401 suspends this pass too.
      */
     const acceptInvitations = Effect.gen(function* () {
       if (config.autoAcceptInviters.length === 0) return;
@@ -351,9 +316,7 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
           );
           continue;
         }
-        // ! Any non-error status is success. GitHub answers with a bare no-content
-        // ! code; 404 means someone already declined or withdrew it, which is not
-        // ! worth distinguishing here.
+        // Any non-error status is success; 404 means already declined/withdrawn.
         if (accepted.right.status < 200 || accepted.right.status >= 300) {
           yield* Effect.logWarning('Accepting a repository invitation failed').pipe(
             Effect.annotateLogs({ id: invitation.id, status: accepted.right.status }),
@@ -366,12 +329,9 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
       }
     });
 
-    /**
-     * ! `Effect.forever` runs the body before it ever sleeps, so the first
-     * ! sweep happens at startup. Waiting one interval first would lose the
-     * ! whole point of acknowledging fast — a mention would sit unanswered for
-     * ! a minute after every restart.
-     */
+    // `Effect.forever` runs the body before sleeping, so the first sweep happens
+    // at startup — waiting an interval would leave a mention unanswered for a
+    // minute after every restart.
     const run = Effect.forever(
       Effect.gen(function* () {
         const outcome = yield* pollOnce.pipe(
@@ -387,12 +347,9 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
               ),
           ),
         );
-        // ! After the sleep, not before: a backoff the sweep just accepted must
-        // ! cover this pass too — firing an unthrottled request into a declared
-        // ! backoff is what turns a throttle into a block.
+        // Sleep after the pass: a backoff the sweep accepted must cover this
+        // pass too, or we fire unthrottled into a declared backoff.
         yield* Effect.sleep(Duration.millis(outcome.waitMs));
-        // ! Never fatal: a failed pass costs one cadence, killing the loop costs
-        // ! polling itself.
         yield* acceptInvitations.pipe(
           Effect.catchAll((error) =>
             Effect.logWarning('Invitation acceptance failed').pipe(

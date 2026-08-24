@@ -50,8 +50,8 @@ describe('GitHubCredential', () => {
     );
   });
 
-  // ! git never parses a Bearer value and reports `invalid credentials`, which
-  // ! reads like a revoked token rather than a wrong scheme. Pin the scheme.
+  // git never parses a Bearer value and reports `invalid credentials`, which
+  // reads like a revoked token rather than a wrong scheme. Pin the scheme.
   it('never hands git a Bearer header', async () => {
     const header = await credential(Effect.flatMap(GitHubCredential, (self) => self.gitAuthHeader));
 
@@ -105,9 +105,9 @@ describe('GitHubClient', () => {
     expect(requests[0]?.headers['x-github-api-version']).toBe('2022-11-28');
   });
 
-  // ! A credential that refreshes must be re-read per request. Resolving it once
-  // ! per client looks identical with a static token and silently pins a stale
-  // ! one as soon as the credential rotates.
+  // A credential that refreshes must be re-read per request. Resolving it once
+  // per client looks identical with a static token and silently pins a stale
+  // one as soon as the credential rotates.
   it('re-reads the credential on every request through one client', async () => {
     const authorizations = await Effect.runPromise(
       Effect.gen(function* () {

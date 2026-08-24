@@ -37,18 +37,10 @@ export const isTerminalFailure = (
 type ProcessRequirements = GitHubClient | GitHubIdentity | LictorConfig | Policy | WorkQueue;
 
 /**
- * One decoder per stored-delivery source. Adding a producer means adding a
- * `DeliverySource` member and this map forces its decoder into existence —
- * nothing downstream assumes an envelope again.
- */
-/**
- * Reacts to the triggering comment, and records that it did.
- *
- * Strictly best-effort: every failure is logged and swallowed. This runs inside
- * the delivery worker, where a non-`QueueError` failure marks the delivery
- * permanently `failed` — so a reaction GitHub refused would throw away work that
- * is already durably queued and about to run. The eyes are a courtesy; the job
- * is the product.
+ * Eyes reaction on the triggering comment, and the audit row recording it.
+ * Strictly best-effort: a non-`QueueError` failure here marks the delivery
+ * permanently `failed`, so no reaction GitHub refused may throw away durably
+ * queued work.
  */
 const acknowledge = (work: WorkItem, context: ContextRef, jobId: number) =>
   Effect.gen(function* () {
@@ -96,27 +88,22 @@ const processBySource: Record<
     ProcessRequirements
   >
 > = {
+  /** One decoder per `DeliverySource`; the map forces each into existence. */
   notification: (stored) =>
     Effect.gen(function* () {
-      // ! `Effect.try`, not a bare `JSON.parse`. A throw inside `Effect.gen`
-      // ! is a defect, which none of the recovery branches below would see.
+      // ! A throw inside `Effect.gen` is a defect, which none of the recovery
+      // ! branches below would see — so `JSON.parse` goes through `Effect.try`.
       const raw = yield* Effect.try({
         try: () => JSON.parse(stored.body) as unknown,
         catch: (cause) => new InvalidStoredDelivery({ cause }),
       });
-      // ! A `ParseError` here is terminal, and correctly so: the body is one the
-      // ! poller serialized from a thread it had already decoded, so a shape this
-      // ! schema rejects fails identically on every retry. Enrichment failures
-      // ! are a different tag — see `NotificationError` — precisely so a GitHub
-      // ! 502 mid-qualification costs an attempt rather than the delivery.
       const thread = yield* decodeThread(raw);
       const identity = yield* GitHubIdentity;
       const { login } = yield* identity.verified;
       const queue = yield* WorkQueue;
       const policy = yield* Policy;
-      // ! Trust is resolved per repository, not globally: somebody trusted for
-      // ! one owner's repositories is not automatically trusted in an unrelated
-      // ! one she happens to have access to.
+      // Trust is resolved per repository, not globally: trusted for one owner's
+      // repositories is not trusted for every other one she can access.
       const threadPolicy = policy.forRepository(thread.repository.full_name);
       const cursorMs = yield* queue.notificationCursor(thread.id);
       const subject = subjectRef(thread);
@@ -131,9 +118,8 @@ const processBySource: Record<
         cursorMs,
         live,
       });
-      // ! Advanced only after the job is committed, never before. A cursor moved
-      // ! ahead of a failed `enqueue` makes the retry scan from the wrong anchor
-      // ! and miss the comment that caused the notification in the first place.
+      // ! Advanced only after the job commits, never before: a cursor moved
+      // ! past a failed `enqueue` loses the comment that caused it all.
       const advance = Number.isFinite(lastActivityAt)
         ? queue.advanceNotificationCursor(thread.id, lastActivityAt)
         : Effect.void;
@@ -171,21 +157,15 @@ const processBySource: Record<
         }),
       );
 
-      // ! Only on a fresh insert. `enqueue` reports `inserted: false` for a
-      // ! replayed notification, and reacting again would be a second write for
-      // ! work that already exists — GitHub's endpoint is idempotent, but the
-      // ! audit row would not be.
+      // Fresh inserts only: a replayed notification must not acknowledge twice.
       if (enqueued.inserted && work.context !== undefined) {
         yield* acknowledge(work, work.context, enqueued.jobId);
       }
 
       // ! Armed by triggering turns only, never by continuations: an untrusted
-      // ! reply extends nobody's window, or one stranger could keep a thread
-      // ! open to every stranger forever.
-      // ! Best-effort like the acknowledgement above — the job is already
-      // ! durably committed, so a failed arming must not burn the delivery's
-      // ! attempt budget on work that exists; the next trusted trigger on this
-      // ! thread re-arms instead.
+      // ! reply must not extend anyone's live window. Best-effort like the
+      // ! acknowledgement — the job is already committed, so arming must not
+      // ! burn the delivery's attempt budget.
       if (enqueued.inserted && work.continuation !== true && work.context !== undefined) {
         yield* queue
           .markLive({
@@ -223,27 +203,12 @@ export class DeliveryWorker extends Effect.Service<DeliveryWorker>()('DeliveryWo
         yield* queue.finishDelivery(stored.id, 'completed');
       });
       yield* process.pipe(
-        // ! A dead credential says nothing about the delivery, so it must not
-        // ! condemn one. `finishDelivery(..., 'failed')` is terminal — nothing
-        // ! recovers a `failed` row, not the startup reset and not the control
-        // ! plane — and the verdict is memoized, so without this the drain loop
-        // ! would burn through the whole durable inbox at SQLite speed while the
-        // ! shutdown signal is still propagating. Retry instead and let the
-        // ! deliveries outlive the misconfiguration that stalled them.
+        // ! A dead credential says nothing about the delivery, and `failed` is
+        // ! terminal and memoized — condemning one would destroy the whole inbox
+        // ! at SQLite speed while shutdown propagates. Retry instead.
         Effect.catchTag('GitHubIdentityError', (error) =>
-          // ! `false`, so the attempt budget never applies. With `true` this
-          // ! branch only *defers* the condemnation — `retryDelivery` flips the
-          // ! row to terminal `failed` once attempts reach the limit, and the
-          // ! drain loop reclaims the same delivery every cycle, so the whole
-          // ! inbox is destroyed a few passes later instead of immediately. The
-          // ! budget exists to stop one poisonous delivery retrying forever, and
-          // ! a credential the daemon cannot verify is not a property of any
-          // ! delivery. Same reasoning as the `QueueError` branch below.
           queue
             .retryDelivery(stored.id, String(error), false)
-            // ! A flat wait, not a backoff: this branch is not retry-counted at
-            // ! all, so there is no curve to climb — the pause only keeps the
-            // ! drain loop from spinning against a credential that cannot work.
             .pipe(Effect.zipRight(Effect.sleep(config.workerRetryBaseMs))),
         ),
         Effect.catchTag('QueueError', (error) =>
@@ -256,8 +221,7 @@ export class DeliveryWorker extends Effect.Service<DeliveryWorker>()('DeliveryWo
             .pipe(Effect.zipRight(backoff)),
         ),
         Effect.catchIf(isTerminalFailure, (error) =>
-          // ! `failed` is terminal, so something has to be logged here or the
-          // ! reason is lost: nothing downstream ever reads the row again.
+          // Terminal row: nothing reads it again, so log the reason here.
           Effect.logError('Delivery failed permanently').pipe(
             Effect.annotateLogs({
               delivery: stored.id,
@@ -269,16 +233,12 @@ export class DeliveryWorker extends Effect.Service<DeliveryWorker>()('DeliveryWo
             ),
           ),
         ),
-        // ! The catch-all retries rather than condemns. Only parse and schema
-        // ! failures are provably permanent, and those are named above; every
-        // ! other failure is presumed transient until proven otherwise. The
-        // ! attempt budget keeps a genuinely poisonous delivery from looping
-        // ! forever — `retryDelivery` flips it to terminal `failed` at the limit.
+        // Retry rather than condemn: only parse/schema failures are provably
+        // permanent (named above); the attempt budget stops the rest looping.
         Effect.catchAllCause((cause) =>
           Cause.isInterruptedOnly(cause)
             ? Effect.interrupt
-            : // ! Logged per retry or the reason is lost: the eventual terminal
-              // ! flip happens inside `retryDelivery` and writes only the row.
+            : // Logged per retry: the eventual terminal flip writes only the row.
               Effect.logWarning('Retrying failed delivery')
                 .pipe(
                   Effect.annotateLogs({

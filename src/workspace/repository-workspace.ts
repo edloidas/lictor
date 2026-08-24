@@ -29,15 +29,11 @@ export class WorkspaceError extends Data.TaggedError('WorkspaceError')<{
 const CREDENTIAL_REJECTED =
   /invalid credentials|authentication failed|could not read username|terminal prompts disabled/i;
 const ACCESS_DENIED = /write access to repository not granted/i;
-// ! Separate from access denial, because GitHub answers "not found" for a private
-// ! repository the credential cannot see. That is indistinguishable from a
-// ! repository that truly does not exist, and one of the two heals — on a token
-// ! rotation, an SSO authorization, or an invitation being accepted.
+// GitHub answers "not found" for a private repository the credential cannot
+// see — indistinguishable from a truly absent one, and one of the two heals.
 const REPOSITORY_UNAVAILABLE = /repository not found/i;
-// ! Git reports API throttling two ways: the prose GitHub writes on the
-// ! smart-HTTP channel, and the bare status the transport surfaces when there is
-// ! no prose at all. Only matching the first left the common case falling
-// ! through to a generic failure that retries on the short exponential base.
+// Git reports throttling two ways: prose on the smart-HTTP channel, and a bare
+// status when there is no prose. Only matching the first misses the common case.
 const RATE_LIMITED = /exceeded a secondary rate limit|rate limit exceeded|returned error: 429/i;
 
 /** Conservative wait when git reports throttling, which carries no reset header. */
@@ -55,8 +51,8 @@ const CREDENTIAL_ROTATION_WAIT_MS = 5 * 60 * 1000;
  */
 const DISK_PRESSURE_WAIT_MS = 15 * 60 * 1000;
 
-// ! 8 KiB truncates clone and fetch stderr exactly where TLS and credential
-// ! diagnostics live, which is precisely the prose `classifyGitFailure` reads.
+// 8 KiB truncates clone/fetch stderr right where TLS and credential
+// diagnostics live — exactly the prose `classifyGitFailure` reads.
 const OUTPUT_LIMIT_BYTES = 65_536;
 
 /**
@@ -70,11 +66,9 @@ const RETAINED_SESSION_LIMIT = 8;
  * full clone now, so a nearly-full disk fails jobs one by one instead of
  * failing once, loudly — this turns that into the loud failure.
  *
- * ! Not sized to the repository being cloned: it passes with 1.01 GiB free,
- * ! and a clone larger than that still dies of ENOSPC mid-tree. That path
- * ! recovers on its own — the partial tree is quarantined and reclaimed by
- * ! the next `pruneRetained(0)` pass, here or in the sweep — but the floor
- * ! buys an early refusal for small clones, not a guarantee for large ones.
+ * Not sized to the repository: it passes with 1.01 GiB free and a larger clone
+ * still dies mid-tree (that recovers via quarantine + `pruneRetained(0)`).
+ * The floor buys an early refusal for small clones, not a guarantee.
  */
 const MIN_FREE_BYTES = 1024 ** 3;
 
@@ -107,13 +101,9 @@ const classifyGitFailure = (
   },
 ): WorkspaceError => {
   if (CREDENTIAL_REJECTED.test(stderr)) {
-    // ! Retryable, but slowly. A refused credential heals the moment an operator
-    // ! rotates the token, so failing the job outright discards work for a
-    // ! daemon-side problem that says nothing about the job — the same reasoning
-    // ! that stops a delivery being condemned for it. The long wait is what
-    // ! stops the attempt budget burning a clone cycle per minute in the
-    // ! meantime. Retaining the job without spending attempts at all needs queue
-    // ! support and belongs with the credential breaker in #28.
+    // Retryable, but slowly: the credential heals on rotation, so failing the
+    // job discards work over a daemon-side problem; the long wait keeps the
+    // attempt budget from burning a clone per minute.
     return new WorkspaceError({
       code: 'WORKSPACE_CREDENTIAL_REJECTED',
       message: 'GitHub rejected the daemon credential',
@@ -231,10 +221,9 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
           },
         });
 
-      // ! The header goes in through git config env, never the URL and never a
-      // ! credential store, so the token exists only in this process's memory
-      // ! and in the environment of one short-lived git command. Nothing that
-      // ! lands inside the session directory can carry it.
+      // ! The token reaches git only as config-env, never the URL or a
+      // ! credential store: it exists solely in this process and one short-lived
+      // ! git command's environment.
       const authEnv = (authorization: Redacted.Redacted<string>) => ({
         PATH: process.env.PATH ?? '/usr/bin:/bin',
         HOME: '/var/empty',
@@ -252,12 +241,9 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
       /**
        * Move a spent session aside for forensics, or delete it when even the
        * rename refuses. Never fails the job over a directory that was about to
-       * be replaced anyway.
-       *
-       * ! An Effect, not a plain helper, because its fallback deletes a whole
-       * ! tree asynchronously: `rename` is O(1) on one directory and stays
-       * ! synchronous, but unlinking a multi-gigabyte tree must yield the
-       * ! single thread or the heartbeats stall with it.
+       * be replaced anyway. An Effect because the fallback deletes a whole tree
+       * asynchronously — unlinking gigabytes must yield the single thread or
+       * the heartbeats stall with it.
        */
       const quarantine = (sessionPath: string): Effect.Effect<void> =>
         Effect.gen(function* () {
@@ -287,13 +273,9 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
       /**
        * Deletes retained sessions oldest-mtime-first until `limit` remain, and
        * returns how many went away. Under genuine disk pressure the caller may
-       * pass zero: forensics are worth less than a daemon that runs.
-       *
-       * ! Per-entry recovery, like the sweep's `removeEntry`: one wedged tree
-       * ! must neither abandon the rest of the prune nor fail an unrelated
-       * ! job — `release`'s retain path runs this inline, and a forensic
-       * ! directory that refuses to die must not surface there as "cleanup
-       * ! failed" for a job whose own session was retained perfectly.
+       * pass zero: forensics are worth less than a daemon that runs. Per-entry
+       * recovery like the sweep: one wedged tree must not fail an unrelated job
+       * whose own session was retained perfectly.
        */
       const pruneRetained = (limit: number): Effect.Effect<number, WorkspaceError> =>
         Effect.gen(function* () {
@@ -320,9 +302,8 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
                 cause,
               }),
           });
-          // ! The subtraction clamps at zero: `slice` reads a negative end as
-          // ! an offset from the tail, so an unclamped result deletes retained
-          // ! forensics precisely while the count is under the cap.
+          // slice reads a negative end from the tail; clamp so an under-cap
+          // count cannot delete forensics instead.
           const doomed = retained.slice(0, Math.max(0, retained.length - limit));
           let pruned = 0;
           for (const { name } of doomed) {
@@ -353,8 +334,7 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
         policy: RepositoryPolicy,
       ) =>
         Effect.gen(function* () {
-          // ! The one check between a GitHub payload and a `join`. Terminal:
-          // ! nothing about a name changes on a retry or a token rotation.
+          // The one check between a GitHub payload and a `join`.
           if (!isSafeRepository(job.repository)) {
             return yield* new WorkspaceError({
               code: 'WORKSPACE_REPOSITORY_INVALID',
@@ -363,9 +343,8 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
             });
           }
           const repository = canonicalRepository(job.repository);
-          // ! Terminal: neither the policy nor the name changes between attempts,
-          // ! so every retry would pay these checks again before dying the same
-          // ! death. Both must pass before any filesystem or network work.
+          // Terminal checks before any filesystem or network work: neither the
+          // policy, the name, nor a bad ref heals on retry.
           if (policy.clone !== 'allowed') {
             return yield* new WorkspaceError({
               code: 'WORKSPACE_CLONE_DENIED',
@@ -373,8 +352,6 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
               retryable: false,
             });
           }
-          // ! Before any command line can see it, for the same reason as the
-          // ! repository check above: a bad ref does not heal on retry.
           if (job.ref !== undefined && !isSafeRef(job.ref)) {
             return yield* new WorkspaceError({
               code: 'WORKSPACE_REF_INVALID',
@@ -383,9 +360,8 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
             });
           }
 
-          // ! The root exists before anything probes it: `statfs` throws on a
-          // ! missing path, and letting that surface as "disk exhausted" would
-          // ! misreport an absent directory as a full disk.
+          // Root exists before anything probes it: `statfs` on a missing path
+          // would misreport an absent directory as a full disk.
           yield* Effect.try({
             try: () => mkdirSync(root, { recursive: true, mode: 0o700 }),
             catch: (cause) =>
@@ -397,20 +373,12 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
           });
 
           const sessionPath = join(root, `job-${job.id}`);
-          // ! The job's own leftover is reclaimed *before* any disk accounting.
-          // ! A large orphan named after a live job is unreachable by every
-          // ! other reclaim path — `pruneRetained` matches only `.failed-*`
-          // ! names and the sweep skips live jobs — so probing first could
-          // ! fail the job on its own dead weight. Quarantining here moves it
-          // ! into the retained pool, where an under-floor `pruneRetained(0)`
-          // ! below can delete it; a rename alone frees nothing. A session is
-          // ! never reused: it may be a leftover from a killed attempt whose
-          // ! state nobody knows, so it moves aside intact for forensics and
-          // ! the clone starts clean.
+          // Reclaim the job's own leftover before any disk accounting: it is
+          // unreachable by every other reclaim path (pruneRetained matches only
+          // `.failed-*`, the sweep skips live jobs), so probing first could fail
+          // the job on its own dead weight. Sessions are never reused.
           yield* quarantine(sessionPath);
-          // ! Quarantining adds to the retained pool, so the cap follows it
-          // ! here too: only release and sweep pruned, and a daemon repeatedly
-          // ! killed mid-job held more than the cap between sweeps.
+          // Quarantining adds to the retained pool, so the cap applies here too.
           yield* pruneRetained(RETAINED_SESSION_LIMIT).pipe(
             Effect.catchAll((cause) =>
               Effect.logWarning('Could not enforce retention after quarantining').pipe(
@@ -435,11 +403,9 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
               }),
           });
           if (availableBytes < MIN_FREE_BYTES) {
-            // ! Genuine pressure means free space binds first, forensics
-            // ! second: reclaim past the retention cap, down to zero retained
-            // ! — including the leftover quarantined above — then re-probe once
-            // ! before failing. Without this, "8 clones held, under the floor"
-            // ! is stable and every job dies until an operator intervenes.
+            // Free space binds first, forensics second: reclaim past the cap,
+            // down to zero retained, then re-probe once. Otherwise "8 clones
+            // held" is stable and every job dies until an operator intervenes.
             const reclaimed = yield* pruneRetained(0).pipe(
               Effect.catchAll((cause) =>
                 Effect.logWarning('Could not reclaim retained sessions').pipe(
@@ -470,8 +436,7 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
           }
 
           const authorization = yield* credential.gitAuthHeader;
-          // ! The credential reaches git as an environment header only — argv
-          // ! stays clean, so the audit row can carry the command verbatim.
+          // Credential reaches git as env only — argv stays clean for the audit.
           const audited = (
             capability: string,
             argv: readonly string[],
@@ -518,9 +483,8 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
             }
 
             if (job.ref !== undefined) {
-              // ! Fetch the exact thing asked for and detach onto it. A ref that
-              // ! cannot be fetched or checked out fails the job — silently
-              // ! landing on the default branch would review the wrong tree.
+              // Fetch exactly what was asked and detach onto it: silently
+              // landing on the default branch would review the wrong tree.
               const fetch = yield* audited(
                 'git_fetch',
                 ['git', 'fetch', 'origin', job.ref],
@@ -528,9 +492,8 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
                 authEnv(authorization),
               );
               if (fetch.exitCode !== 0) {
-                // ! Classified first: "not found" on stderr may be a refused
-                // ! credential or a rate limit, not a bad ref, and only the first
-                // ! of those heals.
+                // Classify first: stderr "not found" may be a refused credential
+                // or a rate limit, not a bad ref — only the first heals.
                 return yield* classifyGitFailure(fetch.stderr, {
                   code: 'WORKSPACE_REF_UNAVAILABLE',
                   message: 'Could not fetch the requested ref',
@@ -550,24 +513,16 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
                 });
               }
             }
-            // ! No ref given: the clone already checked out the remote default
-            // ! HEAD. Pinning to `origin/HEAD` unconditionally would override a
-            // ! default branch that the clone resolved correctly.
+            // No ref given: the clone already checked out remote default HEAD;
+            // pinning to `origin/HEAD` would override it.
 
             return { path: sessionPath } satisfies JobWorkspace;
           });
-          // ! Once the session directory exists, every exit that is not success
-          // ! — typed failure, defect, interruption — quarantines what landed
-          // ! on disk and prunes, dropping the job from the owned set only
-          // ! after both conclude: unmarking first would leave the quarantine
-          // ! rename unprotected against a concurrent sweep, destroying the
-          // ! forensics this handler exists to preserve. Without this,
-          // ! `acquireUseRelease` runs no finalizer on a failed acquire, and
-          // ! the next sweep sees a dead job and deletes the evidence
-          // ! outright. Interruption itself is unreachable from the production
-          // ! caller — `Effect.acquireUseRelease` runs `acquire`
-          // ! uninterruptibly, deferring an interrupt until the clone returns —
-          // ! but direct callers can interrupt, and the guard holds there.
+          // ! Once the directory exists, every non-success exit quarantines and
+          // ! prunes before the job leaves the owned set — unmarking first would
+          // ! leave the quarantine rename unprotected against a concurrent sweep,
+          // ! which deletes evidence outright (acquireUseRelease runs no
+          // ! finalizer on a failed acquire).
           return yield* populate.pipe(
             Effect.onError(() =>
               quarantine(sessionPath).pipe(
@@ -590,12 +545,9 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
         job: { readonly id: number; readonly repository: string; readonly ref?: string },
         policy: RepositoryPolicy,
       ) =>
-        // ! Ownership is claimed before any filesystem work, so a session being
-        // ! prepared or cloned is protected even while the queue still reports
-        // ! the job dead — exactly the stale-snapshot window a sweep iterates
-        // ! through. `prepare` releases its own late failures, after their
-        // ! quarantine; this backstop covers the checks that fail before any
-        // ! filesystem work exists, and is idempotent where both run.
+        // Ownership claimed before any filesystem work: a session mid-clone is
+        // protected even in the queue's stale-snapshot window. Idempotent with
+        // prepare's own late-failure release.
         markOwned(job.id).pipe(
           Effect.flatMap(() => prepare(job, policy)),
           Effect.onError(() => markReleased(job.id)),
@@ -618,12 +570,9 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
                     cause,
                   }),
               });
-          // ! Released only once the directory work has concluded, success or
-          // ! not: unmarking first exposes the quarantine rename or the `rm`
-          // ! to a concurrent sweep, which could destroy the forensics or
-          // ! delete a session this daemon still owns. `ensuring` also keeps a
-          // ! failed `rm` from leaking the claim, which would hide the
-          // ! session from every later sweep.
+          // Released only after the directory work concludes: unmarking first
+          // exposes the rename or rm to a concurrent sweep; `ensuring` also
+          // keeps a failed rm from leaking the claim.
           return yield* spent.pipe(Effect.ensuring(markReleased(jobId)));
         }).pipe(Effect.asVoid);
 
@@ -631,24 +580,11 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
        * Deletes sessions whose jobs are gone, unrecognized debris, and retained
        * overage.
        *
-       * ! Deliberate deviation from #24's literal
-       * ! `sweep: (isLive: (jobId: number) => boolean)`: a ready-made predicate
-       * ! forces the caller to resolve liveness before this listing, and a job
-       * ! enqueued between that snapshot and `readdir` lands in the listing
-       * ! while absent from the live set — deleted out from under a clone that
-       * ! just started. Taking liveness as an effect makes *this* resolve it,
-       * ! strictly after the listing, which closes that race by construction:
-       * ! every listed entry predates the answer and is judged against it, and
-       * ! anything created later is invisible to this pass.
-       * !
-       * ! A second, narrower window remains — between the liveness answer and
-       * ! each sequential `rm`, an operator can retry a failed job and its
-       * ! fresh clone lands on a directory already judged deletable. The
-       * ! owned set closes it: what this daemon has handed out is live by
-       * ! definition, regardless of what the queue's snapshot says. It is
-       * ! read per entry, immediately before each delete — the deletions are
-       * ! sequential `rm`s of full clones spanning real seconds, so a single
-       * ! snapshot taken before the loop goes stale inside it.
+       * Liveness arrives as an effect, resolved strictly *after* this listing:
+       * a ready-made predicate would let a job enqueued between snapshot and
+       * readdir be deleted out from under a clone that just started. The owned
+       * set closes the narrower remaining window — read per entry, immediately
+       * before each delete, because the deletions span real seconds.
        */
       const sweep = <E>(
         liveJobIds: Effect.Effect<ReadonlySet<number>, E>,
@@ -674,8 +610,7 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
                   cause,
                 }),
             }).pipe(
-              // ! One wedged entry must not abandon the rest of the sweep, or a
-              // ! single unremovable directory collects debris forever.
+              // One wedged entry must not abandon the rest of the sweep.
               Effect.catchAll((cause) =>
                 Effect.logWarning('Session sweep could not delete an entry').pipe(
                   Effect.annotateLogs({ entry: name, error: cause.message }),
@@ -685,17 +620,13 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
           for (const entry of entries) {
             const session = parseSessionName(entry);
             if (session === undefined) {
-              // ! Neither the daemon nor git wrote this name; it is debris.
+              // Neither daemon nor git wrote this name; it is debris.
               yield* removeEntry(entry);
             } else if (!session.retained && !live.has(session.id)) {
-              // ! Re-read here, not once per sweep: `markOwned` precedes all of
-              // ! `acquire`'s filesystem work, so this is authoritative at the
-              // ! moment it is consulted, however long the loop has run.
+              // Re-read per entry: authoritative at the moment of deletion.
               const held = yield* Ref.get(owned);
               if (!held.has(session.id)) yield* removeEntry(entry);
             }
-            // ! Retained sessions are forensic state, not live work: liveness
-            // ! does not delete them, the retention cap does.
           }
           yield* pruneRetained(RETAINED_SESSION_LIMIT).pipe(
             Effect.catchAll((cause) =>

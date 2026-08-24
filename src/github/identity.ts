@@ -75,17 +75,15 @@ export class GitHubIdentity extends Effect.Service<GitHubIdentity>()('GitHubIden
         ),
       );
 
-      // ! GitHub answers 403 both for a credential it will not accept and for a
-      // ! bucket that is momentarily empty. Only the first should be fatal, and
-      // ! a secondary limit is documented to arrive with neither rate header —
-      // ! so the body has to be read before calling a 403 a dead credential.
+      // GitHub answers 403 for a refused credential and for a momentarily empty
+      // bucket alike, and a secondary limit arrives with neither rate header —
+      // so the body must be read before calling a 403 a dead credential.
       const hinted = retryAfterMs(response.headers, yield* Clock.currentTimeMillis);
       const throttled =
         response.status === 403 &&
         (hinted !== undefined ||
-          // ! An exhausted bucket reported without a reset time is still an
-          // ! exhausted bucket. `retryAfterMs` returns nothing here because it
-          // ! has no time to offer, not because there is no throttle.
+          // No reset time is still an exhausted bucket; `retryAfterMs` has
+          // nothing to offer, not no throttle.
           response.headers['x-ratelimit-remaining'] === '0' ||
           isSecondaryRateLimit(yield* Effect.orElseSucceed(response.text, () => '')));
 
@@ -109,9 +107,8 @@ export class GitHubIdentity extends Effect.Service<GitHubIdentity>()('GitHubIden
         });
       }
 
-      // ! Decoded inside the probe, not after it. A 200 whose body arrives
-      // ! truncated is as transient as a request that never arrived, and outside
-      // ! the retry it would be indistinguishable from a bad token.
+      // Decoded inside the probe: a truncated 200 is as transient as a request
+      // that never arrived, and outside the retry it would look like a bad token.
       const body = yield* Effect.flatMap(response.json, Schema.decodeUnknown(User)).pipe(
         Effect.mapError(
           (cause) =>
@@ -129,12 +126,10 @@ export class GitHubIdentity extends Effect.Service<GitHubIdentity>()('GitHubIden
     const verify = Effect.gen(function* () {
       const attempts = yield* Ref.make(0);
       const { body, headers } = yield* probe.pipe(
-        // ! Every wait happens here and none in the schedule. A schedule sees its
-        // ! own output, not the error that carried the header, so honouring the
-        // ! header there is impossible — and doing it in both places composes
-        // ! them, turning a requested 30s into 30s plus whatever the schedule
-        // ! adds. Retrying sooner than GitHub asked is what turns a throttle into
-        // ! a blocked integration; retrying later is merely slow.
+        // All waiting happens here and none in the schedule: the schedule cannot
+        // see the error carrying `retryAfterMs`, and composing the two turns a
+        // requested 30s into 30s-plus-backoff — sooner than GitHub asked is what
+        // turns a throttle into a block.
         Effect.tapError((error) =>
           error.transient === true
             ? Ref.updateAndGet(attempts, (count) => count + 1).pipe(
@@ -148,7 +143,7 @@ export class GitHubIdentity extends Effect.Service<GitHubIdentity>()('GitHubIden
               )
             : Effect.void,
         ),
-        // ! No attempt or elapsed limit on purpose — see the class comment.
+        // No attempt or elapsed limit on purpose — see the class comment.
         Effect.retry({
           while: (error: GitHubIdentityError) => error.transient === true,
           schedule: Schedule.forever,
@@ -163,22 +158,18 @@ export class GitHubIdentity extends Effect.Service<GitHubIdentity>()('GitHubIden
         });
       }
 
-      // ! Trusting your own account is a self-trigger loop with extra steps. The
-      // ! qualification policy drops self-authored deliveries regardless, but a
-      // ! configuration this wrong is worth refusing rather than quietly ignoring.
+      // Self-trust is a self-trigger loop with extra steps; qualification drops
+      // self-authored deliveries regardless, but refuse rather than ignore this.
       if (config.trustedSenders.some((sender) => sender.trim().toLowerCase() === login)) {
         return yield* new GitHubIdentityError({
           message: `${login} authenticates this daemon and must not be a trusted sender`,
         });
       }
 
-      // ! `x-oauth-scopes` is returned for classic tokens only. Absent means the
-      // ! credential is a different class — a fine-grained PAT, which was ruled
-      // ! out because it cannot cross resource owners, or a future App
-      // ! user-to-server token, which is the migration this seam exists for. So
-      // ! a missing header warns and a present-but-insufficient one fails: the
-      // ! second is a token that will 403 on the first clone, and finding that
-      // ! out at boot beats finding it out per job.
+      // `x-oauth-scopes` exists for classic tokens only. Absent means another
+      // credential class (fine-grained PAT ruled out, App token the future seam),
+      // so warn; present-but-insufficient fails — that token will 403 on the
+      // first clone, and boot beats per-job for finding out.
       const scopes = headers['x-oauth-scopes'];
       if (scopes === undefined) {
         yield* Effect.logWarning('GitHub reported no token scopes').pipe(
@@ -219,9 +210,8 @@ export class GitHubIdentity extends Effect.Service<GitHubIdentity>()('GitHubIden
       return { login, tokenExpiresAt } satisfies VerifiedIdentity;
     });
 
-    // ! Memoized, so the many callers that need the login share one probe and
-    // ! one verdict. Caching the fatal outcome too is correct: nothing reaching
-    // ! that branch heals without an operator changing the token.
+    // Memoized: many callers share one probe and one verdict, including its
+    // fatal outcome — nothing reaching that branch heals without a new token.
     const verified = yield* Effect.cached(verify);
 
     return { verified };

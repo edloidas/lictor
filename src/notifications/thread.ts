@@ -31,14 +31,10 @@ export const decodeThread = Schema.decodeUnknown(NotificationThread);
 /**
  * Reasons that can never carry a mention, and are therefore not worth fetching.
  *
- * ! An exclusion list, not an allow list, and that direction is the whole point.
- * ! `reason` describes the *thread*, not the activity that just landed on it, and
- * ! GitHub does not re-key an already-unread thread — so a thread that went unread
- * ! as `assign` and then received a trusted mention still reports `assign`.
- * ! Accepting only `mention` would discard exactly that thread, and since the
- * ! poller has already marked it read, the mention would be gone from both sides.
- * ! What remains here is machine traffic that has no author to trust and no prose
- * ! to scan, which is also the high-volume kind worth not fetching.
+ * An exclusion list, not an allow list: `reason` describes the thread, not the
+ * activity that landed on it. An allow list would discard exactly the thread
+ * that went unread as `assign` and then received a trusted mention — and after
+ * the poller's read mark it would be gone from both sides.
  */
 export const UNMENTIONABLE_REASONS: ReadonlySet<string> = new Set([
   'ci_activity',

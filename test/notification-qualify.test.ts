@@ -32,8 +32,8 @@ const issue = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
-// ! `created_at` mirrors `updated_at` by default. Candidates key on creation, so
-// ! a fixture that omitted it would silently fall outside every window.
+// `created_at` mirrors `updated_at` by default. Candidates key on creation, so
+// a fixture that omitted it would silently fall outside every window.
 const comment = (overrides: Record<string, unknown> = {}) => {
   const base = {
     id: 99,
@@ -118,10 +118,10 @@ const qualified = <A>(exit: Exit.Exit<A, unknown>): A => {
 };
 
 describe('qualifyNotification', () => {
-  // ! `reason` is an exclusion list, not an allow list. It describes the thread,
-  // ! not the activity that just landed on it, so a thread that went unread as
-  // ! `assign` and then received a mention still reports `assign` — refusing to
-  // ! scan it would discard the mention outright.
+  // `reason` is an exclusion list, not an allow list. It describes the thread,
+  // not the activity that just landed on it, so a thread that went unread as
+  // `assign` and then received a mention still reports `assign` — refusing to
+  // scan it would discard the mention outright.
   it('scans a thread whose reason is not mention', async () => {
     const result = await run(
       qualifyNotification({
@@ -130,8 +130,8 @@ describe('qualifyNotification', () => {
         policy,
         cursorMs: undefined,
       }),
-      // ! The assignment path runs alongside the mention scan now, so the
-      // ! timeline route must answer even when a mention decides the trigger.
+      // The assignment path runs alongside the mention scan now, so the
+      // timeline route must answer even when a mention decides the trigger.
       [['/issues/7/events', { body: [] }], ...issueRoutes(issue(), [comment()])],
     );
 
@@ -202,8 +202,8 @@ describe('qualifyNotification', () => {
     expect(work?.contextUrl).toBe('https://github.com/edloidas/sandbox/issues/7#issuecomment-99');
   });
 
-  // ! An identity, not an event. A timestamp or an html url in here makes every
-  // ! edit of the same comment a second job.
+  // An identity, not an event. A timestamp or an html url in here makes every
+  // edit of the same comment a second job.
   it('builds an interaction id from identities only', async () => {
     const result = await run(
       qualifyNotification({
@@ -264,10 +264,10 @@ describe('qualifyNotification', () => {
     expect(work?.context).toEqual({ kind: 'issue_comment', id: 99 });
   });
 
-  // ! An untrusted mention must not suppress a trusted one. Letting the newest
-  // ! mention win and then refusing it hands every repository participant a mute
-  // ! button: mention her after a trusted request and the whole thread is dropped,
-  // ! the cursor advances, and the real request is never rescanned.
+  // An untrusted mention must not suppress a trusted one. Letting the newest
+  // mention win and then refusing it hands every repository participant a mute
+  // button: mention her after a trusted request and the whole thread is dropped,
+  // the cursor advances, and the real request is never rescanned.
   it('ignores an untrusted mention layered over a trusted one', async () => {
     const result = await run(
       qualifyNotification({
@@ -301,9 +301,9 @@ describe('qualifyNotification', () => {
     expect(qualified(result.exit).work).toBeUndefined();
   });
 
-  // ! `comment.user` is who wrote the comment; REST reports no editor. Keying a
-  // ! candidate on `updated_at` would let a maintainer rewrite someone else's
-  // ! comment and have the job attributed to that trusted author.
+  // `comment.user` is who wrote the comment; REST reports no editor. Keying a
+  // candidate on `updated_at` would let a maintainer rewrite someone else's
+  // comment and have the job attributed to that trusted author.
   it('ignores a mention inserted by editing an existing comment', async () => {
     const result = await run(
       qualifyNotification({
@@ -348,8 +348,8 @@ describe('qualifyNotification', () => {
     expect(qualified(result.exit).work).toBeUndefined();
   });
 
-  // ! A near-miss must not match. `@adiutriel-bot` is a different account, and
-  // ! matching it would put someone else's mention into her queue.
+  // A near-miss must not match. `@adiutriel-bot` is a different account, and
+  // matching it would put someone else's mention into her queue.
   it('does not match a login that merely prefixes hers', async () => {
     const result = await run(
       qualifyNotification({
@@ -364,10 +364,10 @@ describe('qualifyNotification', () => {
     expect(qualified(result.exit).work).toBeUndefined();
   });
 
-  // ! `subject.user` is who opened the issue, and REST exposes no editor
-  // ! identity for a body. Keying the body candidate on `updated_at` would let
-  // ! anyone able to edit the body insert a mention and have it attributed to the
-  // ! original — possibly trusted — author.
+  // `subject.user` is who opened the issue, and REST exposes no editor
+  // identity for a body. Keying the body candidate on `updated_at` would let
+  // anyone able to edit the body insert a mention and have it attributed to the
+  // original — possibly trusted — author.
   it('ignores a body mention inserted after the issue was opened', async () => {
     const result = await run(
       qualifyNotification({
@@ -389,10 +389,10 @@ describe('qualifyNotification', () => {
     expect(qualified(result.exit).work).toBeUndefined();
   });
 
-  // ! `GET /issues/{n}/comments` takes no `direction`, so `Link: rel="last"` is
-  // ! the only handle on the newest comments. Walking back from the last page is
-  // ! what makes the page budget a safe truncation: it drops the oldest comments,
-  // ! never the one that decides trust.
+  // `GET /issues/{n}/comments` takes no `direction`, so `Link: rel="last"` is
+  // the only handle on the newest comments. Walking back from the last page is
+  // what makes the page budget a safe truncation: it drops the oldest comments,
+  // never the one that decides trust.
   it('walks back from the last page to reach the newest comments', async () => {
     const oldest = comment({ id: 10, updated_at: '2026-08-21T08:00:00Z', body: 'no mention' });
     const newest = comment({ id: 900, updated_at: '2026-08-21T10:00:00Z' });
@@ -414,14 +414,14 @@ describe('qualifyNotification', () => {
     );
 
     expect(qualified(result.exit).work?.context).toEqual({ kind: 'issue_comment', id: 900 });
-    // ! Within budget, so page 1 is kept rather than discarded — the arithmetic
-    // ! that decides this is off by one in the obvious wrong direction.
+    // Within budget, so page 1 is kept rather than discarded — the arithmetic
+    // that decides this is off by one in the obvious wrong direction.
     expect(result.requests.filter((url) => url.includes('/issues/7/comments'))).toHaveLength(3);
   });
 
-  // ! Past the budget the oldest pages go, and page 1 with them. This is the
-  // ! branch that must never be reached by an in-budget thread, and the only one
-  // ! that logs; the assertion below pins which half of the window survives.
+  // Past the budget the oldest pages go, and page 1 with them. This is the
+  // branch that must never be reached by an in-budget thread, and the only one
+  // that logs; the assertion below pins which half of the window survives.
   it('drops the oldest pages once the page budget is exhausted', async () => {
     const link = '<https://api.github.test/x?page=15>; rel="last"';
     const trigger = comment({ id: 1500, updated_at: '2026-08-21T10:00:00Z' });
@@ -451,9 +451,9 @@ describe('qualifyNotification', () => {
     expect(qualified(result.exit).work?.context).toEqual({ kind: 'issue_comment', id: 1500 });
   });
 
-  // ! Every bound in the scan derives from `updated_at`, and the schema accepts
-  // ! any string. Without a guard an unreadable one leaves the comment scan with
-  // ! no anchor, which turns a malformed envelope into a full history scan.
+  // Every bound in the scan derives from `updated_at`, and the schema accepts
+  // any string. Without a guard an unreadable one leaves the comment scan with
+  // no anchor, which turns a malformed envelope into a full history scan.
   it('drops a thread whose activity time is unreadable', async () => {
     const result = await run(
       qualifyNotification({
@@ -484,10 +484,10 @@ describe('qualifyNotification', () => {
     expect(String(result.exit)).toContain('NotificationError');
   });
 
-  // ! The scan is never unbounded. A cursor anchors it; failing that the read
-  // ! mark does; failing that a short grace around the notification's own
-  // ! `updated_at`, because scanning an old issue whole would put every comment
-  // ! it ever received into one window and overflow the page ceiling.
+  // The scan is never unbounded. A cursor anchors it; failing that the read
+  // mark does; failing that a short grace around the notification's own
+  // `updated_at`, because scanning an old issue whole would put every comment
+  // it ever received into one window and overflow the page ceiling.
   it('anchors the comment scan on the cursor when there is one', async () => {
     const result = await run(
       qualifyNotification({
@@ -530,9 +530,9 @@ describe('qualifyNotification', () => {
     expect(commentsCall(unread.requests)).not.toContain('since=');
   });
 
-  // ! GitHub's reply button quotes what it replies to, and GitHub notifies on a
-  // ! mention inside a blockquote. Without stripping, a trusted reader agreeing
-  // ! with "@adiutriel do X" produces a second job that does X again.
+  // GitHub's reply button quotes what it replies to, and GitHub notifies on a
+  // mention inside a blockquote. Without stripping, a trusted reader agreeing
+  // with "@adiutriel do X" produces a second job that does X again.
   it('does not treat a quoted or fenced mention as a fresh one', async () => {
     const quoted = await run(
       qualifyNotification({
@@ -598,9 +598,9 @@ describe('qualifyNotification', () => {
     expect(result.requests.some((url) => url.includes('/pulls/12/comments'))).toBe(true);
   });
 
-  // ! `/pulls/{n}/comments` holds only the inline threads. A mention in the body
-  // ! of a submitted review lives on `/pulls/{n}/reviews`, notifies just the same,
-  // ! and was covered by the deleted `pull_request_review` webhook handler.
+  // `/pulls/{n}/comments` holds only the inline threads. A mention in the body
+  // of a submitted review lives on `/pulls/{n}/reviews`, notifies just the same,
+  // and was covered by the deleted `pull_request_review` webhook handler.
   it('triggers on a mention in a submitted review body', async () => {
     const result = await run(
       qualifyNotification({
@@ -642,10 +642,10 @@ describe('qualifyNotification', () => {
     const work = qualified(result.exit).work;
     expect(work?.sender).toBe('friend');
     expect(work?.contextUrl).toContain('pullrequestreview-7001');
-    // ! Keyed on the review's own id even though it reacts on the pull request:
-    // ! collapsing reviews into `body` would give every review on one pull request
-    // ! the same `interactionId`, and a reviewer's second instruction would be
-    // ! deduped away as a replay of the first.
+    // Keyed on the review's own id even though it reacts on the pull request:
+    // collapsing reviews into `body` would give every review on one pull request
+    // the same `interactionId`, and a reviewer's second instruction would be
+    // deduped away as a replay of the first.
     expect(work?.context).toEqual({ kind: 'review', id: 7001, number: 12 });
   });
 
@@ -672,12 +672,12 @@ describe('qualifyNotification', () => {
     ...overrides,
   });
   const eventsRoute = (events: readonly Record<string, unknown>[]) =>
-    // ! Before `/issues/7`: the fragment matcher picks the first substring hit,
-    // ! and the events path contains the subject path.
+    // Before `/issues/7`: the fragment matcher picks the first substring hit,
+    // and the events path contains the subject path.
     [['/issues/7/events', { body: events }], ...issueRoutes(issue(), [])] as const;
 
-  // ! The whole point of the timeline fetch: an assignment carries no comment,
-  // ! so the mention scan cannot see it and the actor must come from `assigned`.
+  // The whole point of the timeline fetch: an assignment carries no comment,
+  // so the mention scan cannot see it and the actor must come from `assigned`.
   it('acts on a trusted assignment with no mention anywhere', async () => {
     const result = await run(
       qualifyNotification({
@@ -762,8 +762,8 @@ describe('qualifyNotification', () => {
     expect(work?.context).toEqual({ kind: 'review_requested', id: 3001, number: 7 });
   });
 
-  // ! A team request names no individual reviewer, so there is nobody to
-  // ! attribute and nobody to trust — skipped rather than guessed.
+  // A team request names no individual reviewer, so there is nobody to
+  // attribute and nobody to trust — skipped rather than guessed.
   it('skips a review request aimed at a team', async () => {
     const result = await run(
       qualifyNotification({
@@ -785,9 +785,9 @@ describe('qualifyNotification', () => {
     expect(qualified(result.exit).work).toBeUndefined();
   });
 
-  // ! A withdrawal of the other kind does not cancel: she can be assigned and
-  // ! review-requested on the same pull request, and dropping one must not
-  // ! silence the other.
+  // A withdrawal of the other kind does not cancel: she can be assigned and
+  // review-requested on the same pull request, and dropping one must not
+  // silence the other.
   it('keeps a review request alive when her assignment is withdrawn', async () => {
     const result = await run(
       qualifyNotification({
@@ -820,8 +820,8 @@ describe('qualifyNotification', () => {
     expect(work?.reasons).toEqual(['review_requested']);
   });
 
-  // ! Same-second events cannot be ordered by GitHub's timestamps, so the
-  // ! withdrawal scan compares positions in the timeline instead.
+  // Same-second events cannot be ordered by GitHub's timestamps, so the
+  // withdrawal scan compares positions in the timeline instead.
   it('cancels a same-second assignment withdrawn after it', async () => {
     const stamp = '2026-08-21T10:00:00Z';
     const result = await run(
@@ -845,8 +845,8 @@ describe('qualifyNotification', () => {
     expect(qualified(result.exit).work).toBeUndefined();
   });
 
-  // ! Bot churn — assign, unassign, reassign inside one second. The final
-  // ! assignment stands because its withdrawal precedes it positionally.
+  // Bot churn — assign, unassign, reassign inside one second. The final
+  // assignment stands because its withdrawal precedes it positionally.
   it('keeps a same-second assignment reassigned after a withdrawal', async () => {
     const stamp = '2026-08-21T10:00:00Z';
     const result = await run(
@@ -871,9 +871,9 @@ describe('qualifyNotification', () => {
     expect(qualified(result.exit).work?.sender).toBe('edloidas');
   });
 
-  // ! Authority that was withdrawn is not authority. The thread is marked read
-  // ! once committed, so acting on a rescinded assignment spends work nobody
-  // ! asked for by the time anyone could notice.
+  // Authority that was withdrawn is not authority. The thread is marked read
+  // once committed, so acting on a rescinded assignment spends work nobody
+  // asked for by the time anyone could notice.
   it('drops an assignment that was rescinded after it was made', async () => {
     const result = await run(
       qualifyNotification({
@@ -896,8 +896,8 @@ describe('qualifyNotification', () => {
     expect(qualified(result.exit).work).toBeUndefined();
   });
 
-  // ! Trust first, newest second. Newest-then-trust would let an untrusted
-  // ! assigner silence a trusted one with assign → unassign → assign.
+  // Trust first, newest second. Newest-then-trust would let an untrusted
+  // assigner silence a trusted one with assign → unassign → assign.
   it('lets the newest trusted assignment win when an untrusted one is newer', async () => {
     const result = await run(
       qualifyNotification({
@@ -919,8 +919,8 @@ describe('qualifyNotification', () => {
     expect(qualified(result.exit).work?.sender).toBe('edloidas');
   });
 
-  // ! The mute-button guard, timeline edition: an untrusted throwaway mention
-  // ! must not suppress a trusted assignment in the same window.
+  // The mute-button guard, timeline edition: an untrusted throwaway mention
+  // must not suppress a trusted assignment in the same window.
   it('prefers a trusted assignment over an untrusted mention in the window', async () => {
     const result = await run(
       qualifyNotification({
@@ -940,8 +940,8 @@ describe('qualifyNotification', () => {
     expect(work?.reasons).toEqual(['assigned']);
   });
 
-  // ! The whole point of liveness: a reply this policy does not trust keeps the
-  // ! work going inside the armed window, at continuation strength.
+  // The whole point of liveness: a reply this policy does not trust keeps the
+  // work going inside the armed window, at continuation strength.
   it('continues live work from an untrusted non-mentioning reply', async () => {
     const result = await run(
       qualifyNotification({
@@ -980,11 +980,11 @@ describe('qualifyNotification', () => {
     expect(qualified(result.exit).work).toBeUndefined();
   });
 
-  // ! A closed subject ends the conversation regardless of the stored window:
-  // ! the work is done and nobody should be able to reopen it by commenting.
-  // ! A trusted trigger outranks any continuation, whatever the timestamps: a
-  // ! stranger's later comment must not demote a trusted command to a stripped
-  // ! continuation turn.
+  // A closed subject ends the conversation regardless of the stored window:
+  // the work is done and nobody should be able to reopen it by commenting.
+  // A trusted trigger outranks any continuation, whatever the timestamps: a
+  // stranger's later comment must not demote a trusted command to a stripped
+  // continuation turn.
   it('keeps a trusted mention authoritative when an untrusted reply is newer', async () => {
     const result = await run(
       qualifyNotification({

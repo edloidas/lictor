@@ -53,9 +53,9 @@ describe('GET /health', () => {
   });
 });
 
-// ! The route GitHub used to deliver to is gone, not merely unused. Polling is
-// ! the only transport, and a live inbound endpoint would be an unauthenticated
-// ! path into the queue that nothing verifies any more.
+// The route GitHub used to deliver to is gone, not merely unused. Polling is
+// the only transport, and a live inbound endpoint would be an unauthenticated
+// path into the queue that nothing verifies any more.
 describe('the retired webhook route', () => {
   it('is not served', async () => {
     const response = await serve(

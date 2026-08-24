@@ -10,9 +10,9 @@ describe('repository automation policy', () => {
     const policy = await parse('');
     const repository = policy.forRepository('Edloidas/Lictor');
 
-    // ! An unlisted repository is the third-party tier: accepted, but capped at
-    // ! read and comment under approval execution, so joining one (#29) arms
-    // ! nothing a human does not approve.
+    // An unlisted repository is the third-party tier: accepted, but capped at
+    // read and comment under approval execution, so joining one (#29) arms
+    // nothing a human does not approve.
     expect(repository).toEqual({
       repository: 'edloidas/lictor',
       accepted: true,
@@ -97,9 +97,9 @@ deny = ["team/archive-*"]
       ['operator'],
     );
 
-    // ! Unlisted repositories stay accepted at the third-party tier; what the
-    // ! exact names decide is ownership, and with it the environment trust
-    // ! default and the full capability set.
+    // Unlisted repositories stay accepted at the third-party tier; what the
+    // exact names decide is ownership, and with it the environment trust
+    // default and the full capability set.
     expect(policy.forRepository('EDLOIDAS/LICTOR').trustedSenders).toEqual(['operator']);
     expect(policy.forRepository('team/platform-api').trustedSenders).toEqual(['operator']);
     expect(policy.forRepository('team/archive-api').accepted).toBe(false);
@@ -181,8 +181,8 @@ execution = "automatic"
     ['unknown execution mode', '[defaults]\nexecution = "sometimes"'],
     ['unknown security key', '[defaults]\nexecuton = "automatic"'],
     ['malformed repository name', '[repositories]\nallow = ["lictor"]'],
-    // ! Reach is granted by an invitation; permission must be granted one
-    // ! repository at a time, or being added anywhere arms everything there.
+    // Reach is granted by an invitation; permission must be granted one
+    // repository at a time, or being added anywhere arms everything there.
     ['an owner wildcard in allow', '[repositories]\nallow = ["edloidas/*"]'],
     ['a traversal segment in allow', '[repositories]\nallow = ["edloidas/.."]'],
     ['a removed workspace root key', '[repositories]\nworkspaceRoots = ["/srv/lictor"]'],

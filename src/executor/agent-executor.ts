@@ -60,17 +60,12 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
     const controlSocketPath = resolve(config.controlSocketPath);
     const codexHome =
       config.codexHome ||
-      // ! Derived from the database's directory rather than configured, so the
-      // ! agent's home always follows daemon state. With the default that is
-      // ! `~/.lictor/codex`, which is the path `codex login` has to be run
-      // ! against. Overridden wholesale by LICTOR_CODEX_HOME.
+      // Follows daemon state by default: `~/.lictor/codex` is the path
+      // `codex login` must be run against. Overridden by LICTOR_CODEX_HOME.
       join(dirname(resolve(config.databasePath)), 'codex');
     yield* Effect.sync(() => mkdirSync(codexHome, { recursive: true, mode: 0o700 }));
-    // ! Operator-authored standing instructions for the agent, beside the
-    // ! database like the codex home. This is the one trusted prose in the
-    // ! prompt, so it is prepended ahead of the untrusted JSON, never inside
-    // ! it. A missing file means no persona; every other read failure is
-    // ! treated the same way — a broken SOUL.md must not take the queue down.
+    // Operator-authored standing instructions — the one trusted prose in the
+    // prompt, so it is prepended ahead of the untrusted JSON, never inside it.
     const soulPath = join(dirname(resolve(config.databasePath)), 'SOUL.md');
     const readSoul = Effect.tryPromise({
       try: () => Bun.file(soulPath).text(),
@@ -119,8 +114,8 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                     workerId ?? '',
                   ])}`,
                 ]),
-            // ! --approve-for-me implies the workspace-write sandbox; passing
-            // ! --sandbox alongside it is a clap conflict on codex >= 0.147.
+            // --approve-for-me implies workspace-write; adding --sandbox is a
+            // clap conflict on codex >= 0.147.
             '--approve-for-me',
             '--cd',
             workdir,
@@ -139,9 +134,8 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
             HOME: workdir,
             LANG: process.env.LANG ?? 'C.UTF-8',
             CODEX_HOME: codexHome,
-            // ! The session must stay token-free and non-interactive: git the
-            // ! agent runs must fail fast on a credential need instead of
-            // ! blocking on a prompt until the executor timeout.
+            // Token-free, non-interactive: git must fail fast on a credential
+            // need instead of blocking on a prompt until the executor timeout.
             GIT_TERMINAL_PROMPT: '0',
           },
         }),

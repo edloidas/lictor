@@ -92,26 +92,21 @@ const defaultCapabilities: Capabilities = {
   scripts: [],
 };
 
-// ! Shared, not private: the clone path and the per-repository semaphore key in
-// ! the worker must normalize identically, or a name that validates takes a
-// ! different lock partition than it clones under.
+// Clone path and per-repository lock key must normalize identically, or a name
+// that validates takes a different lock partition than it clones under.
 export const canonicalRepository = (repository: string): string => repository.trim().toLowerCase();
 
-// ! Underscores are legal in an owner: an Enterprise Managed User login is
-// ! `shortname_enterprise`, and rejecting one refuses that whole namespace.
+// Underscores are legal in owners: an EMU login is `shortname_enterprise`.
 const ownerPattern = /^[a-z0-9](?:[a-z0-9_-]{0,37}[a-z0-9])?$/;
 const namePattern = /^[a-z0-9_.-]{1,100}$/;
 
 /**
  * Whether a name is safe to treat as one repository and to join into a path.
  *
- * Repository names arrive from GitHub payloads, and the daemon computes a
- * filesystem path from them. This is the only check standing between that input
- * and a `join`, which is why dot-only segments are rejected explicitly: the
- * character class permits `..`.
- *
- * A leading dot stays legal — `owner/.github` is a real repository — so nothing
- * the daemon puts beside a clone may be named like one.
+ * The only check between a GitHub payload name and a `join`: the character
+ * class permits `..`, so dot-only segments are rejected explicitly. A leading
+ * dot stays legal (`owner/.github` is real) — nothing beside a clone may be
+ * named like one.
  */
 export const isSafeRepository = (repository: string): boolean => {
   const segments = canonicalRepository(repository).split('/');
@@ -186,9 +181,9 @@ const makePolicy = (
 ): AutomationPolicy => {
   const defaults = document.defaults;
   const repositories = document.repositories;
-  // ! Exact names only. An owner wildcard would arm every repository the
-  // ! account is ever invited to, collapsing reach and permission into one key.
-  // ! Deny keeps its patterns: a wildcard there can only ever subtract.
+  // ! Exact names only: an allow wildcard would arm every repository the
+  // ! account is ever invited to. Deny keeps its patterns — there a wildcard
+  // ! can only ever subtract.
   const allow = new Set((repositories?.allow ?? []).map(validateExact));
   const deny = (repositories?.deny ?? []).map(validateDenyPattern);
   const overrides = new Map<string, Schema.Schema.Type<typeof RepositoryOverride>>();
@@ -221,11 +216,10 @@ const makePolicy = (
     const owned = allow.has(repository);
     const safe = isSafeRepository(repository);
     const override = overrides.get(repository);
-    // ! Third-party tier. A repository the operator does not control is never
-    // ! granted the defaults wholesale: without an explicit override it caps at
-    // ! read and comment under approval execution, which bounds a stranger's
-    // ! prompt-injection blast radius to posting a comment after a human
-    // ! approved the job. Deny still subtracts first.
+    // ! Third-party tier: without an explicit override, a repository the operator
+    // ! does not control caps at read+comment under approval execution — bounding
+    // ! a stranger's prompt injection to one human-approved comment. Deny still
+    // ! subtracts first.
     const thirdParty = !owned && override === undefined;
     const capabilities = thirdParty
       ? {
@@ -244,10 +238,8 @@ const makePolicy = (
 
     return {
       repository,
-      // ! Safe non-denied repositories are all accepted now; ownership decides
-      // ! the tier, not admission. An unlisted repository runs at the capped
-      // ! third-party tier above, so joining one (#29) still arms nothing a
-      // ! human does not approve.
+      // Ownership decides the tier, not admission: joining a repo (#29) arms
+      // nothing a human does not approve.
       accepted: safe && !denied,
       execution: thirdParty
         ? 'approval'
