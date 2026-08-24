@@ -88,13 +88,10 @@ const migrate = (database: Database) => {
   database.exec('PRAGMA journal_mode = WAL');
   database.exec('PRAGMA foreign_keys = ON');
   const version = database.query('PRAGMA user_version').get() as { user_version: number };
-  // ! Column presence, not the version stamp alone, decides whether migration
-  // ! runs. The deliveries table predates its source column by several schema
-  // ! versions, and a database can carry the current stamp while its table
-  // ! lacks the column — an equality guard once stamped v6 onto v2–v4 tables
-  // ! it never altered, leaving every claim dying on a missing column while
-  // ! the server kept acknowledging deliveries into a queue nothing could
-  // ! drain. Checking presence makes both that state and any like it heal.
+  // ! Column presence, not the version stamp, decides whether migration runs:
+  // ! a database can carry the current stamp while its tables lack the columns
+  // ! (an equality guard once stamped v6 onto v2–v4 it never altered), and only
+  // ! presence checks make that state heal.
   const deliveriesHaveSource = () =>
     (database.query('PRAGMA table_info(deliveries)').all() as { name: string }[]).some(
       (column) => column.name === 'source',
@@ -106,10 +103,8 @@ const migrate = (database: Database) => {
     (database.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(
       (existing) => existing.name === column,
     );
-  // ! Every v9 artifact, not a sample of them. A database stamped 9 that is
-  // ! missing one table or one column returns early here and then fails on every
-  // ! use of it — which is exactly the failure the v6 equality guard used to
-  // ! cause, one version later.
+  // Every v9 artifact checked, not a sample: one missing piece would fail on
+  // every use — the v6 equality-guard failure, one version later.
   if (
     version.user_version === 9 &&
     deliveriesHaveSource() &&
@@ -223,18 +218,13 @@ const migrate = (database: Database) => {
           WHERE status = 'running' AND lease_expires_at IS NULL;
       `);
     }
-    // ! Column presence, not the version stamp, for the same reason the guard
-    // ! above checks artifacts rather than trusting `user_version`: a database
-    // ! stamped past 4 whose `capability_audit` lacks `actor` would leave this
-    // ! migration unrepaired, and every `recordAudit` — which names the column —
-    // ! then fails. The block below creates the table for every path that
-    // ! predates it, so only a schema that already has it can need the column.
+    // Column presence, not the stamp, for the same reason as the v9 guard:
+    // `recordAudit` names this column, so an unrepaired table fails forever.
     if (hasTable('capability_audit') && !hasColumn('capability_audit', 'actor')) {
       database.exec('ALTER TABLE capability_audit ADD COLUMN actor TEXT');
     }
-    // ! The check sits after the `CREATE TABLE IF NOT EXISTS` above, which is
-    // ! its only ordering constraint: a table that never existed is created
-    // ! complete, and one that predates the column is altered here.
+    // Ordered after the CREATE TABLE IF NOT EXISTS above: a fresh table is
+    // created complete; only one predating the column reaches this ALTER.
     if (!deliveriesHaveSource()) {
       database.exec("ALTER TABLE deliveries ADD COLUMN source TEXT NOT NULL DEFAULT 'webhook'");
     }
@@ -290,11 +280,8 @@ const migrate = (database: Database) => {
       );
       PRAGMA user_version = 9;
     `);
-    // ! Condemned, not drained. `DeliverySource` no longer has a `webhook`
-    // ! member, so nothing can decode these bodies — leaving one claimable
-    // ! means the delivery worker looks up a decoder that is not there and
-    // ! dies on a defect every cycle. `failed` is terminal and `last_error`
-    // ! says why, which is the most an upgrade can honestly offer.
+    // ! Condemned, not drained: no decoder exists for webhook bodies anymore,
+    // ! so leaving one claimable kills the delivery worker on a defect per cycle.
     database.exec(
       `UPDATE deliveries
        SET status = 'failed', processed_at = unixepoch('subsec') * 1000,
@@ -835,10 +822,9 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
              (status = 'failed' AND processed_at < ?)`,
           )
           .run(completedBefore, failedBefore);
-        // ! Pruned on the failed window, the longer of the two. A cursor is the
-        // ! only record of what a thread already produced, so dropping one early
-        // ! makes the qualifier rescan from the beginning of the thread and
-        // ! re-attribute an old comment as fresh activity.
+        // Pruned on the failed window, the longer of the two: a cursor dropped
+        // early makes the qualifier rescan and re-attribute an old comment as
+        // fresh activity.
         database.query('DELETE FROM notification_cursors WHERE updated_at < ?').run(failedBefore);
         database.query('DELETE FROM thread_liveness WHERE expires_at < ?').run(now);
         database.exec('PRAGMA wal_checkpoint(PASSIVE)');
@@ -914,7 +900,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         return yield* attempt('read thread liveness', () => {
-          // ! bun:sqlite answers null, not undefined, for a missing row.
+          // bun:sqlite answers null, not undefined, for a missing row.
           const row = database
             .query(
               `SELECT expires_at AS expiresAt FROM thread_liveness

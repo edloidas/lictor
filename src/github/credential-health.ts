@@ -15,9 +15,8 @@ import { Effect, Ref } from 'effect';
 export class CredentialHealth extends Effect.Service<CredentialHealth>()('CredentialHealth', {
   effect: Effect.gen(function* () {
     const rejected = yield* Ref.make(false);
-    // ! Loud exactly once. Every poll cycle would otherwise repeat a fatal-grade
-    // ! log line forever, burying everything else — the mirror of the poller's
-    // ! original suspension comment.
+    // Loud exactly once: every poll cycle repeating a fatal-grade line buries
+    // everything else.
     const suspend = Ref.getAndSet(rejected, true).pipe(
       Effect.flatMap((already) =>
         already

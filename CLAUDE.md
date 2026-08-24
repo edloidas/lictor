@@ -62,6 +62,12 @@ bun validate    # Full gate: check + test:ci (coverage)
   means adding a member and the map forces its decoder into existence — nothing
   downstream assumes an envelope
 
+## Comments
+
+Default to none. A plain `//` comment only for a non-obvious invariant — why,
+not what. `// !` is for critical things alone: data loss, security, silent
+corruption — not every sharp edge.
+
 ## Ad-hoc scripts
 
 For one-off checks: create the file with the `Write` tool, run `bun run <file>`,

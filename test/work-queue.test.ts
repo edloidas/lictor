@@ -370,9 +370,9 @@ describe('WorkQueue', () => {
     }
   });
 
-  // ! `capability_audit` is created with `IF NOT EXISTS`, so a database that
-  // ! already has the table skips it entirely and needs the column added by
-  // ! hand. Without the ALTER, every audit write on an existing install fails.
+  // `capability_audit` is created with `IF NOT EXISTS`, so a database that
+  // already has the table skips it entirely and needs the column added by
+  // hand. Without the ALTER, every audit write on an existing install fails.
   it('adds the audit actor column to a database created before it existed', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
@@ -413,10 +413,10 @@ describe('WorkQueue', () => {
     }
   });
 
-  // ! The migration guard checks artifacts, not the version stamp, so a database
-  // ! stamped current but missing one of them must still be repaired. Every
-  // ! `recordAudit` names `actor`, so an unrepaired column fails every
-  // ! acknowledgement — and the guard is the only thing standing between the two.
+  // The migration guard checks artifacts, not the version stamp, so a database
+  // stamped current but missing one of them must still be repaired. Every
+  // `recordAudit` names `actor`, so an unrepaired column fails every
+  // acknowledgement — and the guard is the only thing standing between the two.
   it.each(['notification_cursors', 'poller_state', 'capability_audit.actor'])(
     'repairs a database stamped current but missing %s',
     async (artifact) => {
@@ -469,10 +469,10 @@ describe('WorkQueue', () => {
     },
   );
 
-  // ! `DeliverySource` no longer has a `webhook` member, so a leftover
-  // ! claimable row would make the delivery worker look up a decoder that is
-  // ! not there and die on a defect every cycle. The upgrade condemns them
-  // ! instead, and says why in `last_error`.
+  // `DeliverySource` no longer has a `webhook` member, so a leftover
+  // claimable row would make the delivery worker look up a decoder that is
+  // not there and die on a defect every cycle. The upgrade condemns them
+  // instead, and says why in `last_error`.
   it('condemns undrained webhook deliveries when the transport is removed', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
@@ -508,8 +508,8 @@ describe('WorkQueue', () => {
 
       expect(statuses.pending).toBe('failed');
       expect(statuses.processing).toBe('failed');
-      // ! A row already drained is history, not a hazard — leave it alone so the
-      // ! retention window prunes it on schedule.
+      // A row already drained is history, not a hazard — leave it alone so the
+      // retention window prunes it on schedule.
       expect(statuses.done).toBe('completed');
       expect(statuses.claimed).toBeUndefined();
     } finally {
@@ -517,12 +517,12 @@ describe('WorkQueue', () => {
     }
   });
 
-  // ! Every delivery stored before sources existed came from the webhook, so
-  // ! the migration must backfill the column rather than leave old rows
-  // ! unreadable by a consumer that switches over it. The seeds rewind to
-  // ! faithful pre-source shapes — version 2 predates the table entirely, and
-  // ! the audit table is dropped or stripped to match what each later version
-  // ! actually held, since its own migration is equality-gated on version 4.
+  // Every delivery stored before sources existed came from the webhook, so
+  // the migration must backfill the column rather than leave old rows
+  // unreadable by a consumer that switches over it. The seeds rewind to
+  // faithful pre-source shapes — version 2 predates the table entirely, and
+  // the audit table is dropped or stripped to match what each later version
+  // actually held, since its own migration is equality-gated on version 4.
   it.each([2, 3, 4, 5])(
     'upgrades a version-%i database so deliveries carry a source',
     async (version) => {
@@ -661,21 +661,21 @@ describe('WorkQueue', () => {
     }
   });
 
-  // ! Liveness feeds the sweep predicate, where absence means deletable. The
-  // ! result must therefore be exhaustive over every non-terminal status — a
-  // ! page cap here would name live sessions dead — while every terminal
-  // ! status is absent. Live ids span both ends of the table so a
-  // ! newest-first limit of any small size would miss one. `recoverStale`
-  // ! recovers every stale running job, so the interrupted fixture lives in a
-  // ! scope of its own rather than beside the others.
+  // Liveness feeds the sweep predicate, where absence means deletable. The
+  // result must therefore be exhaustive over every non-terminal status — a
+  // page cap here would name live sessions dead — while every terminal
+  // status is absent. Live ids span both ends of the table so a
+  // newest-first limit of any small size would miss one. `recoverStale`
+  // recovers every stale running job, so the interrupted fixture lives in a
+  // scope of its own rather than beside the others.
   it('lists live job ids exhaustively across non-terminal statuses', async () => {
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
         const now = yield* Clock.currentTimeMillis;
 
-        // ! Dead-letter first: its recovery passes would flip any other
-        // ! running job, so nothing else may be running yet.
+        // Dead-letter first: its recovery passes would flip any other
+        // running job, so nothing else may be running yet.
         yield* queue.enqueue(work('j-dead'));
         for (let cycle = 0; cycle < 3; cycle++) {
           const claimed = yield* queue.claim;
@@ -797,7 +797,7 @@ describe('WorkQueue', () => {
           expiresAt: (yield* Clock.currentTimeMillis) + 60_000,
         });
         const live = yield* queue.livenessFor('edloidas/lictor', 'issue', 17);
-        // ! Case-insensitive on the repository, like every other name compare.
+        // Case-insensitive on the repository, like every other name compare.
         const liveCanonical = yield* queue.livenessFor('EDLOIDAS/LICTOR', 'issue', 17);
         const expired = yield* queue.livenessFor('edloidas/lictor', 'issue', 18);
         return { live, liveCanonical, expired };

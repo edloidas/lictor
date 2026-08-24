@@ -117,9 +117,9 @@ const run = <A, E>(
   return Effect.runPromise(
     Effect.scoped(
       effect.pipe(
-        // ! Health merged outside too, so the test body and the worker share
-        // ! one latch instance — suspending in the test must be visible to the
-        // ! loop under test.
+        // Health merged outside too, so the test body and the worker share
+        // one latch instance — suspending in the test must be visible to the
+        // loop under test.
         Effect.provide(Layer.mergeAll(QueueLive, WorkerLive, HealthLive)),
         Effect.provide(ConfigLive),
       ),
@@ -177,9 +177,9 @@ describe('Worker.runOnce', () => {
     expect(counts.retry).toBe(0);
   });
 
-  // ! The whole point of the daemon-wide latch: while the credential is dead,
-  // ! claims stop *before* an attempt is spent, so queued work survives a token
-  // ! rotation instead of draining into failures.
+  // The whole point of the daemon-wide latch: while the credential is dead,
+  // claims stop *before* an attempt is spent, so queued work survives a token
+  // rotation instead of draining into failures.
   it('stops claiming while the credential is rejected', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -207,7 +207,7 @@ describe('Worker.runOnce', () => {
         yield* queue.enqueue(work);
         const first = yield* worker.runOnce;
         const latched = yield* health.isRejected;
-        // ! No second claim: the retained job must not spend another attempt.
+        // No second claim: the retained job must not spend another attempt.
         const second = yield* worker.runOnce;
         return { first, latched, second, counts: yield* queue.counts };
       }),
@@ -246,9 +246,9 @@ describe('Worker.runOnce', () => {
     expect(result.worked).toBe(false);
     expect(result.counts.pending).toBe(1);
   });
-  // ! Access is a fact about the repository, not the daemon, and repeating the
-  // ! attempt cannot change it — unlike a refused credential, which an operator
-  // ! rotates. So this one stays terminal and the credential one does not.
+  // Access is a fact about the repository, not the daemon, and repeating the
+  // attempt cannot change it — unlike a refused credential, which an operator
+  // rotates. So this one stays terminal and the credential one does not.
   it('does not retry a workspace failure that can never succeed', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -295,12 +295,12 @@ describe('Worker.runOnce', () => {
     expect(result.retry).toBe(1);
   });
 
-  // ! GitHub publishes when the bucket refills. Guessing with exponential
-  // ! backoff either wastes the wait or retries into the same wall. Both halves
-  // ! are load-bearing: `retry` proves the job is still scheduled rather than
-  // ! abandoned, and the unavailability after 250ms proves it was scheduled from
-  // ! the hint and not from the 100ms configured base. Either one alone is also
-  // ! satisfied by a permanently failed job.
+  // GitHub publishes when the bucket refills. Guessing with exponential
+  // backoff either wastes the wait or retries into the same wall. Both halves
+  // are load-bearing: `retry` proves the job is still scheduled rather than
+  // abandoned, and the unavailability after 250ms proves it was scheduled from
+  // the hint and not from the 100ms configured base. Either one alone is also
+  // satisfied by a permanently failed job.
   it('schedules a throttled workspace failure from the wait GitHub asked for', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -349,9 +349,9 @@ describe('Worker.runOnce', () => {
     expect(reclaimed?.work.deliveryId).toBe(work.deliveryId);
   });
 
-  // ! A pull-request job must clone at its head, not the default branch —
-  // ! reviewing a PR requires reviewing its tree. `refs/pull/<n>/head` resolves
-  // ! from the base repository, so it works for fork PRs too.
+  // A pull-request job must clone at its head, not the default branch —
+  // reviewing a PR requires reviewing its tree. `refs/pull/<n>/head` resolves
+  // from the base repository, so it works for fork PRs too.
   it('clones a pull-request job at refs/pull/<n>/head', async () => {
     const acquireCalls: Parameters<InstanceType<typeof RepositoryWorkspace>['acquire']>[0][] = [];
     await run(
@@ -396,8 +396,8 @@ describe('Worker.runOnce', () => {
     expect(acquireCalls[0]?.ref).toBeUndefined();
   });
 
-  // ! A branch a previous interaction created wins over the PR head: continuing
-  // ! her own work beats re-reading a head that may have moved.
+  // A branch a previous interaction created wins over the PR head: continuing
+  // her own work beats re-reading a head that may have moved.
   it('clones at the branch a prior interaction on this subject created', async () => {
     const acquireCalls: Parameters<InstanceType<typeof RepositoryWorkspace>['acquire']>[0][] = [];
     await run(

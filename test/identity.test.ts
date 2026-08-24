@@ -83,9 +83,9 @@ const resolve = (options: {
           ),
         ),
       );
-      // ! Building the layer must not touch the network — that is the whole
-      // ! point of the service. So the probe is triggered explicitly here, and a
-      // ! suite that saw zero calls after construction would be the bug.
+      // Building the layer must not touch the network — that is the whole
+      // point of the service. So the probe is triggered explicitly here, and a
+      // suite that saw zero calls after construction would be the bug.
       const service = yield* Effect.provide(GitHubIdentity, IdentityLive);
       const before = yield* Ref.get(calls);
       const identity = yield* service.verified;
@@ -110,9 +110,9 @@ describe('GitHubIdentity', () => {
     expect(exit._tag).toBe('Success');
   });
 
-  // ! The whole point of the check: a valid token for the wrong account must not
-  // ! reach a single API call, because GitHub ignores the Basic-auth username and
-  // ! nothing downstream would notice the substitution.
+  // The whole point of the check: a valid token for the wrong account must not
+  // reach a single API call, because GitHub ignores the Basic-auth username and
+  // nothing downstream would notice the substitution.
   it('fails when the credential belongs to another account', async () => {
     const exit = await resolve({ expectedLogin: 'adiutriel', body: { login: 'edloidas' } });
 
@@ -125,8 +125,8 @@ describe('GitHubIdentity', () => {
     expect(exit._tag).toBe('Failure');
   });
 
-  // ! A token for the right account with the wrong scopes passes every other
-  // ! check and then 403s on the first clone, once per job, forever.
+  // A token for the right account with the wrong scopes passes every other
+  // check and then 403s on the first clone, once per job, forever.
   it('refuses a classic token that lacks the repo scope', async () => {
     const exit = await resolve({
       expectedLogin: 'adiutriel',
@@ -145,8 +145,8 @@ describe('GitHubIdentity', () => {
     expect(exit._tag).toBe('Success');
   });
 
-  // ! No scope header at all means a different credential class, which is what
-  // ! the migration seam is for — warn, do not refuse.
+  // No scope header at all means a different credential class, which is what
+  // the migration seam is for — warn, do not refuse.
   it('starts when GitHub reports no scopes at all', async () => {
     const exit = await resolve({ expectedLogin: 'adiutriel' });
 
@@ -172,9 +172,9 @@ describe('GitHubIdentity', () => {
     expect(exit.value.identity.tokenExpiresAt).toBeUndefined();
   });
 
-  // ! Booting before the network is up must not need an operator. A daemon that
-  // ! dies on a DNS blip stops receiving deliveries, and GitHub does not
-  // ! redeliver what it could not reach.
+  // Booting before the network is up must not need an operator. A daemon that
+  // dies on a DNS blip stops receiving deliveries, and GitHub does not
+  // redeliver what it could not reach.
   it('retries an unreachable GitHub and succeeds once it answers', async () => {
     const exit = await resolve({
       expectedLogin: 'adiutriel',
@@ -192,8 +192,8 @@ describe('GitHubIdentity', () => {
     expect(exit._tag).toBe('Failure');
   });
 
-  // ! 403 is both "credential refused" and "bucket empty". Retrying the first
-  // ! wastes a boot; failing on the second needs an operator for nothing.
+  // 403 is both "credential refused" and "bucket empty". Retrying the first
+  // wastes a boot; failing on the second needs an operator for nothing.
   it('retries a throttled 403 rather than treating it as a bad credential', async () => {
     const exit = await resolve({
       expectedLogin: 'adiutriel',
@@ -201,8 +201,8 @@ describe('GitHubIdentity', () => {
         {
           status: 403,
           body: {},
-          // ! A reset already due, so the honoured wait is zero and the test does
-          // ! not sit out the conservative default the headerless case falls to.
+          // A reset already due, so the honoured wait is zero and the test does
+          // not sit out the conservative default the headerless case falls to.
           headers: {
             'x-ratelimit-remaining': '0',
             'x-ratelimit-reset': String(Math.floor(Date.now() / 1000)),
@@ -217,24 +217,24 @@ describe('GitHubIdentity', () => {
     expect(exit.value.calls).toHaveLength(2);
   });
 
-  // ! GitHub answers a secondary limit with 403 and no rate headers, so the
-  // ! headers alone would make a throttle at boot look like a dead credential.
-  // ! No `retry-after` header: the body prose must be what trips the secondary
-  // ! limit, since a header would short-circuit before the body is read.
-  // ! A headerless 403 whose *body* reports a secondary limit is covered by the
-  // ! broker suite, which shares `isSecondaryRateLimit`. Repeating it here would
-  // ! need either a retry-after header — which short-circuits before the body is
-  // ! read, deadening the branch this case named — or sitting out the 60s
-  // ! conservative default the headerless case falls to.
+  // GitHub answers a secondary limit with 403 and no rate headers, so the
+  // headers alone would make a throttle at boot look like a dead credential.
+  // No `retry-after` header: the body prose must be what trips the secondary
+  // limit, since a header would short-circuit before the body is read.
+  // A headerless 403 whose *body* reports a secondary limit is covered by the
+  // broker suite, which shares `isSecondaryRateLimit`. Repeating it here would
+  // need either a retry-after header — which short-circuits before the body is
+  // read, deadening the branch this case named — or sitting out the 60s
+  // conservative default the headerless case falls to.
   it('fails a 403 that carries no throttling signal', async () => {
     const exit = await resolve({ expectedLogin: 'adiutriel', status: 403, body: {} });
 
     expect(exit._tag).toBe('Failure');
   });
 
-  // ! The qualification policy drops self-authored deliveries anyway, but an
-  // ! operator who trusts the daemon's own account has misunderstood something
-  // ! worth stopping for.
+  // The qualification policy drops self-authored deliveries anyway, but an
+  // operator who trusts the daemon's own account has misunderstood something
+  // worth stopping for.
   it('refuses to start when the daemon login is a trusted sender', async () => {
     const exit = await resolve({
       expectedLogin: 'adiutriel',
@@ -250,8 +250,8 @@ describe('GitHubIdentity', () => {
     expect(exit._tag).toBe('Success');
   });
 
-  // ! The header is the only thing that knows when the bucket reopens. Retrying
-  // ! on the exponential schedule alone burns the budget before it does.
+  // The header is the only thing that knows when the bucket reopens. Retrying
+  // on the exponential schedule alone burns the budget before it does.
   it('honours the wait GitHub named on a throttled response', async () => {
     const exit = await resolve({
       expectedLogin: 'adiutriel',
@@ -263,8 +263,8 @@ describe('GitHubIdentity', () => {
     expect(exit.value.calls).toHaveLength(2);
   });
 
-  // ! `GITHUB_TRUSTED_SENDERS` is lowercased by `loginList`, but a caller that
-  // ! builds the config by hand is not, and this refusal is the safety net.
+  // `GITHUB_TRUSTED_SENDERS` is lowercased by `loginList`, but a caller that
+  // builds the config by hand is not, and this refusal is the safety net.
   it('refuses a trusted sender that differs from the daemon login only by case', async () => {
     const exit = await resolve({
       expectedLogin: 'adiutriel',

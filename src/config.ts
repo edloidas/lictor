@@ -28,14 +28,10 @@ const HOME = join(homedir(), '.lictor');
 /**
  * Path config with a home-relative default.
  *
- * A leading `~/` in a supplied value is expanded, because the defaults printed
- * in `.env.example` are home paths and an operator who copies one into `.env`
- * writes exactly that. Without expansion the daemon would create a literal `~`
- * directory beside the working directory and open a second, empty database
- * there — silently, since every path is created on demand.
- *
- * Only a leading `~/`. Not `~user`, not `$HOME`: one rule, stated once, and no
- * path is ever rewritten in a way the operator did not type.
+ * A leading `~/` expands, because `.env.example` prints home paths and an
+ * operator who copies one writes exactly that — unexpanded it silently opens a
+ * second, empty database. Leading `~/` only: no path is rewritten beyond what
+ * the operator typed.
  */
 /** Where state used to live: relative to wherever the daemon happened to run. */
 const LEGACY_HOME = '.lictor';
@@ -58,26 +54,17 @@ export const legacyStateConflict = (
   home = HOME,
   legacy = LEGACY_HOME,
 ): string | undefined => {
-  // ! The database alone decides. It is the only path whose relocation is
-  // ! *silent* — the queue creates the file it cannot find, so the daemon comes
-  // ! up healthy with zero work. A relocated policy path fails loudly on its own
-  // ! when the file is missing, and requiring both to be defaults would miss the
-  // ! operator who set only `LICTOR_POLICY_PATH`, which is the worst case: a
-  // ! daemon that looks fine and quietly ignores yesterday's queue.
+  // ! The database alone decides: its relocation is the silent one — the queue
+  // ! creates the file it cannot find, so the daemon comes up healthy holding
+  // ! zero work. A relocated policy path fails loudly on its own.
   if (config.databasePath !== join(home, 'lictor.sqlite')) return undefined;
-  // ! Files, not directories. The setup instructions say to `mkdir -p ~/.lictor`
-  // ! and copy a policy into it, so a directory test would be defeated by the
-  // ! documented upgrade path itself — the new home exists, the old database is
-  // ! still full of work, and the guard waves it through. An empty legacy
-  // ! directory is likewise nothing to strand.
+  // File test, not directory: the documented upgrade path (`mkdir -p ~/.lictor`)
+  // leaves an empty legacy directory behind, and that strands nothing.
   if (existsSync(config.databasePath)) return undefined;
   if (!existsSync(join(legacy, 'lictor.sqlite'))) return undefined;
-  // ! `mkdir -p` first, because the guard fires precisely when the target may not
-  // ! exist yet, and `mv` with a glob into a missing directory aborts having moved
-  // ! nothing. And "point ... at" rather than "set ...", because the operator may
-  // ! already have set these — `~/.lictor/lictor.sqlite` expands to exactly the
-  // ! default, so setting it explicitly is indistinguishable from setting nothing
-  // ! and being told to set it would be no help at all.
+  // "mkdir -p" first — the guard fires when the target may not exist yet — and
+  // "point ... at" rather than "set ...": `~/.lictor/lictor.sqlite` expands to
+  // exactly the default, so telling them to set it would be no help at all.
   return `Found a daemon database at ${join(legacy, 'lictor.sqlite')} and none at ${config.databasePath}. Move it (mkdir -p ${home} && mv ${legacy}/* ${home}/) or point LICTOR_DATABASE_PATH, LICTOR_POLICY_PATH, and LICTOR_SOCKET_PATH at ${legacy} to keep using it.`;
 };
 
@@ -112,10 +99,9 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       /**
        * Personal access token for the account the daemon acts as.
        *
-       * ! Deliberately not `GITHUB_TOKEN`. That name is exported by `gh`, GitHub
-       * ! Actions, and direnv, and Bun does not let `.env` override a variable
-       * ! already exported by the shell — a stray export would silently run the
-       * ! daemon as whoever owns that token.
+       * ! Deliberately not `GITHUB_TOKEN`: that name is exported by `gh`, GitHub
+       * ! Actions, and direnv, and `.env` cannot override an exported variable —
+       * ! a stray export would silently run the daemon as whoever owns it.
        */
       githubToken: yield* Config.redacted('LICTOR_GITHUB_TOKEN'),
       /**
@@ -180,13 +166,9 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
         10 * 1024 * 1024,
       ),
       /**
-       * Ceiling on every git operation the service runs, network and local
-       * alike — `clone`, `fetch`, and the `checkout` that detaches onto a
-       * fetched ref. The checkout counts as long-running even though it never
-       * touches the network: detaching materializes the working-tree delta,
-       * which on a large repository with a cold cache routinely exceeds any
-       * short local budget. Raising this value therefore raises the budget of
-       * a wedged filesystem too.
+       * Ceiling on every git operation, network or local — including the
+       * `checkout` that detaches onto a fetched ref, which materializes the
+       * working-tree delta and can exceed any short budget on a cold cache.
        */
       gitTimeoutMs: yield* positiveInteger('LICTOR_GIT_TIMEOUT_MS', 180_000, 60 * 60 * 1000),
       workerPollMs: yield* positiveInteger('LICTOR_WORKER_POLL_MS', 1000, 60_000),
@@ -199,10 +181,9 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       /**
        * Floor for the gap between notification polls.
        *
-       * ! A floor, not the interval. GitHub returns `X-Poll-Interval` and asks
-       * ! callers to honour it; polling faster than it says is what earns a
-       * ! secondary rate limit. This only stops a header that is absent or
-       * ! implausibly small from turning the loop into a spin.
+       * ! Polling faster than GitHub's `X-Poll-Interval` says is what earns a
+       * ! secondary rate limit; this only stops an absent or implausibly small
+       * ! header from turning the loop into a spin.
        */
       notificationPollMs: yield* positiveInteger(
         'LICTOR_NOTIFICATION_POLL_MS',

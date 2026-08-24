@@ -14,9 +14,9 @@ describe('describeCause', () => {
     );
   });
 
-  // ! The reason this exists. `GitHubClient` injects the token as a plain
-  // ! `Authorization` header, so a rendered request carries the credential —
-  // ! `Redacted` guards the config value and stops guarding it at the wire.
+  // The reason this exists. `GitHubClient` injects the token as a plain
+  // `Authorization` header, so a rendered request carries the credential —
+  // `Redacted` guards the config value and stops guarding it at the wire.
   it('never renders the nested cause, where the credential lives', () => {
     const described = describeCause(
       Cause.fail(

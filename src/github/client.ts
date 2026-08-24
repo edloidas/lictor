@@ -10,10 +10,9 @@ const reactionPath = (repository: string, target: ContextRef): string => {
       return `/repos/${repository}/issues/comments/${target.id}/reactions`;
     case 'review_comment':
       return `/repos/${repository}/pulls/comments/${target.id}/reactions`;
-    // ! A review, an assignment, and a review request all react on the issue or
-    // ! pull request itself. GitHub has no reactions endpoint for a review, and
-    // ! a timeline event has no resource of its own to acknowledge — the subject
-    // ! is the only place the acknowledgement can land.
+    // Reviews, assignments, and review requests all react on the issue or pull
+    // request itself: no reactions endpoint for a review, and a timeline event
+    // has no resource of its own to acknowledge.
     case 'review':
     case 'assigned':
     case 'review_requested':
@@ -40,10 +39,9 @@ export class GitHubClient extends Effect.Service<GitHubClient>()('GitHubClient',
     const credential = yield* GitHubCredential;
     const client = yield* HttpClient.HttpClient;
 
-    // ! The credential is resolved per request, not once per client. A caller
-    // ! that holds one client across many requests would otherwise bake in the
-    // ! token it saw first, which is invisible with a static token and wrong the
-    // ! moment the credential has to refresh.
+    // Resolved per request, not once per client: a caller holding one client
+    // across many requests would bake in the token it saw first — invisible with
+    // a static token, wrong the moment the credential has to refresh.
     const authenticated = Effect.succeed(
       client.pipe(
         HttpClient.mapRequest(HttpClientRequest.prependUrl('https://api.github.com')),
@@ -83,8 +81,7 @@ export class GitHubClient extends Effect.Service<GitHubClient>()('GitHubClient',
               (cause) => new GitHubRequestError({ message: `Could not POST ${path}`, cause }),
             ),
           );
-        // ! 200 as well as 201: GitHub answers 200 when the reaction is already
-        // ! there, which is the normal case for a replayed delivery.
+        // 200 as well as 201: already-present reaction, normal on a replay.
         if (response.status !== 200 && response.status !== 201) {
           return yield* new GitHubRequestError({
             message: `Reacting to ${target.kind} returned status ${response.status}`,

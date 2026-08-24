@@ -63,8 +63,8 @@ const react = (target: ContextRef, status = 201) => {
 };
 
 describe('GitHubClient.addReaction', () => {
-  // ! Three targets, three endpoints. A url built from the wrong one answers 404
-  // ! and the acknowledgement silently never appears.
+  // Three targets, three endpoints. A url built from the wrong one answers 404
+  // and the acknowledgement silently never appears.
   it('posts an issue-comment reaction to the issues comment endpoint', async () => {
     const { result, calls, bodies } = await react({ kind: 'issue_comment', id: 99 });
 
@@ -89,8 +89,8 @@ describe('GitHubClient.addReaction', () => {
     expect(calls[0]).toBe('POST https://api.github.com/repos/edloidas/lictor/issues/17/reactions');
   });
 
-  // ! GitHub answers 200 rather than 201 when the reaction is already there,
-  // ! which is the normal case for a replayed notification.
+  // GitHub answers 200 rather than 201 when the reaction is already there,
+  // which is the normal case for a replayed notification.
   it('treats an existing reaction as success', async () => {
     const { result } = await react({ kind: 'issue_comment', id: 99 }, 200);
 

@@ -92,10 +92,10 @@ const run = (
           source: 'notification',
         });
         const worker = yield* DeliveryWorker;
-        // ! Repeated deliberately. The drain loop reclaims a pending delivery
-        // ! every cycle, and `claimDelivery` increments `attempts` each time, so
-        // ! a branch that merely defers condemnation looks correct on the first
-        // ! pass and destroys the inbox on the third.
+        // Repeated deliberately. The drain loop reclaims a pending delivery
+        // every cycle, and `claimDelivery` increments `attempts` each time, so
+        // a branch that merely defers condemnation looks correct on the first
+        // pass and destroys the inbox on the third.
         let processed = false;
         for (let pass = 0; pass < passes; pass += 1) {
           processed = yield* worker.runOnce;
@@ -184,19 +184,19 @@ describe('DeliveryWorker', () => {
     expect(result.audit[0]?.outcome).toBe('ok');
   });
 
-  // ! The cursor is what makes the next sweep scan from the right anchor. Moving
-  // ! it is not optional bookkeeping: without it the same comment is re-examined
-  // ! and re-attributed on every poll.
+  // The cursor is what makes the next sweep scan from the right anchor. Moving
+  // it is not optional bookkeeping: without it the same comment is re-examined
+  // and re-attributed on every poll.
   it('advances the thread cursor once the job is committed', async () => {
     const result = await run(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }));
 
     expect(result.cursor).toBe(Date.parse('2026-08-21T10:00:00Z'));
   });
 
-  // ! A reaction is a courtesy, the job is the product. A refused reaction must
-  // ! not reach the delivery worker's error channel, where a non-`QueueError`
-  // ! failure marks the delivery permanently failed and throws away work that is
-  // ! already durably queued.
+  // A reaction is a courtesy, the job is the product. A refused reaction must
+  // not reach the delivery worker's error channel, where a non-`QueueError`
+  // failure marks the delivery permanently failed and throws away work that is
+  // already durably queued.
   it('completes the delivery even when the reaction is refused', async () => {
     const result = await run(
       Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }),
@@ -210,10 +210,10 @@ describe('DeliveryWorker', () => {
     expect(result.audit[0]?.outcome).toBe('react_failed');
   });
 
-  // ! A dead credential says nothing about the delivery. `failed` is terminal —
-  // ! neither the startup reset nor the control plane recovers such a row — so
-  // ! condemning the inbox for a daemon-side misconfiguration silently voids the
-  // ! guarantee that a committed delivery is durable.
+  // A dead credential says nothing about the delivery. `failed` is terminal —
+  // neither the startup reset nor the control plane recovers such a row — so
+  // condemning the inbox for a daemon-side misconfiguration silently voids the
+  // guarantee that a committed delivery is durable.
   it.each([1, 3, 5])(
     'does not condemn a delivery when the credential cannot be verified, after %i passes',
     async (passes) => {
@@ -232,10 +232,10 @@ describe('DeliveryWorker', () => {
     },
   );
 
-  // ! Parse and schema failures are properties of the stored bytes, so they are
-  // ! condemned on the first pass and stay condemned — a later pass must not
-  // ! resurrect them, which is what distinguishes terminal from budgeted. A
-  // ! condemned delivery is not reclaimed, so a later pass finds an empty inbox.
+  // Parse and schema failures are properties of the stored bytes, so they are
+  // condemned on the first pass and stay condemned — a later pass must not
+  // resurrect them, which is what distinguishes terminal from budgeted. A
+  // condemned delivery is not reclaimed, so a later pass finds an empty inbox.
   it.each([1, 3])('condemns an unparseable body after %i passes', async (passes) => {
     const result = await run(
       Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }),
@@ -260,10 +260,10 @@ describe('DeliveryWorker', () => {
     expect(result.counts.pending).toBe(0);
   });
 
-  // ! Anything the worker cannot classify is presumed transient and retried
-  // ! within the attempt budget — this is the path enrichment-fetch transport
-  // ! errors land on. `Effect.die` stands in for such an error, because defects
-  // ! skip every named branch by construction.
+  // Anything the worker cannot classify is presumed transient and retried
+  // within the attempt budget — this is the path enrichment-fetch transport
+  // errors land on. `Effect.die` stands in for such an error, because defects
+  // skip every named branch by construction.
   it.each([1, 2])('keeps retrying an unclassifiable failure after %i passes', async (passes) => {
     const result = await run(Effect.die(new Error('enrichment fetch exploded')), passes);
 
@@ -279,8 +279,8 @@ describe('DeliveryWorker', () => {
 });
 
 describe('isTerminalFailure', () => {
-  // ! Built from a real schema rejection rather than a lookalike object: the
-  // ! predicate must recognize the actual `ParseError` the decoder produces.
+  // Built from a real schema rejection rather than a lookalike object: the
+  // predicate must recognize the actual `ParseError` the decoder produces.
   const parseError = Effect.runSync(
     Effect.flip(Schema.decodeUnknown(Schema.Struct({ login: Schema.String }))({})),
   );

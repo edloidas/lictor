@@ -23,9 +23,9 @@ describe('LictorConfig', () => {
     expect((await Effect.runPromise(load(required))).executor).toBe('codex');
   });
 
-  // ! State must not default into the working directory. Lictor serves many
-  // ! repositories and one of them may be lictor itself, so a relative default
-  // ! puts the live database inside a tree the agent is editing.
+  // State must not default into the working directory. Lictor serves many
+  // repositories and one of them may be lictor itself, so a relative default
+  // puts the live database inside a tree the agent is editing.
   test('defaults every state path under the home directory', async () => {
     const config = await Effect.runPromise(load(required));
 
@@ -34,9 +34,9 @@ describe('LictorConfig', () => {
     expect(config.controlSocketPath).toBe(join(homedir(), '.lictor', 'lictor.sock'));
   });
 
-  // ! The documented defaults are home paths, so an operator copying one into
-  // ! `.env` writes a tilde. Unexpanded, it becomes a literal `~` directory and a
-  // ! second, empty database — created silently, since paths are made on demand.
+  // The documented defaults are home paths, so an operator copying one into
+  // `.env` writes a tilde. Unexpanded, it becomes a literal `~` directory and a
+  // second, empty database — created silently, since paths are made on demand.
   test.each([
     ['~/elsewhere/lictor.sqlite', join(homedir(), 'elsewhere/lictor.sqlite')],
     ['~', homedir()],
@@ -86,9 +86,9 @@ describe('LictorConfig', () => {
     expect(exit._tag).toBe('Failure');
   });
 
-  // ! Opening a fresh database beside the old one is the worst available
-  // ! outcome: the daemon looks healthy while reading none of yesterday's policy
-  // ! and processing none of yesterday's queue.
+  // Opening a fresh database beside the old one is the worst available
+  // outcome: the daemon looks healthy while reading none of yesterday's policy
+  // and processing none of yesterday's queue.
   describe('legacyStateConflict', () => {
     /** Both homes are temporary, so the verdict never depends on the real one. */
     const inScratch = <A>(run: (home: string, legacy: string) => A): A => {
@@ -112,8 +112,8 @@ describe('LictorConfig', () => {
       });
 
       expect(message).toContain('LICTOR_DATABASE_PATH');
-      // ! The guard fires when the target may not exist, so a bare `mv` glob into
-      // ! it would abort having moved nothing and the operator would be stuck.
+      // The guard fires when the target may not exist, so a bare `mv` glob into
+      // it would abort having moved nothing and the operator would be stuck.
       expect(message).toContain('mkdir -p');
     });
 
@@ -123,8 +123,8 @@ describe('LictorConfig', () => {
       ).toBeUndefined();
     });
 
-    // ! Once the new database exists it is the answer, and a leftover legacy file
-    // ! must not block every subsequent start.
+    // Once the new database exists it is the answer, and a leftover legacy file
+    // must not block every subsequent start.
     test('stays quiet once the new database exists too', () => {
       const message = inScratch((home, legacy) => {
         writeLegacyDatabase(legacy);
@@ -136,8 +136,8 @@ describe('LictorConfig', () => {
       expect(message).toBeUndefined();
     });
 
-    // ! The documented upgrade path is `mkdir -p ~/.lictor` plus a policy copy,
-    // ! so testing the directory would let the instructions defeat the guard.
+    // The documented upgrade path is `mkdir -p ~/.lictor` plus a policy copy,
+    // so testing the directory would let the instructions defeat the guard.
     test('still reports when the new home exists but holds no database', () => {
       const message = inScratch((home, legacy) => {
         writeLegacyDatabase(legacy);
@@ -158,8 +158,8 @@ describe('LictorConfig', () => {
       expect(message).toBeUndefined();
     });
 
-    // ! An explicit path is a decision already made, and a legacy directory
-    // ! beside it is then just a directory.
+    // An explicit path is a decision already made, and a legacy directory
+    // beside it is then just a directory.
     test('stays quiet when the operator configured the database path', () => {
       const message = inScratch((home, legacy) => {
         writeLegacyDatabase(legacy);
@@ -169,14 +169,14 @@ describe('LictorConfig', () => {
       expect(message).toBeUndefined();
     });
 
-    // ! The worst case, and the one a both-paths-defaulted check misses. A
-    // ! relocated policy fails loudly on a missing file; a relocated database
-    // ! just opens an empty one, so the daemon looks healthy with no work.
+    // The worst case, and the one a both-paths-defaulted check misses. A
+    // relocated policy fails loudly on a missing file; a relocated database
+    // just opens an empty one, so the daemon looks healthy with no work.
     test('reports a conflict even when only the policy path was configured', () => {
       const message = inScratch((home, legacy) => {
         writeLegacyDatabase(legacy);
-        // ! Typed wide on purpose: the signature ignores `policyPath`, and this is
-        // ! what a real caller passes — the whole config.
+        // Typed wide on purpose: the signature ignores `policyPath`, and this is
+        // what a real caller passes — the whole config.
         const config = {
           databasePath: join(home, 'lictor.sqlite'),
           policyPath: '/etc/lictor/policy.toml',

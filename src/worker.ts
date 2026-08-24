@@ -14,27 +14,18 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
     const policy = yield* Policy;
     const workspaces = yield* RepositoryWorkspace;
     const health = yield* CredentialHealth;
-    // ! Worker-owned scheduling, not a workspace API. Despite the partitioned
-    // ! key, `PartitionedSemaphore`'s permits are *global*, shared across all
-    // ! keys round-robin — `permits: 1` is a daemon-wide mutex with fair
-    // ! queuing, not one permit per repository. That over-serializes: safe,
-    // ! since each job's session is its own, but nothing runs concurrently.
-    // ! Genuine per-repository serialization needs a different construct
-    // ! before any concurrent worker fiber exists. The API itself is marked
-    // ! `@experimental`. Today `Worker.run` is a single sequential loop, so
-    // ! this only orders work; it guards no shared store — there are no
-    // ! pushes (the session is token-free by design), and every GitHub write
-    // ! goes through `CapabilityBroker`, which checks each call against the
-    // ! job's persisted attempt and live lease, so two jobs racing on one
-    // ! issue are individually attributed, never conflated.
+    // PartitionedSemaphore permits are global, shared across all keys
+    // round-robin: `permits: 1` is a daemon-wide mutex with fair queuing, not
+    // one permit per repository. Safe — each job's session is its own — but it
+    // only orders work; genuine per-repository serialization needs a different
+    // construct before any concurrent worker fiber exists.
     const locks = yield* PartitionedSemaphore.make<string>({ permits: 1 });
 
     const runOnce = Effect.gen(function* () {
       if (!executor.enabled) return false;
-      // ! Before the claim, not after: a claimed job spends its attempt the
-      // ! moment it runs. While the credential is dead every GitHub-dependent
-      // ! job would burn its budget on clones that cannot push — leaving the
-      // ! rows untouched keeps them for the rotation instead.
+      // Before the claim, not after: a claimed job spends its attempt the moment
+      // it runs, and a dead credential makes every claim burn it on a clone that
+      // cannot push.
       if (yield* health.isRejected) return false;
       const job = yield* queue.claimFor(queue.ownerId, policy.maxJobAgeMs);
       if (job === undefined) return false;
@@ -53,12 +44,10 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         ),
       );
       const repositoryPolicy = policy.forRepository(job.work.repository);
-      // ! A pull-request job clones at its head: `refs/pull/<n>/head` resolves
-      // ! the PR head from the base repository, so it works for forks too, and
-      // ! landing on the default branch would review the wrong tree. An issue
-      // ! job passes no ref — the clone already sits on the default HEAD.
-      // ! A branch a previous interaction on this subject created wins over
-      // ! both: continuing her own work beats re-reading a moved head.
+      // PR jobs clone at their head (`refs/pull/<n>/head` works for forks too;
+      // the default branch would review the wrong tree). A branch a previous
+      // interaction created wins over both: continuing her own work beats
+      // re-reading a moved head.
       const priorBranch = yield* queue.branchForSubject(
         job.work.repository,
         job.work.subject.kind,
@@ -139,9 +128,8 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
                     cause instanceof WorkspaceError
                       ? cause.message
                       : 'Could not prepare or clean up the isolated workspace',
-                  // ! A refused credential never heals, and each retry pays for
-                  // ! another clone. Only genuinely transient workspace failures
-                  // ! are worth another attempt.
+                  // A refused credential never heals and every retry pays another
+                  // clone; only transient workspace failures are worth an attempt.
                   retryable: cause instanceof WorkspaceError ? cause.retryable !== false : true,
                   ...(cause instanceof WorkspaceError && cause.retryAfterMs !== undefined
                     ? { retryAfterMs: cause.retryAfterMs }
@@ -151,8 +139,8 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
           ),
         );
       const result = yield* Effect.either(Effect.raceFirst(execution, keepLease));
-      // ! Git classifies a refused credential from its stderr prose; latch the
-      // ! daemon-wide breaker here so no further claim happens while it is dead.
+      // Git classifies a refused credential from stderr prose; latch the
+      // daemon-wide breaker here so nothing claims while it is dead.
       if (
         result._tag === 'Left' &&
         result.left.cause instanceof WorkspaceError &&

@@ -56,11 +56,9 @@ const Subject = Schema.Struct({
 /**
  * A submitted pull-request review, whose own body can carry the mention.
  *
- * ! A third comment species, and not optional. GitHub notifies on a mention in a
- * ! review body, `/pulls/{n}/comments` holds only the inline threads, and the
- * ! deleted `pull_request_review` webhook handler used to cover exactly this. It
- * ! carries `submitted_at` rather than `updated_at`, and the endpoint takes no
- * ! `since`, so the window filter is applied here instead of by GitHub.
+ * A third comment species GitHub notifies on; `/pulls/{n}/comments` holds only
+ * inline threads. Carries `submitted_at` and its endpoint takes no `since`, so
+ * the window filter is applied here.
  */
 const Review = Schema.Struct({
   id: Schema.Number,
@@ -81,12 +79,9 @@ const Comment = Schema.Struct({
 
 /**
  * One issue-timeline event — the only record of who assigned her or requested
- * her review.
- *
- * ! The notification names a thread, never an actor: an assignment carries no
- * ! comment whose author could be trusted, so the actor is resolved from the
- * ! timeline. `requested_reviewer` is checked rather than trusted blindly — a
- * ! `review_requested` event naming a team says nothing about her.
+ * her review: an assignment carries no comment whose author could be trusted.
+ * A `review_requested` event naming a team says nothing about her, so the
+ * requested reviewer is checked rather than trusted blindly.
  */
 const TimelineEvent = Schema.Struct({
   id: Schema.Number,
@@ -107,24 +102,16 @@ const parseDate = (value: string): number | undefined => {
 };
 
 /**
- * Strips the parts of a comment that quote or display someone else's words.
+ * Strips quote blocks, code spans, and fenced code — places where a mention is
+ * displayed, not addressed.
  *
- * ! Not cosmetic. GitHub's own reply button quotes the message it replies to, and
- * ! GitHub notifies on a mention inside a blockquote — so without this a reader
- * ! quote-replying to "@adiutriel do X" produces a second job that does X again,
- * ! attributed to whoever merely agreed with it. Code spans matter for the same
- * ! reason: a mention shown as an example is not an instruction.
- *
- * ! Fences are matched line-anchored, both spellings. Anchoring is what stops a
- * ! sentence containing two inline ``` runs from swallowing everything between
- * ! them, which silently ate real mentions. A blockquote is recognised inside a
- * ! list item too, because that is how a threaded quote-reply nests.
- *
- * ! Not a Markdown parser, and not trying to be. A lazy blockquote continuation —
- * ! an unprefixed line GitHub still renders inside the quote — is not recognised,
- * ! and indented code blocks are deliberately left alone: stripping four-space
- * ! indentation would eat list continuations, and losing a real mention is worse
- * ! than acting on a displayed one.
+ * GitHub's reply button quotes the message and notifies on blockquote mentions,
+ * so without this a quote-reply to "@her do X" produces a second job attributed
+ * to whoever agreed with it. Fences are matched line-anchored (both spellings):
+ * unanchored, two inline ``` runs swallow everything between them and silently
+ * ate real mentions. Not a Markdown parser: lazy blockquote continuations are
+ * missed, indented code blocks left alone — losing a real mention beats acting
+ * on a displayed one.
  */
 const addressable = (body: string): string =>
   body
@@ -132,19 +119,16 @@ const addressable = (body: string): string =>
     .replace(/`[^`\n]*`/g, ' ')
     .replace(/^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?>.*$/gm, ' ');
 
-// ! Deliberately narrow, and not to be loosened. `@adiutriel-bot` is a different
-// ! account, and matching a login that merely prefixes hers would put someone
-// ! else's mention into her queue.
+// ! Deliberately narrow, not to be loosened: matching a login that merely
+// ! prefixes hers would put someone else's mention into her queue.
 const mentions = (body: string, login: string): boolean => {
   const escaped = login.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(`(^|[^a-z0-9-])@${escaped}(?![a-z0-9-])`, 'i').test(addressable(body));
 };
 
-/**
- * ! Generic over the client's error channel rather than typed `HttpClient`. The
- * ! authenticated client can also fail resolving the credential, and pinning the
- * ! narrower type here would force a cast at the only call site that has one.
- */
+// Generic over the client's error channel: the authenticated client can also
+// fail resolving the credential, and a narrower type forces a cast at the only
+// call site that has one.
 type Authenticated<E> = HttpClient.HttpClient.With<E>;
 
 const fetchResponse = <E>(
@@ -167,11 +151,9 @@ const fetchResponse = <E>(
     );
 };
 
-/**
- * ! A body that will not parse is wrapped like every other enrichment failure.
- * ! A truncated 200 is as transient as a request that never arrived, and letting
- * ! its `ResponseError` escape would put it outside the retry budget.
- */
+// An unparseable body wraps like every other enrichment failure: a truncated
+// 200 is as transient as a request that never arrived, and letting its error
+// escape would put it outside the retry budget.
 const readJson = (
   response: { readonly json: Effect.Effect<unknown, unknown> },
   path: string,
@@ -214,11 +196,10 @@ const fetchSubject = <E>(
 /**
  * Page number `Link: rel="last"` points at, when GitHub supplies one.
  *
- * ! The only way to read this endpoint newest-first. `GET /issues/{n}/comments`
- * ! takes no `direction` — only the repository-wide comment list does — so the
- * ! last page is the sole handle on the newest comments. Without it a truncated
- * ! scan holds the *oldest* half of the window, which is exactly the wrong half
- * ! for a rule where the newest mentioning comment decides trust.
+ * The only way to read the endpoint newest-first — it takes no `direction`, so
+ * the last page is the sole handle on the newest comments. Without it a
+ * truncated scan holds the oldest half of the window, the wrong half when the
+ * newest mentioning comment decides trust.
  */
 const lastPage = (link: string | undefined): number | undefined => {
   if (link === undefined) return undefined;
@@ -255,16 +236,10 @@ const readPage = <A, I, E>(
 /**
  * Every element of a paginated list in the window, newest pages first.
  *
- * The first request establishes how many pages there are; from then on the walk
- * runs backwards, so exhausting the budget drops the oldest entries rather than
- * the newest. That makes the budget a safe truncation instead of a reason to fail
- * a delivery on a thread that is merely long.
- *
- * ! Page 1 is read before the budget is known, because `Link` is the only place
- * ! the page count appears. When the walk does not reach page 2 those hundred
- * ! entries are the oldest in the window and are dropped — one request spent to
- * ! learn the shape of the thread, which is the price of endpoints with no
- * ! `direction` parameter.
+ * Page 1 fixes the page count (`Link` is the only place it appears); from then
+ * on the walk runs backwards, so exhausting the budget drops the oldest entries,
+ * which makes truncation safe instead of failing the delivery. When the walk
+ * never reaches page 2 those hundred entries are the oldest and are dropped.
  */
 const fetchNewestFirst = <A, I, E>(
   client: Authenticated<E>,
@@ -298,12 +273,9 @@ const fetchComments = <E>(
 ): Effect.Effect<readonly Schema.Schema.Type<typeof Comment>[], NotificationError> =>
   fetchNewestFirst(client, path, Comment, since);
 
-/**
- * ! Paginated newest-first like the comment streams, and for the same reason: the
- * ! endpoint returns oldest-first and takes no `since`, so reading only page 1
- * ! would hide the newest reviews on any pull request with more than a hundred of
- * ! them. The window filter is applied to the candidates instead of by GitHub.
- */
+// Paginated newest-first like the comment streams: the endpoint returns
+// oldest-first, takes no `since`, and reading only page 1 hides the newest
+// reviews past a hundred. Window filtering happens on the candidates.
 const fetchReviews = <E>(
   client: Authenticated<E>,
   repository: string,
@@ -342,13 +314,11 @@ const fetchTriggeringEvent = <E>(
       if (at === undefined || (since !== undefined && at < since)) return false;
       return reason === 'assign'
         ? normalizeLogin(event.assignee?.login ?? '') === selfLogin
-        : // ! A team request names no individual, so there is nobody to trust
-          // ! and nobody to attribute — skipped rather than guessed.
+        : // A team request names no individual — skipped rather than guessed.
           normalizeLogin(event.requested_reviewer?.login ?? '') === selfLogin;
     });
-    // ! Trust first, newest second. Picking the newest match and then trusting
-    // ! it would let an untrusted assigner silence a trusted one with
-    // ! assign → unassign → assign.
+    // Trust first, newest second: trusting the newest match lets an untrusted
+    // assigner silence a trusted one with assign → unassign → assign.
     const eligible = inWindow.filter((event) => {
       const causer = reason === 'assign' ? event.actor?.login : event.review_requester?.login;
       const author = normalizeLogin(causer ?? '');
@@ -356,12 +326,9 @@ const fetchTriggeringEvent = <E>(
     });
     const chosen = eligible.at(-1);
     if (chosen === undefined) return undefined;
-    // ! Authority that was withdrawn is not authority. A withdrawal naming her
-    // ! after the chosen trigger cancels it — the thread is marked read once
-    // ! committed, so acting anyway would spend work nobody asked for.
-    // ! Compared by position, not timestamp: GitHub's timeline arrives in
-    // ! chronological order while its timestamps carry only second granularity,
-    // ! which cannot order events inside one second.
+    // Authority withdrawn after the trigger cancels it — acting anyway spends
+    // work nobody asked for. Compared by position, not timestamp: the timeline
+    // is chronological while timestamps have only second granularity.
     const chosenIndex = events.indexOf(chosen);
     const rescinded = events.some((event, index) => {
       if (index <= chosenIndex) return false;
@@ -374,15 +341,10 @@ const fetchTriggeringEvent = <E>(
   });
 
 /**
- * ! `created_at`, not `updated_at`, and this is a security property rather than a
- * ! preference. `comment.user` is who *wrote* the comment and REST reports no
- * ! editor for it, so keying on `updated_at` lets anyone able to edit a comment —
- * ! a maintainer, on someone else's comment — insert a mention and have the
- * ! resulting job attributed to the original, possibly trusted, author. Keying on
- * ! creation is what makes the recorded sender authoritative. The cost is that a
- * ! mention added by editing an existing comment is not acted on; a new comment
- * ! still is. GitHub's GraphQL schema exposes `editor` and `lastEditedAt`, which
- * ! is what would let the edited case be attributed correctly.
+ * ! Keyed on `created_at`, never `updated_at` — a security property. REST names
+ * ! no editor for a comment, so keying on edits would let anyone able to edit a
+ * ! comment have the job attributed to its original, possibly trusted, author.
+ * ! Cost: a mention added by editing is not acted on; a new comment still is.
  */
 const commentCandidate = (
   comment: Schema.Schema.Type<typeof Comment>,
@@ -397,13 +359,9 @@ const commentCandidate = (
 
 /**
  * Order within one second, where GitHub's timestamps cannot separate candidates.
- *
- * ! A total order, not a meaningful one. A body candidate loses to any comment
- * ! because it carries no id at all, and issue-comment ids are compared before
- * ! review-comment ids only so the winner is stable — the two are disjoint
- * ! sequences, so nothing about their relative size says which came first. Two
- * ! comments of the same kind in the same second do order correctly, which is the
- * ! case this exists for.
+ * A total order, not a meaningful one: body candidates carry no id at all, and
+ * issue/review-comment ids are disjoint sequences compared only so the winner
+ * stays stable. Same-kind pairs do order correctly — the case this exists for.
  */
 const rankOf = (candidate: Candidate): readonly [number, number] => {
   switch (candidate.ref.kind) {
@@ -444,10 +402,9 @@ export const qualifyNotification = (input: {
     Effect.gen(function* () {
       const lastActivityAt = Date.parse(input.thread.updated_at);
 
-      // ! First, because every bound below derives from it. `updated_at` is a
-      // ! plain string in the schema, and an unreadable one leaves the comment
-      // ! scan with no anchor — a malformed envelope then costs a full history
-      // ! scan and the delivery's whole attempt budget.
+      // Checked first: every bound below derives from it, and an unreadable
+      // `updated_at` leaves the comment scan with no anchor — a full history
+      // scan and the delivery's whole attempt budget.
       if (Number.isNaN(lastActivityAt)) {
         yield* Effect.logWarning('Notification dropped: its activity time is unreadable').pipe(
           Effect.annotateLogs({ threadId: input.thread.id, updatedAt: input.thread.updated_at }),
@@ -470,10 +427,9 @@ export const qualifyNotification = (input: {
         return { work: undefined, lastActivityAt };
       }
 
-      // ! `undefined` is allowed here: with no cursor and no read mark the whole
-      // ! thread is new to her, and `fetchComments` walks newest-first, so an
-      // ! unbounded window truncates the *oldest* comments rather than losing the
-      // ! one that triggered the notification.
+      // `undefined` allowed: with no cursor and no read mark the thread is new
+      // to her, and newest-first walking makes an unbounded window drop the
+      // oldest comments, not the triggering one.
       const since =
         input.cursorMs ??
         (input.thread.last_read_at === undefined
@@ -507,10 +463,8 @@ export const qualifyNotification = (input: {
       const candidates: Candidate[] = [
         ...conversationComments.map((comment) => commentCandidate(comment, 'issue_comment')),
         ...reviewComments.map((comment) => commentCandidate(comment, 'review_comment')),
-        // ! Targeted at the pull request rather than the review. GitHub has no
-        // ! reactions endpoint for a review, so the pull request itself is the
-        // ! only place an acknowledgement can land — while `contextUrl` still
-        // ! points at the review, which is what the agent needs to read.
+        // Targeted at the pull request, not the review: GitHub has no reactions
+        // endpoint for a review, while `contextUrl` still points at the review.
         ...reviews.map((review) => ({
           at: review.submitted_at === undefined ? Number.NaN : Date.parse(review.submitted_at),
           author: review.user?.login,
@@ -519,9 +473,8 @@ export const qualifyNotification = (input: {
           body: review.body,
         })),
       ];
-      // ! Gated on when the issue was opened, not on any later change, for the
-      // ! reason spelled out on `commentCandidate`: `subject.user` is whoever
-      // ! opened it and REST names no editor.
+      // Gated on when the issue was opened, not any later edit — see
+      // `commentCandidate`: `subject.user` opened it and REST names no editor.
       const openedAt = Date.parse(subject.created_at);
       if (since === undefined || openedAt >= since) {
         candidates.push({
@@ -533,9 +486,8 @@ export const qualifyNotification = (input: {
         });
       }
 
-      // ! The reviews endpoint takes no `since`, so its candidates are held to the
-      // ! same window GitHub applied to the comment streams. Without this a review
-      // ! submitted long before the cursor would re-trigger on every sweep.
+      // The reviews endpoint takes no `since`, so hold its candidates to the
+      // same window or old reviews re-trigger on every sweep.
       const windowed =
         since === undefined ? candidates : candidates.filter((candidate) => candidate.at >= since);
 
@@ -551,11 +503,9 @@ export const qualifyNotification = (input: {
         (candidate) => candidate.body !== undefined && mentions(candidate.body, selfLogin),
       );
 
-      // ! The newest *trusted* mention triggers, not the newest mention. Letting
-      // ! an untrusted one win and then refusing it hands every repository
-      // ! participant a mute button. Her own activity is excluded structurally
-      // ! rather than by configuration, so a loop cannot be configured into
-      // ! existence.
+      // The newest *trusted* mention triggers. Letting an untrusted one win and
+      // then refusing hands every participant a mute button; self-activity is
+      // excluded structurally, so a loop cannot be configured into existence.
       const eligible = matching.filter((candidate) => {
         const author = normalizeLogin(candidate.author);
         return author !== selfLogin && trusted.has(author);
@@ -570,11 +520,9 @@ export const qualifyNotification = (input: {
         undefined,
       );
 
-      // ! An assignment carries no comment at all, so the mention scan cannot
-      // ! see it — the actor comes from the issue timeline instead of a comment
-      // ! body. Fetched even when a mention matched, because the two paths pick
-      // ! their trigger independently: an untrusted participant must not be able
-      // ! to mute a trusted assignment with one throwaway mention.
+      // Assignments carry no comment, so their actor comes from the timeline;
+      // fetched even when a mention matched, because an untrusted participant
+      // must not mute a trusted assignment with one throwaway mention.
       const reason = input.thread.reason;
       const assignedEvent =
         reason === 'assign' || reason === 'review_requested'
@@ -589,11 +537,9 @@ export const qualifyNotification = (input: {
             )
           : undefined;
 
-      // ! While the thread is live, any non-self reply continues the work — the
-      // ! trust gate ran when the trigger armed liveness, and these replies
-      // ! inherit that authority at continuation strength. A closed subject ends
-      // ! the conversation regardless of the stored window. The body candidate
-      // ! is excluded: opening an issue is not replying to one.
+      // While live, any non-self reply continues at continuation strength —
+      // trust was gated when the trigger armed liveness. A closed subject ends
+      // it regardless of the stored window; opening an issue is not replying.
       const live = input.live === true && subject.state !== 'closed';
       const continuationTrigger = live
         ? usable.reduce<(typeof usable)[number] | undefined>((best, candidate) => {
@@ -625,14 +571,10 @@ export const qualifyNotification = (input: {
         return { work: undefined, lastActivityAt };
       }
 
-      // ! A trusted trigger outranks any continuation, whatever the timestamps:
-      // ! a continuation inherits its authority from the trigger that armed
-      // ! liveness, so letting a stranger's later comment demote a trusted
-      // ! command to continuation strength would strip it without anyone having
-      // ! earned that. The window collapses to one turn, so the stranger's reply
-      // ! stays unread context in the thread rather than an executed instruction.
-      // ! Between trusted triggers, newest wins — the timeline event on ties,
-      // ! being GitHub's own record of why the thread went unread.
+      // ! A trusted trigger outranks any continuation whatever the timestamps:
+      // ! continuations inherit authority from the arming trigger, so letting a
+      // ! stranger's later comment demote a trusted command strips it unearned.
+      // ! Between trusted triggers, newest wins — the timeline event on ties.
       const assignedAt =
         assignedEvent === undefined ? -1 : (parseDate(assignedEvent.created_at) ?? -1);
       const useAssigned = assignedEvent !== undefined && assignedAt >= (mentionTrigger?.at ?? -1);
@@ -652,8 +594,7 @@ export const qualifyNotification = (input: {
       } as const;
 
       if (useAssigned && assignedEvent !== undefined) {
-        // ! Trust was already applied inside `fetchTriggeringEvent`, so the
-        // ! causer here is a confirmed trusted sender.
+        // Trust was already applied inside `fetchTriggeringEvent`.
         const causer =
           reason === 'assign' ? assignedEvent.actor?.login : assignedEvent.review_requester?.login;
         const sender = normalizeLogin(causer ?? '');

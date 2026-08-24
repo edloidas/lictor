@@ -73,9 +73,9 @@ const comments = [
   },
 ];
 
-// ! `setUrlParams` is serialized at execution time, so `request.url` carries no
-// ! query string — matching on one silently routes every list call to the
-// ! fallthrough.
+// `setUrlParams` is serialized at execution time, so `request.url` carries no
+// query string — matching on one silently routes every list call to the
+// fallthrough.
 const isList = (url: string): boolean =>
   url.includes('/notifications') && !url.includes('/notifications/threads');
 
@@ -194,8 +194,8 @@ describe('notification-to-agent pipeline', () => {
             const worker = yield* Worker;
             const queue = yield* WorkQueue;
 
-            // ! Two sweeps, not one. A replayed notification must produce no
-            // ! second job and no second reaction, and one sweep cannot show that.
+            // Two sweeps, not one. A replayed notification must produce no
+            // second job and no second reaction, and one sweep cannot show that.
             const first = yield* poller.pollOnce;
             yield* poller.pollOnce;
             yield* deliveryWorker.drain;
@@ -232,7 +232,7 @@ describe('notification-to-agent pipeline', () => {
     expect(result.counts.pending).toBe(0);
     expect(result.executions).toBe(1);
     expect(result.reactions).toEqual(['edloidas/lictor:{"kind":"issue_comment","id":99}']);
-    // ! Marked read exactly once, and only after the row was committed.
+    // Marked read exactly once, and only after the row was committed.
     expect(
       result.calls.filter((call) => call.startsWith('PATCH') && call.includes('/threads/14567')),
     ).toHaveLength(1);

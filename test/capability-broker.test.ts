@@ -265,9 +265,9 @@ describe('CapabilityBroker', () => {
     expect(result.requests[0]).toContain('/repos/edloidas/lictor/issues/13');
     expect(result.value.audit.at(-1)).toMatchObject({
       repository: 'edloidas/lictor',
-      // ! The actor is the only identity an audit row carries: the PAT acts as
-      // ! one account, so attribution is the verified login, never a payload
-      // ! field.
+      // The actor is the only identity an audit row carries: the PAT acts as
+      // one account, so attribution is the verified login, never a payload
+      // field.
       actor: 'adiutriel',
       capability: 'get_issue',
       outcome: 'ok',
@@ -348,9 +348,9 @@ describe('CapabilityBroker', () => {
     expect(result.value.audit[0]?.input).toContain('[REDACTED]');
   });
 
-  // ! A continuation turn inherits its authority from the trigger that armed
-  // ! liveness, so it never reaches the escalation capabilities even where
-  // ! repository policy grants them to the operator.
+  // A continuation turn inherits its authority from the trigger that armed
+  // liveness, so it never reaches the escalation capabilities even where
+  // repository policy grants them to the operator.
   it('strips escalation capabilities from continuation turns', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -397,9 +397,9 @@ describe('CapabilityBroker', () => {
     expect(String(result.value)).toContain('CAPABILITY_REPOSITORY_DENIED');
     expect(result.requests).toHaveLength(0);
   });
-  // ! Harmless while every commit was visibly `lictor[bot]`; once commits carry a
-  // ! person's account, a forwarded `author` attributes work to someone who did
-  // ! not do it.
+  // Harmless while every commit was visibly `lictor[bot]`; once commits carry a
+  // person's account, a forwarded `author` attributes work to someone who did
+  // not do it.
   it('strips agent-supplied author and committer from a commit', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -451,8 +451,8 @@ describe('CapabilityBroker', () => {
     expect(result.bodies[0]).toContain('mentioning author and committer');
   });
 
-  // ! An installation token healed by re-minting. A revoked PAT never does, so a
-  // ! generic failure code spends every remaining attempt on a dead credential.
+  // An installation token healed by re-minting. A revoked PAT never does, so a
+  // generic failure code spends every remaining attempt on a dead credential.
   it('reports a rejected credential distinctly from a generic failure', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -504,8 +504,8 @@ describe('CapabilityBroker', () => {
     expect(result.value.retryAfterMs).toBe(30_000);
   });
 
-  // ! 403 is GitHub's answer for both "forbidden" and "slow down". Only the
-  // ! throttled variant is worth retrying.
+  // 403 is GitHub's answer for both "forbidden" and "slow down". Only the
+  // throttled variant is worth retrying.
   it('keeps an unthrottled 403 as a generic failure', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -532,9 +532,9 @@ describe('CapabilityBroker', () => {
     expect(result.value.code).toBe('CAPABILITY_GITHUB_FAILED');
   });
 
-  // ! Unlike 403, a 429 has no second meaning. Falling through to the generic
-  // ! code when the header is missing tells the agent to retry at once, against
-  // ! a bucket GitHub just said is closed.
+  // Unlike 403, a 429 has no second meaning. Falling through to the generic
+  // code when the header is missing tells the agent to retry at once, against
+  // a bucket GitHub just said is closed.
   it('treats a 429 with no usable header as rate limited anyway', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -562,9 +562,9 @@ describe('CapabilityBroker', () => {
     expect(result.value.retryAfterMs).toBe(60_000);
   });
 
-  // ! A secondary limit is what an agent creating content actually trips, and
-  // ! GitHub answers it with 403 and no rate headers at all. Reading it as
-  // ! "forbidden" tells the agent to give up on a call that would succeed later.
+  // A secondary limit is what an agent creating content actually trips, and
+  // GitHub answers it with 403 and no rate headers at all. Reading it as
+  // "forbidden" tells the agent to give up on a call that would succeed later.
   it('recognises a secondary rate limit that arrives with no rate headers', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -621,8 +621,8 @@ describe('CapabilityBroker', () => {
     expect(result.value.code).toBe('CAPABILITY_GITHUB_FAILED');
   });
 
-  // ! `callTool` is only ever reached through `handleMcp` in production. A wait
-  // ! the agent cannot see is a wait that does not exist.
+  // `callTool` is only ever reached through `handleMcp` in production. A wait
+  // the agent cannot see is a wait that does not exist.
   it('carries the wait and the prose across the MCP boundary', async () => {
     const result = await run(
       Effect.gen(function* () {
