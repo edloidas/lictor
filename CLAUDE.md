@@ -12,12 +12,51 @@ symlink with a real file.
 ## Commands
 
 ```bash
-bun dev         # Watch-mode server on PORT (default 3000)
-bun run start   # One-shot server
-bun check:fix   # Typecheck + biome check --write (lint + format + import sort)
-bun test        # Run tests — no network, every suite stubs GitHub
-bun validate    # Full gate: check + test:ci (coverage)
+with-secrets bun dev         # Watch-mode server on PORT (default 3000)
+with-secrets bun run start   # One-shot server
+bun check:fix                # Typecheck + biome --write (lint, format, imports)
+bun test                     # Run tests — no network, every suite stubs GitHub
+bun validate                 # Full gate: check + test:ci (coverage)
 ```
+
+Only the two that talk to GitHub need `with-secrets`, and only where `.env` holds
+references — run them bare otherwise, see [Secrets](#secrets). The test suite
+stubs GitHub, so it needs no credential.
+
+## Secrets
+
+What `.env` holds decides how it must be treated. Copying `.env.example` produces
+literal values — that is what a fresh checkout gets. The operator's machines keep
+1Password references there instead:
+
+```
+LICTOR_GITHUB_TOKEN=op://<vault>/<item>/<field>
+```
+
+Read the value before concluding anything. One beginning `op://` is a reference;
+anything else is a live credential. Whether `with-secrets` is on PATH proves
+nothing either way — it resolves whatever the file holds and never converts it,
+so a machine can have the wrapper and a literal-value `.env` at the same time.
+
+`with-secrets` resolves them for the life of one command, injecting the results
+as real environment variables — which Bun gives precedence over `.env`. Nothing
+resolved is written anywhere.
+
+The wrapper is a convenience on the operator's machine, not a dependency of this
+project, and it is named for intent rather than backend so the authentication
+under it can differ per machine. Assume it may be absent: without it the commands
+run bare, against whatever `.env` already holds.
+
+Where the references are in place and `bun dev` is run bare, the failure does not
+look like a configuration error. Bun loads `.env`, `Config.redacted` takes the
+literal `op://...` string without validating its shape, and the startup identity
+probe fails with `GitHub rejected the configured credential with status 401` —
+indistinguishable from a revoked token.
+
+- A reference discloses nothing, and must never be replaced with a literal value
+- A literal value *is* the credential: never print it, never paste it, never let
+  it leave the machine
+- Under either, never print a resolved value, to a log or a terminal
 
 ## Constraints
 
@@ -77,46 +116,27 @@ Prefer promoting recurring checks to a real `*.test.ts`.
 
 ## Git & GitHub
 
-Conventional Commits: `<type>: <description> #<issue>`
+Conventional commit style; PRs squash to one commit before merge, unless the PR
+combines work from several tasks.
 
-Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`, `perf`,
-`build`, `ci`
-
-- Imperative mood, under 72 chars, no period
-- Include issue number when related: `feat: add issue handler #5`
-- No promotional or generated-by lines
-- Optional body: past tense, one line per change, backticks for code refs
-- PRs should contain a single commit on merge; squash locally and force-push
-  before merging unless the PR combines work from several tasks
+- **Commit**: `<type>: <description> #<issue>`, e.g. `feat: add issue handler #5`.
+  Without an issue, drop the number. Body optional: past tense, one line per
+  change, backticks for code refs.
+- **Issue**: title `<type>: <description>`; `epic:` for issues that aggregate
+  sub-issues, never used in commits. Body explains what and why and ends with a
+  `Rationale` section, `####` headers for short issues and `###` at 3+. Assign
+  to the current user unless told otherwise.
+- **PR**: title matches the commit. Body factual, no emojis, sections separated
+  by one blank line, `Closes #1, closes #23` last on its own line — GitHub
+  applies the keyword only to the reference it precedes.
+- Never append a generated-by footer, `---` rule, session link, `<sub>`
+  attribution, or promotional line — including PRs opened from the web, where
+  this file is the only source of truth.
 
 ### Issue Labels
 
-Each issue gets one **main** label + 0–2 **supportive** labels.
+One **main** label + 0–2 **supportive**.
 
 - **Main** (exactly one): `bug`, `feature`, `improvement`, `epic`
-- **Supportive** (optional): `DX`, `AI`, `testing`, `performance`,
-  `documentation`, `refactoring`, `critical`, `R&D`, `external`, `wontfix`,
-  `duplicate`
-
-### Issues
-
-- **Title**: `<type>: <description>`; `epic: <description>` for issues that
-  aggregate sub-issues (never used in commits)
-- Always assign the issue to the current user unless told otherwise
-- **Body**: concisely explain what and why, end with a `Rationale` section;
-  headers `####` for short issues (1–2 headers), `###` at 3+
-
-### Pull Requests
-
-- **Title**: `<type>: <description> #<number>`
-- **Body**: concise, no emojis, separate all sections with one blank line
-- Multiple issues go on one `Closes` line: `Closes #1 #23 #456`
-- Never append a generated footer, `---` rule, session link, `<sub>`
-  attribution, or promotional line. Applies to PRs created from the web too,
-  where these instructions are the only source of truth.
-
-  ```
-  <summary of changes>
-
-  Closes #<issue1> #<issue2>
-  ```
+- **Supportive**: `DX`, `AI`, `testing`, `performance`, `documentation`,
+  `refactoring`, `critical`, `R&D`, `external`, `wontfix`, `duplicate`
