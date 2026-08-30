@@ -101,164 +101,95 @@ const parseDate = (value: string): number | undefined => {
   return Number.isNaN(ms) ? undefined : ms;
 };
 
-// The prefix is captured because a fence closes relative to its own opener; the
-// marker repeats because a fence or a quote nests in as many containers as the
-// author opened.
-const FENCE_OPEN = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)*)(```+|~~~+)/;
-const FENCE_CLOSE = /^([ \t]*)(```+|~~~+)[ \t]*$/;
-const QUOTE_OPEN = /^[ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)*>/;
-// ! Both bounds on a closer are load-bearing: widen either and a line GitHub
-// ! renders as code ends the strip early and reads as addressed.
-const MAX_MARKER_INDENT = 3;
-// The block starts that end a paragraph, and with it the quote a lazy line was
-// continuing. Only `1.`: CommonMark lets no other number interrupt one.
-const BLOCK_START = /^ {0,3}(?:#{1,6}(?:[ \t]|$)|[-*+][ \t]|1[.)][ \t]|(?:[-*_][ \t]*){3,}$)/;
-
-type BacktickRun = { readonly start: number; readonly length: number };
-
-const backtickRuns = (text: string): readonly BacktickRun[] => {
-  const runs: BacktickRun[] = [];
-  for (let index = 0; index < text.length; ) {
-    if (text[index] !== '`') {
-      index += 1;
-      continue;
-    }
-    const start = index;
-    while (index < text.length && text[index] === '`') index += 1;
-    runs.push({ start, length: index - start });
-  }
-  return runs;
-};
+// A real HTML comment renders away; `<code>` and `<pre>` written as raw HTML
+// display what they wrap. Both are matched on the rendered text rather than
+// per callback, because a raw HTML block arrives as one chunk carrying its own
+// markup, and an attribute may contain `>`. An unterminated one takes the rest
+// of the body, which is the direction that loses a mention rather than invents
+// one.
+const HTML_COMMENT = /<!--[\s\S]*?(?:-->|$)/g;
+const DISPLAYED_HTML = /<(code|pre)\b[\s\S]*?(?:<\/\1[ \t]*>|$)/gi;
+const RAW_TAG = /<\/?[a-z][^>]*>/gi;
+// ! `Bun.markdown` does not implement GFM's bare-URL autolink, so a pasted
+// ! `https://host/@login` arrives as prose and reads as addressed. GitHub links
+// ! no mention inside an autolink, and none is ever written in one.
+const BARE_URL = /(?:https?:\/\/|www\.)\S+/gi;
 
 /**
- * Blanks every code span in one block. A span opens on a run of backticks and
- * closes on the next run of the same length; a run with no such partner is
- * literal text, and the search for an opener resumes at the run after it.
- */
-const stripCodeSpans = (block: string): string => {
-  const runs = backtickRuns(block);
-  // Closers are resolved in one reverse pass, not searched per opener: runs that
-  // never pair are cheap to write, and each would rescan to the end of the body.
-  const spanEnd = new Map<number, number>();
-  const nearest = new Map<number, BacktickRun>();
-  for (const run of runs.toReversed()) {
-    const close = nearest.get(run.length);
-    if (close !== undefined) spanEnd.set(run.start, close.start + close.length);
-    nearest.set(run.length, run);
-  }
-  let stripped = '';
-  let cursor = 0;
-  for (const run of runs) {
-    if (run.start < cursor) continue;
-    const end = spanEnd.get(run.start);
-    if (end === undefined) continue;
-    stripped += `${block.slice(cursor, run.start)} `;
-    cursor = end;
-  }
-  return stripped + block.slice(cursor);
-};
-
-// ! Only spaces and tabs: `trim` would also end a block on a no-break space,
-// ! which GFM keeps a code span running straight through.
-const BLANK_LINE = /^[ \t]*$/;
-
-// Blocks are where a stray backtick either side of a quote or a fence stops
-// pairing across it, over the blank lines the scan left in their place.
-// Approximate at the edges: a setext underline, a table row, and an HTML block
-// each start one too, and none is recognised here.
-const stripCodeSpansPerBlock = (lines: readonly string[]): string => {
-  const out: string[] = [];
-  let block: string[] = [];
-  const flush = () => {
-    if (block.length > 0) out.push(stripCodeSpans(block.join('\n')));
-    block = [];
-  };
-  for (const line of lines) {
-    if (BLANK_LINE.test(line)) {
-      flush();
-      out.push(line);
-      continue;
-    }
-    if (BLOCK_START.test(line)) flush();
-    block.push(line);
-  }
-  flush();
-  return out.join('\n');
-};
-
-/**
- * Strips quote blocks, code spans, and fenced code — places where a mention is
- * displayed, not addressed.
+ * Reduces a body to the text GitHub would apply its mention linkifier to.
  *
- * GitHub's reply button quotes the message and notifies on blockquote mentions,
- * so without this a quote-reply to "@her do X" produces a second job attributed
- * to whoever agreed with it. A quote reaches past its `>` lines: an unprefixed
- * paragraph line continues it — GitHub renders that line inside the quote — and
- * only a blank line or a new block ends it. Lines are blanked rather than
- * dropped, so no rule is ever handed a line the source did not contain.
+ * GitHub renders first and linkifies the result, so every rule that depends on
+ * what a delimiter *renders to* — an underscore consumed as emphasis, a
+ * backslash consumed as an escape, a backtick run that never pairs — resolves
+ * for free here and cannot be expressed on the raw Markdown at all.
  *
- * A code span reaches past a line ending too, and its delimiters are backtick
- * runs of matching length — a doubled run displays a mention exactly as a single
- * one does, while a run closed by one of a different length is prose.
+ * Code and code spans are dropped because GitHub links nothing inside them.
+ * Quoted prose is dropped for a different reason, and it is lictor's rule
+ * rather than GitHub's: GitHub's reply button quotes what it replies to and
+ * does link a mention inside the quote, so without this a reader agreeing with
+ * "@her do X" produces a second job attributed to whoever agreed.
  *
- * Not a Markdown parser: four-space indented code is left alone, since that
- * indentation is also list-item continuation and stripping it would drop real
- * mentions. Losing a real mention beats acting on a displayed one.
+ * ! Every element becomes a boundary, whether its text is kept or dropped.
+ * ! GitHub linkifies each text node separately, so a mention opening one is
+ * ! addressed however the previous node ended — `a**b**@her` links. Join the
+ * ! nodes instead and that `b` runs into the `@` and silently swallows it.
  */
 const addressable = (body: string): string => {
-  let fence: { readonly marker: string; readonly indent: number } | undefined;
-  let quoted = false;
-  // GitHub returns comment bodies CRLF-terminated; a stray `\r` would defeat
-  // every end-anchored rule below.
-  const scanned = body.split(/\r?\n/).map((line) => {
-    if (fence !== undefined) {
-      const close = FENCE_CLOSE.exec(line);
-      const marker = close?.[2];
-      const indent = close?.[1]?.length ?? 0;
-      if (
-        marker !== undefined &&
-        marker[0] === fence.marker[0] &&
-        marker.length >= fence.marker.length &&
-        indent >= fence.indent &&
-        indent <= fence.indent + MAX_MARKER_INDENT
-      ) {
-        fence = undefined;
-      }
-      return '';
-    }
-    const open = FENCE_OPEN.exec(line);
-    if (open?.[2] !== undefined) {
-      fence = { marker: open[2], indent: open[1]?.length ?? 0 };
-      quoted = false;
-      return '';
-    }
-    if (QUOTE_OPEN.test(line)) {
-      quoted = true;
-      return '';
-    }
-    if (!quoted) return line;
-    if (line.trim() === '' || BLOCK_START.test(line)) {
-      quoted = false;
-      return line;
-    }
-    return '';
+  const drop = (): string => ' ';
+  const keep = (children: string): string => ` ${children} `;
+  const block = (children: string): string => `${children}\n`;
+
+  const rendered = Bun.markdown.render(body, {
+    code: drop,
+    codespan: drop,
+    // The quote's prose goes, but a `<code>` or `<pre>` tag it opened stays: an
+    // unclosed one displays every line after the quote on GitHub too, and
+    // dropping it here would leave that text looking addressed.
+    blockquote: (children) => ` ${(children.match(RAW_TAG) ?? []).join(' ')} `,
+    // A mention in link text is displayed, never linked: GitHub does not nest
+    // one anchor inside another.
+    link: drop,
+    image: drop,
+    strong: keep,
+    emphasis: keep,
+    strikethrough: keep,
+    html: block,
+    paragraph: block,
+    heading: block,
+    listItem: block,
+    th: block,
+    td: block,
+    hr: block,
   });
-  return stripCodeSpansPerBlock(scanned);
+
+  return rendered
+    .replace(HTML_COMMENT, ' ')
+    .replace(DISPLAYED_HTML, ' ')
+    .replace(RAW_TAG, ' ')
+    .replace(BARE_URL, ' ');
 };
 
-// A backtick reaches here only unpaired, a real span having been stripped, and
-// GitHub links no mention glued to one. Nothing else belongs in the class: an
-// underscore or a backslash that renders away leaves the mention live.
-const MENTION_OPENS_AFTER = '[^a-z0-9`-]';
+// Measured against `POST /markdown` rather than taken from the spec: GitHub
+// opens a mention after anything but a word character or a backtick, and ends
+// it before anything but a word character, `-`, `/`, or a backtick. `/` is the
+// team-mention separator, and `@org/team` names no user.
+const MENTION_OPENS_AFTER = '[^a-z0-9_`]';
+const MENTION_CLOSES_BEFORE = '(?![a-z0-9_/`-])';
 
 // ! Deliberately narrow, not to be loosened: matching a login that merely
 // ! prefixes hers would put someone else's mention into her queue.
-const mentions = (body: string, login: string): boolean => {
+const mentionPattern = (login: string): RegExp => {
   const escaped = login.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(^|${MENTION_OPENS_AFTER})@${escaped}(?![a-z0-9-])`, 'i').test(
-    addressable(body),
-  );
+  return new RegExp(`(^|${MENTION_OPENS_AFTER})@${escaped}${MENTION_CLOSES_BEFORE}`, 'i');
 };
+
+const mentions = (body: string, login: string): Effect.Effect<boolean, NotificationError> =>
+  // A throw inside `Effect.gen` is a defect that `catchAll` never sees, and a
+  // trusted sender's prose is still prose nobody here wrote.
+  Effect.try({
+    try: () => mentionPattern(login).test(addressable(body)),
+    catch: (cause) => new NotificationError({ message: 'Failed to render a body', cause }),
+  });
 
 // Generic over the client's error channel: the authenticated client can also
 // fail resolving the credential, and a narrower type forces a cast at the only
@@ -633,17 +564,24 @@ export const qualifyNotification = (input: {
 
       const selfLogin = normalizeLogin(input.policy.selfLogin);
       const trusted = new Set(input.policy.trustedSenders.map(normalizeLogin));
-      const matching = usable.filter(
-        (candidate) => candidate.body !== undefined && mentions(candidate.body, selfLogin),
-      );
 
       // The newest *trusted* mention triggers. Letting an untrusted one win and
       // then refusing hands every participant a mute button; self-activity is
       // excluded structurally, so a loop cannot be configured into existence.
-      const eligible = matching.filter((candidate) => {
+      //
+      // ! Trust is settled before the body is read, not after. Rendering is the
+      // ! expensive half of qualification and `Bun.markdown` is superlinear on
+      // ! unresolved link brackets, so deciding first is what keeps a stranger
+      // ! from choosing how long this thread's single runtime is busy. Bounding
+      // ! the cost instead would mean predicting the parser — an escaped or
+      // ! code-spanned `]` closes a bracket for one counter and not the other.
+      const addressed = usable.filter((candidate) => {
         const author = normalizeLogin(candidate.author);
         return author !== selfLogin && trusted.has(author);
       });
+      const eligible = yield* Effect.filter(addressed, (candidate) =>
+        candidate.body === undefined ? Effect.succeed(false) : mentions(candidate.body, selfLogin),
+      );
       const mentionTrigger = eligible.reduce<(typeof usable)[number] | undefined>(
         (best, candidate) =>
           best === undefined ||
@@ -688,14 +626,23 @@ export const qualifyNotification = (input: {
         assignedEvent === undefined &&
         continuationTrigger === undefined
       ) {
-        if (matching.length > 0) {
+        // Names who tried, and decides nothing — so it reads the raw body
+        // rather than rendering an untrusted one. It over-reports a mention
+        // shown as code, which is the harmless way for a log line to be wrong.
+        const attempted = mentionPattern(selfLogin);
+        const untrustedSenders = [
+          ...new Set(
+            usable.flatMap((candidate) =>
+              candidate.body !== undefined && attempted.test(candidate.body)
+                ? [normalizeLogin(candidate.author)]
+                : [],
+            ),
+          ),
+        ].sort();
+
+        if (untrustedSenders.length > 0) {
           yield* Effect.logInfo('Notification dropped: no trusted sender mentioned her').pipe(
-            Effect.annotateLogs({
-              repository,
-              senders: [...new Set(matching.map((candidate) => normalizeLogin(candidate.author)))]
-                .sort()
-                .join(','),
-            }),
+            Effect.annotateLogs({ repository, senders: untrustedSenders.join(',') }),
           );
         } else {
           yield* Effect.logDebug(

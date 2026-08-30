@@ -60,12 +60,33 @@ local process polling on an interval and is not expected to absorb load.
   added by editing existing text is not acted on; a new comment is. GitHub's
   GraphQL schema exposes `editor` and `lastEditedAt`, which is what would let the
   edited case be attributed correctly.
-- Quoted and displayed mentions are stripped before matching. GitHub's reply
-  button quotes what it replies to and GitHub notifies on a mention inside a
-  blockquote, so without this a reader agreeing with a request would re-issue it
-  under their own name. A quote reaches past its `>` lines — an unprefixed line
-  continuing it is stripped too. The stripper is not a Markdown parser:
-  four-space indented code is left alone, and a mention inside one is acted on.
+- Quoted and displayed mentions are dropped before matching. GitHub renders a
+  body and then applies its mention linkifier to the result, so lictor does the
+  same: `Bun.markdown` renders the body, code blocks and code spans are dropped
+  because GitHub links nothing inside them, and the boundary rule runs on what
+  is left. Whether a delimiter displays or renders away is then the renderer's
+  answer rather than a rule — which is the only way the same underscore can be
+  inert in `user_@her` and consumed as emphasis in `_@her do X_`.
+  Blockquotes are dropped for a separate reason, and it is lictor's rule rather
+  than GitHub's: the reply button quotes what it replies to and GitHub notifies
+  on a mention inside a quote, so without this a reader agreeing with a request
+  would re-issue it under their own name.
+  One divergence remains. A fence opened inside a list item and closed by a
+  fence line at the margin is read by GitHub as opening a new block, swallowing
+  what follows as code; `Bun.markdown` closes the list's fence instead, so a
+  mention below it is acted on. It needs malformed Markdown to reach, and there
+  the author did mean the mention — but it is a case where lictor acts on what
+  GitHub displays.
+- Only a trusted sender's body is ever rendered. Qualification has to render a
+  body to decide whether a mention is displayed or addressed, and rendering is
+  the expensive half — `Bun.markdown` needs seconds on a long run of unresolved
+  link brackets. Trust is therefore settled first, so an account that merely can
+  comment cannot choose how long the daemon's single runtime is busy. Bounding
+  the cost instead was tried and abandoned: any cheap counter is a prediction of
+  the parser, and an escaped or code-spanned `]` closes a bracket for one and
+  not the other. The cost of deciding first is that the "no trusted sender
+  mentioned her" log reads the raw body, so it can name someone whose mention
+  was only ever shown as code.
 - Protect `~/.lictor/lictor.sqlite`: it stores issue metadata, execution errors,
   and bounded agent output. It stores the notification thread envelope, which
   carries a subject title and urls, but never comment bodies.
