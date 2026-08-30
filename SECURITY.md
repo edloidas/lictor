@@ -63,8 +63,9 @@ local process polling on an interval and is not expected to absorb load.
 - Quoted and displayed mentions are stripped before matching. GitHub's reply
   button quotes what it replies to and GitHub notifies on a mention inside a
   blockquote, so without this a reader agreeing with a request would re-issue it
-  under their own name. The stripper is not a Markdown parser: a lazy blockquote
-  continuation is not recognised.
+  under their own name. A quote reaches past its `>` lines — an unprefixed line
+  continuing it is stripped too. The stripper is not a Markdown parser:
+  four-space indented code is left alone, and a mention inside one is acted on.
 - Protect `~/.lictor/lictor.sqlite`: it stores issue metadata, execution errors,
   and bounded agent output. It stores the notification thread envelope, which
   carries a subject title and urls, but never comment bodies.
