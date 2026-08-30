@@ -569,14 +569,26 @@ describe('qualifyNotification', () => {
     ['a CRLF fence', 'a\r\n```\r\n@adiutriel do X\r\n```\r\nb'],
     ['a fence inside a list item', '- ```\n  @adiutriel do X\n  ```'],
     ['a quote nested in two list items', '- - > @adiutriel do X'],
-    // GitHub keeps both inside the quote: four spaces past the marker is code,
-    // and a marker that cannot interrupt a paragraph does not end one.
+    // Four spaces past the marker is code, so GitHub keeps the line quoted.
     ['a lazy line indented to code depth', '> quoted\n    - @adiutriel do X'],
-    ['a lazy line under a marker that cannot interrupt', '> quoted\n2. @adiutriel do X'],
     ['a fence whose closer sits past the code indent', '```\n    ```\n@adiutriel do X\n```'],
-    // Dedenting out of the list does not close that fence — GitHub reads the
-    // line as opening a new one, and swallows what follows as code.
-    ['a list fence closed from the margin', '- ```\n  code\n```\nafter @adiutriel do Y'],
+    // Displayed by rendering rather than by a rule: an indented code block, a
+    // code tag written as raw HTML, an HTML comment, and a mention carried in
+    // a URL or in link text, none of which GitHub links.
+    ['a four-space indented block', 'intro\n\n    @adiutriel do X'],
+    ['a code tag written as raw html', 'see <code>@adiutriel do X</code> now'],
+    ['a code tag nobody closed', 'see <code>@adiutriel do X'],
+    // A raw HTML block arrives from the renderer as one chunk carrying its own
+    // markup, and an attribute may hold a `>`. Both defeat a per-tag rule.
+    ['a one-line pre block', '<pre>@adiutriel do X</pre>'],
+    ['a code tag inside a div', '<div><code>@adiutriel do X</code></div>'],
+    ['a code tag whose attribute holds a gt', 'see <code title=">">@adiutriel do X</code> now'],
+    // GitHub carries an unclosed tag out of the quote and displays every line
+    // after it, so dropping the quote whole would leave this looking addressed.
+    ['a code tag left open inside a quote', '> <code>quoted\n\nplease @adiutriel do X'],
+    ['an html comment', '<!-- @adiutriel do X -->'],
+    ['a url path', 'see https://example.com/@adiutriel now'],
+    ['link text', 'see [@adiutriel do X](https://example.com) now'],
   ])('does not treat a mention displayed in %s as a fresh one', async (_shape, body) => {
     expect(await workFor(body)).toBeUndefined();
   });
@@ -624,8 +636,101 @@ describe('qualifyNotification', () => {
     expect((await workFor(body))?.sender).toBe('edloidas');
   });
 
-  // Recognising a span by its real delimiters leaves a lone backtick as text,
-  // where the old regex swallowed it. GitHub links no mention glued to one.
+  // Rendering answers what no character class can: the same underscore is inert
+  // mid-word and consumed as emphasis three characters later, and GitHub
+  // resolves which at render time. Measured against `POST /markdown`.
+  it.each([
+    ['glued to a word by an underscore', 'ask user_@adiutriel do X'],
+    ['glued to a word by an escape', 'ask user\\@adiutriel do X'],
+    ['closed by an underscore', 'hello @adiutriel_ trailing'],
+    // GitHub tokenises the whole login run before resolving it, so a login that
+    // merely prefixes hers is someone else's mention, never hers.
+    ['closed by more letters', 'hello @adiutrielbot do X'],
+    ['closed by a digit', 'hello @adiutriel2 do X'],
+    ['opened on a digit', 'ask v2@adiutriel do X'],
+    ['closed by a backtick', 'hello @adiutriel` trailing'],
+    ['closed by a team separator', 'hello @adiutriel/reviewers please'],
+  ])('does not read a mention %s', async (_shape, body) => {
+    expect(await workFor(body)).toBeUndefined();
+  });
+
+  // A delimiter that renders away leaves the mention at a word boundary, and
+  // `-` never belonged in the opening class at all.
+  it.each([
+    ['escaped backticks either side', 'a \\` b @adiutriel do X \\` c'],
+    ['a dash before it', 'hello -@adiutriel do X'],
+    ['a numbered marker ending a lazy quote', '> quoted\n2. @adiutriel do X'],
+  ])('reads a mention %s leaves live', async (_shape, body) => {
+    expect((await workFor(body))?.sender).toBe('edloidas');
+  });
+
+  // A block that ends is a boundary, so a stray backtick either side of one
+  // never pairs across it and the mention between them stays live.
+  it.each([
+    ['a setext underline', 'a ` b\nheading\n===\n@adiutriel do X ` c'],
+    ['a table row', 'a ` b\n\n| h |\n| --- |\n| @adiutriel do X ` c |'],
+    ['an html block', 'a ` b\n<div>x</div>\n@adiutriel do X ` c'],
+  ])('reads a mention across %s between stray backticks', async (_shape, body) => {
+    expect((await workFor(body))?.sender).toBe('edloidas');
+  });
+
+  // ! GitHub linkifies each text node separately, so a mention opening one is
+  // ! addressed however the node before it ended. Join the nodes instead and
+  // ! that last word character runs into the `@` and swallows the mention.
+  it.each([
+    ['strong emphasis', 'a**b**@adiutriel do X'],
+    ['emphasis', 'a*b*@adiutriel do X'],
+    ['a code span', 'word`shown`@adiutriel do X'],
+    ['a link', 'word[shown](https://example.com)@adiutriel do X'],
+    ['an image', 'word![alt](https://example.com/a.png)@adiutriel do X'],
+    ['a raw html tag', 'see<b>@adiutriel do X</b> now'],
+    ['a code tag that closes before it', 'see <code>x</code> and @adiutriel do X'],
+  ])('reads a mention opening the text node after %s', async (_shape, body) => {
+    expect((await workFor(body))?.sender).toBe('edloidas');
+  });
+
+  // ! Known divergence, and the only one left. GitHub reads the dedented fence
+  // ! as opening a new block and swallows what follows as code; `Bun.markdown`
+  // ! closes the list's fence instead, so the mention is read. It survives
+  // ! because closing it means re-deriving fence indent rules by hand, which is
+  // ! the mechanism this module exists to be rid of.
+  it('diverges from GitHub under a list fence closed from the margin', async () => {
+    const body = '- ```\n  code\n```\nafter @adiutriel do Y';
+    expect((await workFor(body))?.sender).toBe('edloidas');
+  });
+
+  // ! Trust decides before the body is read. `Bun.markdown` needs seconds on a
+  // ! long run of unresolved link brackets, so rendering an untrusted body
+  // ! would let any account that can comment choose how long the daemon's one
+  // ! runtime is busy. The clock is the assertion: nothing is rendered here, so
+  // ! this returns at once — read the body first and the same case takes
+  // ! seconds.
+  it('does not render a body from a sender who is not trusted', async () => {
+    const started = Bun.nanoseconds();
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+      }),
+      issueRoutes(issue(), [
+        comment({ user: { login: 'stranger' }, body: `${'['.repeat(65536)} @adiutriel do X` }),
+      ]),
+    );
+
+    expect(qualified(result.exit).work).toBeUndefined();
+    expect((Bun.nanoseconds() - started) / 1e6).toBeLessThan(2000);
+  });
+
+  it('scans a trusted body whose brackets all close, however many', async () => {
+    const body = `${'[INFO] service started\n'.repeat(4000)}@adiutriel do X`;
+    expect((await workFor(body))?.sender).toBe('edloidas');
+  });
+
+  // A backtick that never paired renders as text, and GitHub links no mention
+  // glued to one — the one punctuation mark that closes a mention as a word
+  // character would.
   it.each([
     ['runs of different length', 'write `@adiutriel do X`` here'],
     ['a run nothing closes', 'write `@adiutriel do X here'],
