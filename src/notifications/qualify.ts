@@ -114,6 +114,78 @@ const MAX_MARKER_INDENT = 3;
 // continuing. Only `1.`: CommonMark lets no other number interrupt one.
 const BLOCK_START = /^ {0,3}(?:#{1,6}(?:[ \t]|$)|[-*+][ \t]|1[.)][ \t]|(?:[-*_][ \t]*){3,}$)/;
 
+type BacktickRun = { readonly start: number; readonly length: number };
+
+const backtickRuns = (text: string): readonly BacktickRun[] => {
+  const runs: BacktickRun[] = [];
+  for (let index = 0; index < text.length; ) {
+    if (text[index] !== '`') {
+      index += 1;
+      continue;
+    }
+    const start = index;
+    while (index < text.length && text[index] === '`') index += 1;
+    runs.push({ start, length: index - start });
+  }
+  return runs;
+};
+
+/**
+ * Blanks every code span in one block. A span opens on a run of backticks and
+ * closes on the next run of the same length; a run with no such partner is
+ * literal text, and the search for an opener resumes at the run after it.
+ */
+const stripCodeSpans = (block: string): string => {
+  const runs = backtickRuns(block);
+  // Closers are resolved in one reverse pass, not searched per opener: runs that
+  // never pair are cheap to write, and each would rescan to the end of the body.
+  const spanEnd = new Map<number, number>();
+  const nearest = new Map<number, BacktickRun>();
+  for (const run of runs.toReversed()) {
+    const close = nearest.get(run.length);
+    if (close !== undefined) spanEnd.set(run.start, close.start + close.length);
+    nearest.set(run.length, run);
+  }
+  let stripped = '';
+  let cursor = 0;
+  for (const run of runs) {
+    if (run.start < cursor) continue;
+    const end = spanEnd.get(run.start);
+    if (end === undefined) continue;
+    stripped += `${block.slice(cursor, run.start)} `;
+    cursor = end;
+  }
+  return stripped + block.slice(cursor);
+};
+
+// ! Only spaces and tabs: `trim` would also end a block on a no-break space,
+// ! which GFM keeps a code span running straight through.
+const BLANK_LINE = /^[ \t]*$/;
+
+// Blocks are where a stray backtick either side of a quote or a fence stops
+// pairing across it, over the blank lines the scan left in their place.
+// Approximate at the edges: a setext underline, a table row, and an HTML block
+// each start one too, and none is recognised here.
+const stripCodeSpansPerBlock = (lines: readonly string[]): string => {
+  const out: string[] = [];
+  let block: string[] = [];
+  const flush = () => {
+    if (block.length > 0) out.push(stripCodeSpans(block.join('\n')));
+    block = [];
+  };
+  for (const line of lines) {
+    if (BLANK_LINE.test(line)) {
+      flush();
+      out.push(line);
+      continue;
+    }
+    if (BLOCK_START.test(line)) flush();
+    block.push(line);
+  }
+  flush();
+  return out.join('\n');
+};
+
 /**
  * Strips quote blocks, code spans, and fenced code — places where a mention is
  * displayed, not addressed.
@@ -124,6 +196,10 @@ const BLOCK_START = /^ {0,3}(?:#{1,6}(?:[ \t]|$)|[-*+][ \t]|1[.)][ \t]|(?:[-*_][
  * paragraph line continues it — GitHub renders that line inside the quote — and
  * only a blank line or a new block ends it. Lines are blanked rather than
  * dropped, so no rule is ever handed a line the source did not contain.
+ *
+ * A code span reaches past a line ending too, and its delimiters are backtick
+ * runs of matching length — a doubled run displays a mention exactly as a single
+ * one does, while a run closed by one of a different length is prose.
  *
  * Not a Markdown parser: four-space indented code is left alone, since that
  * indentation is also list-item continuation and stripping it would drop real
@@ -167,14 +243,21 @@ const addressable = (body: string): string => {
     }
     return '';
   });
-  return scanned.join('\n').replace(/`[^`\n]*`/g, ' ');
+  return stripCodeSpansPerBlock(scanned);
 };
+
+// A backtick reaches here only unpaired, a real span having been stripped, and
+// GitHub links no mention glued to one. Nothing else belongs in the class: an
+// underscore or a backslash that renders away leaves the mention live.
+const MENTION_OPENS_AFTER = '[^a-z0-9`-]';
 
 // ! Deliberately narrow, not to be loosened: matching a login that merely
 // ! prefixes hers would put someone else's mention into her queue.
 const mentions = (body: string, login: string): boolean => {
   const escaped = login.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(^|[^a-z0-9-])@${escaped}(?![a-z0-9-])`, 'i').test(addressable(body));
+  return new RegExp(`(^|${MENTION_OPENS_AFTER})@${escaped}(?![a-z0-9-])`, 'i').test(
+    addressable(body),
+  );
 };
 
 // Generic over the client's error channel: the authenticated client can also

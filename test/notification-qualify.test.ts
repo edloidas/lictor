@@ -555,6 +555,14 @@ describe('qualifyNotification', () => {
     ['a lazy multi-line quote', '> the ask was\nrelayed as\n@adiutriel do X\n\nagreed'],
     ['a quote inside a list item', '- > @adiutriel do X\nstill quoted'],
     ['an inline code span', 'write `@adiutriel` to summon her'],
+    ['a doubled-backtick span', 'write ``@adiutriel do X`` to show the syntax'],
+    ['a tripled-backtick span', 'write ```@adiutriel do X``` to show the syntax'],
+    ['a span crossing a line ending', 'write `code\n@adiutriel do X` here'],
+    ['a doubled span crossing a line ending', 'write ``code\n@adiutriel do X`` here'],
+    ['a shorter run nested in a span', 'write `a``b @adiutriel do X` here'],
+    ['a CRLF span crossing a line ending', 'write `code\r\n@adiutriel do X` here'],
+    // GFM counts only spaces and tabs as blank, so the span runs straight on.
+    ['a span over a no-break-space line', 'write `code\n \n@adiutriel do X` here'],
     ['a fenced block', '```\n@adiutriel do X\n```\nplain'],
     ['a fence nobody closed', 'plain\n```\n@adiutriel do X'],
     ['a tilde line inside a backtick fence', '```\n~~~\n@adiutriel do X\n```'],
@@ -593,6 +601,36 @@ describe('qualifyNotification', () => {
     ['indented with a tab', '\t```\n\tcode\n\t```\n\n@adiutriel do X'],
   ])('closes a fence %s and reads the mention after it', async (_shape, body) => {
     expect((await workFor(body))?.sender).toBe('edloidas');
+  });
+
+  // The same property inline. Backticks only display a mention where they form a
+  // span, and GitHub only reads one where the closing run matches the opening
+  // one and no blank line intervenes — every shape below renders a live mention.
+  it.each([
+    ['runs of different length', 'write `code @adiutriel do X`` here'],
+    ['a run nothing closes', 'write ` code @adiutriel do X here'],
+    ['a run closed only past a blank line', 'write `code\n\n@adiutriel do X` here'],
+    ['stray backticks either side of a fence', 'a ` b\n```\ncode\n```\n@adiutriel do X ` c'],
+    ['stray backticks either side of a quote', 'a ` b\n\n> quoted\n\n@adiutriel do X ` c'],
+    ['a heading between stray backticks', 'a ` b\n# heading\n@adiutriel do X ` c'],
+    ['a list item between stray backticks', '- a `\n- @adiutriel do X ` c'],
+    ['a thematic break between backticks', 'a ` b\n***\n@adiutriel do X ` c'],
+    ['a span that closes before the mention', 'write ``code`` and @adiutriel do X'],
+    // Both delimiters render away and leave the mention at a word boundary, so
+    // neither may join the backtick in the boundary class.
+    ['an escape consumed before it', 'please \\@adiutriel do X'],
+    ['emphasis opened on it', 'please _@adiutriel do X_ today'],
+  ])('reads a mention that %s leaves addressable', async (_shape, body) => {
+    expect((await workFor(body))?.sender).toBe('edloidas');
+  });
+
+  // Recognising a span by its real delimiters leaves a lone backtick as text,
+  // where the old regex swallowed it. GitHub links no mention glued to one.
+  it.each([
+    ['runs of different length', 'write `@adiutriel do X`` here'],
+    ['a run nothing closes', 'write `@adiutriel do X here'],
+  ])('does not read a mention glued to a backtick by %s', async (_shape, body) => {
+    expect(await workFor(body)).toBeUndefined();
   });
 
   it('reads review comments for a pull request and can trigger on one', async () => {
