@@ -530,31 +530,69 @@ describe('qualifyNotification', () => {
     expect(commentsCall(unread.requests)).not.toContain('since=');
   });
 
+  const workFor = async (body: string) => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+      }),
+      issueRoutes(issue(), [comment({ body })]),
+    );
+    return qualified(result.exit).work;
+  };
+
   // GitHub's reply button quotes what it replies to, and GitHub notifies on a
   // mention inside a blockquote. Without stripping, a trusted reader agreeing
-  // with "@adiutriel do X" produces a second job that does X again.
-  it('does not treat a quoted or fenced mention as a fresh one', async () => {
-    const quoted = await run(
-      qualifyNotification({
-        deliveryId: 'delivery',
-        thread: thread(),
-        policy,
-        cursorMs: undefined,
-      }),
-      issueRoutes(issue(), [comment({ body: '> hey @adiutriel take a look\n\nagreed' })]),
-    );
-    const fenced = await run(
-      qualifyNotification({
-        deliveryId: 'delivery',
-        thread: thread(),
-        policy,
-        cursorMs: undefined,
-      }),
-      issueRoutes(issue(), [comment({ body: 'write `@adiutriel` to summon her' })]),
-    );
+  // with "@adiutriel do X" produces a second job that does X again. The quote
+  // runs past its `>` lines: GitHub renders an unprefixed line following one
+  // inside the quote, so a lazy continuation would re-issue the instruction
+  // under the quoter's own name.
+  it.each([
+    ['a strict quote', '> hey @adiutriel take a look\n\nagreed'],
+    ['a lazy continuation', '> please close this\n@adiutriel please close this\n\nagreed'],
+    ['a lazy multi-line quote', '> the ask was\nrelayed as\n@adiutriel do X\n\nagreed'],
+    ['a quote inside a list item', '- > @adiutriel do X\nstill quoted'],
+    ['an inline code span', 'write `@adiutriel` to summon her'],
+    ['a fenced block', '```\n@adiutriel do X\n```\nplain'],
+    ['a fence nobody closed', 'plain\n```\n@adiutriel do X'],
+    ['a tilde line inside a backtick fence', '```\n~~~\n@adiutriel do X\n```'],
+    ['a CRLF fence', 'a\r\n```\r\n@adiutriel do X\r\n```\r\nb'],
+    ['a fence inside a list item', '- ```\n  @adiutriel do X\n  ```'],
+    ['a quote nested in two list items', '- - > @adiutriel do X'],
+    // GitHub keeps both inside the quote: four spaces past the marker is code,
+    // and a marker that cannot interrupt a paragraph does not end one.
+    ['a lazy line indented to code depth', '> quoted\n    - @adiutriel do X'],
+    ['a lazy line under a marker that cannot interrupt', '> quoted\n2. @adiutriel do X'],
+    ['a fence whose closer sits past the code indent', '```\n    ```\n@adiutriel do X\n```'],
+    // Dedenting out of the list does not close that fence — GitHub reads the
+    // line as opening a new one, and swallows what follows as code.
+    ['a list fence closed from the margin', '- ```\n  code\n```\nafter @adiutriel do Y'],
+  ])('does not treat a mention displayed in %s as a fresh one', async (_shape, body) => {
+    expect(await workFor(body)).toBeUndefined();
+  });
 
-    expect(qualified(quoted.exit).work).toBeUndefined();
-    expect(qualified(fenced.exit).work).toBeUndefined();
+  // The other half of the same property: a quote that never ends swallows the
+  // reply carrying the real instruction. It ends where CommonMark ends a
+  // paragraph — a blank line, or a line opening a new block.
+  it.each([
+    ['a blank line', '> quoted\n\n@adiutriel do X'],
+    ['a heading', '> quoted\n# next\n@adiutriel do X'],
+    ['a list item', '> quoted\n- @adiutriel do X'],
+    ['a fence', '> quoted\n```\ncode\n```\n@adiutriel do X'],
+  ])('ends a quote at %s and reads the mention after it', async (_shape, body) => {
+    expect((await workFor(body))?.sender).toBe('edloidas');
+  });
+
+  // Held to a fixed indent instead of its opener's, an indented fence never
+  // closes and swallows every mention after it in the comment.
+  it.each([
+    ['indented under a list item', '1.  Do this:\n\n    ```\n    code\n    ```\n\n@adiutriel do X'],
+    ['opened on a list marker', '- ```\n  code\n  ```\n\n@adiutriel do X'],
+    ['indented with a tab', '\t```\n\tcode\n\t```\n\n@adiutriel do X'],
+  ])('closes a fence %s and reads the mention after it', async (_shape, body) => {
+    expect((await workFor(body))?.sender).toBe('edloidas');
   });
 
   it('reads review comments for a pull request and can trigger on one', async () => {

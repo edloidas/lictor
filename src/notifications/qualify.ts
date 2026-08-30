@@ -101,23 +101,74 @@ const parseDate = (value: string): number | undefined => {
   return Number.isNaN(ms) ? undefined : ms;
 };
 
+// The prefix is captured because a fence closes relative to its own opener; the
+// marker repeats because a fence or a quote nests in as many containers as the
+// author opened.
+const FENCE_OPEN = /^([ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)*)(```+|~~~+)/;
+const FENCE_CLOSE = /^([ \t]*)(```+|~~~+)[ \t]*$/;
+const QUOTE_OPEN = /^[ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)*>/;
+// ! Both bounds on a closer are load-bearing: widen either and a line GitHub
+// ! renders as code ends the strip early and reads as addressed.
+const MAX_MARKER_INDENT = 3;
+// The block starts that end a paragraph, and with it the quote a lazy line was
+// continuing. Only `1.`: CommonMark lets no other number interrupt one.
+const BLOCK_START = /^ {0,3}(?:#{1,6}(?:[ \t]|$)|[-*+][ \t]|1[.)][ \t]|(?:[-*_][ \t]*){3,}$)/;
+
 /**
  * Strips quote blocks, code spans, and fenced code — places where a mention is
  * displayed, not addressed.
  *
  * GitHub's reply button quotes the message and notifies on blockquote mentions,
  * so without this a quote-reply to "@her do X" produces a second job attributed
- * to whoever agreed with it. Fences are matched line-anchored (both spellings):
- * unanchored, two inline ``` runs swallow everything between them and silently
- * ate real mentions. Not a Markdown parser: lazy blockquote continuations are
- * missed, indented code blocks left alone — losing a real mention beats acting
- * on a displayed one.
+ * to whoever agreed with it. A quote reaches past its `>` lines: an unprefixed
+ * paragraph line continues it — GitHub renders that line inside the quote — and
+ * only a blank line or a new block ends it. Lines are blanked rather than
+ * dropped, so no rule is ever handed a line the source did not contain.
+ *
+ * Not a Markdown parser: four-space indented code is left alone, since that
+ * indentation is also list-item continuation and stripping it would drop real
+ * mentions. Losing a real mention beats acting on a displayed one.
  */
-const addressable = (body: string): string =>
-  body
-    .replace(/^[ \t]*(?:```|~~~).*$[\s\S]*?^[ \t]*(?:```|~~~)[ \t]*$/gm, ' ')
-    .replace(/`[^`\n]*`/g, ' ')
-    .replace(/^[ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?>.*$/gm, ' ');
+const addressable = (body: string): string => {
+  let fence: { readonly marker: string; readonly indent: number } | undefined;
+  let quoted = false;
+  // GitHub returns comment bodies CRLF-terminated; a stray `\r` would defeat
+  // every end-anchored rule below.
+  const scanned = body.split(/\r?\n/).map((line) => {
+    if (fence !== undefined) {
+      const close = FENCE_CLOSE.exec(line);
+      const marker = close?.[2];
+      const indent = close?.[1]?.length ?? 0;
+      if (
+        marker !== undefined &&
+        marker[0] === fence.marker[0] &&
+        marker.length >= fence.marker.length &&
+        indent >= fence.indent &&
+        indent <= fence.indent + MAX_MARKER_INDENT
+      ) {
+        fence = undefined;
+      }
+      return '';
+    }
+    const open = FENCE_OPEN.exec(line);
+    if (open?.[2] !== undefined) {
+      fence = { marker: open[2], indent: open[1]?.length ?? 0 };
+      quoted = false;
+      return '';
+    }
+    if (QUOTE_OPEN.test(line)) {
+      quoted = true;
+      return '';
+    }
+    if (!quoted) return line;
+    if (line.trim() === '' || BLOCK_START.test(line)) {
+      quoted = false;
+      return line;
+    }
+    return '';
+  });
+  return scanned.join('\n').replace(/`[^`\n]*`/g, ' ');
+};
 
 // ! Deliberately narrow, not to be loosened: matching a login that merely
 // ! prefixes hers would put someone else's mention into her queue.
