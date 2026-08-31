@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { HttpClient, HttpClientRequest, HttpClientResponse } from '@effect/platform';
-import { Effect, Layer, Logger, Redacted, Schema } from 'effect';
+import { Clock, Effect, Fiber, Layer, Logger, Redacted, Schema } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { DeliveryWorker, isTerminalFailure } from '../src/delivery-worker.ts';
 import { GitHubClient, GitHubRequestError } from '../src/github/client.ts';
@@ -74,6 +74,66 @@ const routes: readonly (readonly [string, unknown])[] = [
   ['/issues/17', issue],
 ];
 
+const services = (
+  verified: Effect.Effect<VerifiedIdentity, GitHubIdentityError>,
+  reactions: string[],
+  options: {
+    readonly reactionStatus?: number;
+    readonly firstRequestDelayMs?: number;
+    readonly requests?: string[];
+  } = {},
+) => {
+  const ConfigLive = Layer.succeed(LictorConfig, config);
+  const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
+  const IdentityLive = Layer.succeed(GitHubIdentity, GitHubIdentity.make({ verified }));
+  let delayed = false;
+  const client = HttpClient.make((request) => {
+    options.requests?.push(request.url);
+    const respond = Effect.succeed(
+      HttpClientResponse.fromWeb(
+        request,
+        new Response(
+          JSON.stringify(routes.find(([fragment]) => request.url.includes(fragment))?.[1] ?? {}),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      ),
+    );
+    if (options.firstRequestDelayMs === undefined || delayed) return respond;
+    delayed = true;
+    return Effect.sleep(`${options.firstRequestDelayMs} millis`).pipe(Effect.zipRight(respond));
+  });
+  const GitHubLive = Layer.succeed(
+    GitHubClient,
+    GitHubClient.make({
+      authenticated: Effect.succeed(
+        client.pipe(HttpClient.mapRequest(HttpClientRequest.prependUrl('https://api.github.test'))),
+      ),
+      addReaction: (repository, target) =>
+        options.reactionStatus !== undefined && options.reactionStatus >= 400
+          ? Effect.fail(
+              new GitHubRequestError({
+                message: `Reacting returned status ${options.reactionStatus}`,
+              }),
+            )
+          : Effect.sync(() => {
+              reactions.push(`${repository}:${JSON.stringify(target)}`);
+            }).pipe(Effect.as(undefined)),
+    }),
+  );
+  const PolicyLive = Layer.effect(
+    Policy,
+    parsePolicy(
+      '[defaults]\nexecution = "automatic"\n[repositories]\nallow = ["edloidas/lictor"]',
+      ['edloidas'],
+    ).pipe(Effect.map(Policy.make)),
+  );
+  const Services = Layer.mergeAll(ConfigLive, QueueLive, GitHubLive, IdentityLive, PolicyLive);
+  return Layer.merge(
+    DeliveryWorker.DefaultWithoutDependencies.pipe(Layer.provide(Services)),
+    Services,
+  );
+};
+
 const run = (
   verified: Effect.Effect<VerifiedIdentity, GitHubIdentityError>,
   passes = 1,
@@ -110,70 +170,142 @@ const run = (
         };
       }).pipe(
         Effect.provide(Logger.remove(Logger.defaultLogger)),
-        Effect.provide(
-          (() => {
-            const ConfigLive = Layer.succeed(LictorConfig, config);
-            const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
-            const IdentityLive = Layer.succeed(GitHubIdentity, GitHubIdentity.make({ verified }));
-            const client = HttpClient.make((request) =>
-              Effect.succeed(
-                HttpClientResponse.fromWeb(
-                  request,
-                  new Response(
-                    JSON.stringify(
-                      routes.find(([fragment]) => request.url.includes(fragment))?.[1] ?? {},
-                    ),
-                    { status: 200, headers: { 'content-type': 'application/json' } },
-                  ),
-                ),
-              ),
-            );
-            const GitHubLive = Layer.succeed(
-              GitHubClient,
-              GitHubClient.make({
-                authenticated: Effect.succeed(
-                  client.pipe(
-                    HttpClient.mapRequest(HttpClientRequest.prependUrl('https://api.github.test')),
-                  ),
-                ),
-                addReaction: (repository, target) =>
-                  options.reactionStatus !== undefined && options.reactionStatus >= 400
-                    ? Effect.fail(
-                        new GitHubRequestError({
-                          message: `Reacting returned status ${options.reactionStatus}`,
-                        }),
-                      )
-                    : Effect.sync(() => {
-                        reactions.push(`${repository}:${JSON.stringify(target)}`);
-                      }).pipe(Effect.as(undefined)),
-              }),
-            );
-            const PolicyLive = Layer.effect(
-              Policy,
-              parsePolicy(
-                '[defaults]\nexecution = "automatic"\n[repositories]\nallow = ["edloidas/lictor"]',
-                ['edloidas'],
-              ).pipe(Effect.map(Policy.make)),
-            );
-            const Services = Layer.mergeAll(
-              ConfigLive,
-              QueueLive,
-              GitHubLive,
-              IdentityLive,
-              PolicyLive,
-            );
-            return Layer.merge(
-              DeliveryWorker.DefaultWithoutDependencies.pipe(Layer.provide(Services)),
-              Services,
-            );
-          })(),
-        ),
+        Effect.provide(services(verified, reactions, options)),
       ),
     ),
   );
 };
 
 describe('DeliveryWorker', () => {
+  // Qualification can outlast the lease, and the sweep reads only the row. The
+  // threshold sits between the claim-time lease and the one heartbeat renews,
+  // so a worker that never renews is reclaimed out from under itself here.
+  it('renews the delivery lease while qualification runs', async () => {
+    const reactions: string[] = [];
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.receiveDelivery({
+            id: 'delivery-1',
+            event: 'notification',
+            body,
+            source: 'notification',
+          });
+          const worker = yield* DeliveryWorker;
+          const claimedAt = yield* Clock.currentTimeMillis;
+          const fiber = yield* Effect.fork(worker.runOnce);
+          yield* Effect.sleep('1200 millis');
+          const reclaimed = yield* queue.recoverStaleDeliveries(claimedAt + 60_500);
+          const processed = yield* Fiber.join(fiber);
+          return { reclaimed, processed, status: yield* queue.deliveryStatus('delivery-1') };
+        }).pipe(
+          Effect.provide(Logger.remove(Logger.defaultLogger)),
+          Effect.provide(
+            services(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }), reactions, {
+              firstRequestDelayMs: 1500,
+            }),
+          ),
+        ),
+      ),
+    );
+
+    expect(result.reclaimed).toBe(0);
+    expect(result.processed).toBe(true);
+    expect(result.status).toBe('completed');
+  });
+
+  // The lease is a claim on the row, so losing it has to stop the work, not
+  // just be noticed. The sweep steals the delivery before the first heartbeat
+  // is due; the renewal that then fails is what aborts qualification. Counting
+  // requests is the only way to tell that apart from a worker that merely
+  // fails at the end — both leave the row `pending`, but one keeps calling
+  // GitHub on a delivery it no longer owns. The cycle survives: the row is
+  // already requeued, so there is nothing to write and nothing to fail over.
+  it('abandons a delivery whose lease it lost mid-qualification', async () => {
+    const reactions: string[] = [];
+    const requests: string[] = [];
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.receiveDelivery({
+            id: 'delivery-1',
+            event: 'notification',
+            body,
+            source: 'notification',
+          });
+          const worker = yield* DeliveryWorker;
+          const fiber = yield* Effect.fork(worker.runOnce);
+          // Inside the first request's delay, and before the heartbeat at 1s.
+          yield* Effect.sleep('300 millis');
+          const now = yield* Clock.currentTimeMillis;
+          const stolen = yield* queue.recoverStaleDeliveries(now + 120_000);
+          const exit = yield* Effect.exit(Fiber.join(fiber));
+          return { stolen, exit, status: yield* queue.deliveryStatus('delivery-1') };
+        }).pipe(
+          Effect.provide(Logger.remove(Logger.defaultLogger)),
+          Effect.provide(
+            services(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }), reactions, {
+              firstRequestDelayMs: 1500,
+              requests,
+            }),
+          ),
+        ),
+      ),
+    );
+
+    expect(result.stolen).toBe(1);
+    // Absorbed, not failed: a lost lease must not cost the rest of the drain.
+    expect(result.exit._tag).toBe('Success');
+    // Left where the sweep put it — the worker wrote nothing on the way out.
+    expect(result.status).toBe('pending');
+    // One request in flight when the lease was lost, and none after.
+    expect(requests).toHaveLength(1);
+  });
+
+  // The heartbeat is not the only way to learn the claim is gone. Here
+  // qualification finishes inside the heartbeat interval, so `finishDelivery`
+  // is what discovers it — and it has to be absorbed the same way, or a sweep
+  // landing near the end of processing costs the whole drain cycle.
+  it('abandons a delivery stolen just before it finished', async () => {
+    const reactions: string[] = [];
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.receiveDelivery({
+            id: 'delivery-1',
+            event: 'notification',
+            body,
+            source: 'notification',
+          });
+          const worker = yield* DeliveryWorker;
+          const fiber = yield* Effect.fork(worker.runOnce);
+          // Inside the first request's 400ms delay, so processing resumes and
+          // completes well before the heartbeat at 1s ever fires.
+          yield* Effect.sleep('200 millis');
+          const now = yield* Clock.currentTimeMillis;
+          const stolen = yield* queue.recoverStaleDeliveries(now + 120_000);
+          const exit = yield* Effect.exit(Fiber.join(fiber));
+          return { stolen, exit, status: yield* queue.deliveryStatus('delivery-1') };
+        }).pipe(
+          Effect.provide(Logger.remove(Logger.defaultLogger)),
+          Effect.provide(
+            services(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }), reactions, {
+              firstRequestDelayMs: 400,
+            }),
+          ),
+        ),
+      ),
+    );
+
+    expect(result.stolen).toBe(1);
+    expect(result.exit._tag).toBe('Success');
+    // Not completed by the worker that lost it — the sweep's requeue stands.
+    expect(result.status).toBe('pending');
+  });
+
   it('completes a delivery it can qualify, and records the acknowledgement', async () => {
     const result = await run(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }));
 
