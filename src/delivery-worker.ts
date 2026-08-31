@@ -8,6 +8,7 @@ import { type NotificationError, qualifyNotification } from './notifications/qua
 import { decodeThread, subjectRef } from './notifications/thread.ts';
 import { Policy } from './policy.ts';
 import {
+  CLAIM_FENCED_OPERATIONS,
   type DeliverySource,
   type InboxDelivery,
   type QueueError,
@@ -35,6 +36,12 @@ export const isTerminalFailure = (
   isTagged('InvalidStoredDelivery')(error) || isTagged('ParseError')(error);
 
 type ProcessRequirements = GitHubClient | GitHubIdentity | LictorConfig | Policy | WorkQueue;
+
+const claimLost: ReadonlySet<string> = new Set(Object.values(CLAIM_FENCED_OPERATIONS));
+
+/** Whether a failure means this worker no longer holds the delivery. */
+const isClaimLost = (error: unknown): error is QueueError =>
+  isTagged('QueueError')(error) && claimLost.has((error as QueueError).operation);
 
 /**
  * Eyes reaction on the triggering comment, and the audit row recording it.
@@ -200,21 +207,42 @@ export class DeliveryWorker extends Effect.Service<DeliveryWorker>()('DeliveryWo
       );
       const process = Effect.gen(function* () {
         yield* processBySource[stored.source](stored);
-        yield* queue.finishDelivery(stored.id, 'completed');
+        yield* queue.finishDelivery(stored.id, stored.attempts, 'completed');
       });
-      yield* process.pipe(
+      // Raced, not forked: qualification outlasts the lease on a slow enough
+      // repository, and a renewal that fails means the daemon tick already
+      // reclaimed the row — carrying on would work a delivery someone else owns.
+      const keepLease = Effect.forever(
+        Effect.sleep('1 second').pipe(
+          Effect.zipRight(queue.heartbeatDelivery(stored.id, stored.attempts)),
+        ),
+      );
+      yield* Effect.raceFirst(process, keepLease).pipe(
+        // Absorbed, never retried: every branch below writes, and the claim is
+        // gone. A renewal that failed for some other reason still resolves when
+        // the lease runs out — guessing the other way corrupts a live claim.
+        Effect.catchIf(isClaimLost, (error) =>
+          Effect.logWarning('Abandoned a delivery this worker no longer holds').pipe(
+            Effect.annotateLogs({
+              delivery: stored.id,
+              attempt: stored.attempts,
+              operation: error.operation,
+            }),
+          ),
+        ),
         // ! A dead credential says nothing about the delivery, and `failed` is
         // ! terminal and memoized — condemning one would destroy the whole inbox
         // ! at SQLite speed while shutdown propagates. Retry instead.
         Effect.catchTag('GitHubIdentityError', (error) =>
           queue
-            .retryDelivery(stored.id, String(error), false)
+            .retryDelivery(stored.id, stored.attempts, String(error), false)
             .pipe(Effect.zipRight(Effect.sleep(config.workerRetryBaseMs))),
         ),
         Effect.catchTag('QueueError', (error) =>
           queue
             .retryDelivery(
               stored.id,
+              stored.attempts,
               String(error),
               (error.cause as Error | undefined)?.message !== 'QUEUE_DEPTH_LIMIT',
             )
@@ -229,7 +257,12 @@ export class DeliveryWorker extends Effect.Service<DeliveryWorker>()('DeliveryWo
               reason: describeCause(Cause.fail(error)),
             }),
             Effect.zipRight(
-              queue.finishDelivery(stored.id, 'failed', 'DELIVERY_PROCESSING_FAILED'),
+              queue.finishDelivery(
+                stored.id,
+                stored.attempts,
+                'failed',
+                'DELIVERY_PROCESSING_FAILED',
+              ),
             ),
           ),
         ),
@@ -250,7 +283,7 @@ export class DeliveryWorker extends Effect.Service<DeliveryWorker>()('DeliveryWo
                 .pipe(
                   Effect.zipRight(
                     queue
-                      .retryDelivery(stored.id, describeCause(cause), true)
+                      .retryDelivery(stored.id, stored.attempts, describeCause(cause), true)
                       .pipe(Effect.zipRight(backoff)),
                   ),
                 ),

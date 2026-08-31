@@ -95,7 +95,7 @@ describe('WorkQueue', () => {
           source: 'notification',
         });
         yield* queue.claimDelivery;
-        yield* queue.finishDelivery('completed', 'completed');
+        yield* queue.finishDelivery('completed', 1, 'completed');
         yield* queue.receiveDelivery({
           id: 'failed',
           event: 'notification',
@@ -103,7 +103,7 @@ describe('WorkQueue', () => {
           source: 'notification',
         });
         yield* queue.claimDelivery;
-        yield* queue.finishDelivery('failed', 'failed', 'invalid payload');
+        yield* queue.finishDelivery('failed', 1, 'failed', 'invalid payload');
         return {
           completed: yield* queue.deliveryStatus('completed'),
           failed: yield* queue.deliveryStatus('failed'),
@@ -126,7 +126,7 @@ describe('WorkQueue', () => {
         } as const;
         yield* queue.receiveDelivery(delivery);
         yield* queue.claimDelivery;
-        yield* queue.finishDelivery(delivery.id, 'failed', 'old decoder');
+        yield* queue.finishDelivery(delivery.id, 1, 'failed', 'old decoder');
         const received = yield* queue.receiveDelivery({ ...delivery, body: '{"version":2}' });
         return { received, claimed: yield* queue.claimDelivery };
       }),
@@ -370,6 +370,302 @@ describe('WorkQueue', () => {
     }
   });
 
+  it('reclaims a delivery whose lease expired', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.receiveDelivery({
+          id: 'stuck',
+          event: 'notification',
+          body: '{}',
+          source: 'notification',
+        });
+        const claimed = yield* queue.claimDelivery;
+        const now = yield* Clock.currentTimeMillis;
+        const reclaimed = yield* queue.recoverStaleDeliveries(now + 60_001);
+        return {
+          claimed,
+          reclaimed,
+          status: yield* queue.deliveryStatus('stuck'),
+          next: yield* queue.claimDelivery,
+        };
+      }),
+    );
+
+    expect(result.claimed).toMatchObject({ id: 'stuck', attempts: 1 });
+    expect(result.reclaimed).toBe(1);
+    expect(result.status).toBe('pending');
+    expect(result.next).toMatchObject({ id: 'stuck', attempts: 2 });
+  });
+
+  it('leaves a live delivery lease alone', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.receiveDelivery({
+          id: 'live',
+          event: 'notification',
+          body: '{}',
+          source: 'notification',
+        });
+        yield* queue.claimDelivery;
+        const now = yield* Clock.currentTimeMillis;
+        const reclaimed = yield* queue.recoverStaleDeliveries(now);
+        return { reclaimed, status: yield* queue.deliveryStatus('live') };
+      }),
+    );
+
+    expect(result.reclaimed).toBe(0);
+    expect(result.status).toBe('processing');
+  });
+
+  // The budget, not the expiry, is what condemns the row: a delivery whose
+  // processing reliably kills the fiber stops after `workerMaxAttempts` instead
+  // of cycling through the queue forever.
+  it('condemns a delivery whose lease expires past the attempt budget', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.receiveDelivery({
+          id: 'doomed',
+          event: 'notification',
+          body: '{}',
+          source: 'notification',
+        });
+        const statuses: (string | undefined)[] = [];
+        for (let pass = 0; pass < 3; pass += 1) {
+          yield* queue.claimDelivery;
+          const now = yield* Clock.currentTimeMillis;
+          yield* queue.recoverStaleDeliveries(now + 60_001);
+          statuses.push(yield* queue.deliveryStatus('doomed'));
+        }
+        return { statuses, next: yield* queue.claimDelivery };
+      }),
+    );
+
+    expect(result.statuses).toEqual(['pending', 'pending', 'failed']);
+    expect(result.next).toBeUndefined();
+  });
+
+  // Aged and read through a side handle rather than timed: the renewal has to
+  // be observed as a value, and racing two `Clock` reads milliseconds apart
+  // proves nothing about which one moved.
+  it('renews a live delivery lease and clears it when the delivery finishes', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-lease-'));
+    const path = join(directory, 'queue.sqlite');
+    const lease = (side: Database) =>
+      (
+        side
+          .query('SELECT lease_expires_at AS leaseExpiresAt FROM deliveries WHERE id = ?')
+          .get('renewed') as { leaseExpiresAt: number | null }
+      ).leaseExpiresAt;
+
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* queue.receiveDelivery({
+              id: 'renewed',
+              event: 'notification',
+              body: '{}',
+              source: 'notification',
+            });
+            yield* queue.claimDelivery;
+            const now = yield* Clock.currentTimeMillis;
+            const side = new Database(path);
+            side
+              .query('UPDATE deliveries SET lease_expires_at = ? WHERE id = ?')
+              .run(now + 5_000, 'renewed');
+            yield* queue.heartbeatDelivery('renewed', 1);
+            const renewed = lease(side);
+            yield* queue.finishDelivery('renewed', 1, 'completed');
+            const finished = lease(side);
+            side.close();
+            return { now, renewed, finished };
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      // A band, not a floor: the renewal must land a full lease out, so
+      // shortening `DELIVERY_LEASE_MS` fails here rather than passing on any
+      // value that merely beats the aged one.
+      expect(result.renewed).toBeGreaterThanOrEqual(result.now + 59_000);
+      expect(result.renewed).toBeLessThanOrEqual(result.now + 61_000);
+      expect(result.finished).toBeNull();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  // Each case is a state the row can reach while a worker still believes it
+  // holds the claim. The third is the one the `attempts` fence exists for: the
+  // row is `processing` again with a live lease, owned by a newer claim.
+  it.each(['expired', 'reclaimed', 'reclaimed and taken by a newer attempt'])(
+    'refuses to renew a delivery lease that is %s',
+    async (state) => {
+      const directory = mkdtempSync(join(tmpdir(), 'lictor-lease-'));
+      const path = join(directory, 'queue.sqlite');
+
+      try {
+        const exit = await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const queue = yield* WorkQueue;
+              yield* queue.receiveDelivery({
+                id: 'lost',
+                event: 'notification',
+                body: '{}',
+                source: 'notification',
+              });
+              yield* queue.claimDelivery;
+              const now = yield* Clock.currentTimeMillis;
+              if (state === 'expired') {
+                const side = new Database(path);
+                side
+                  .query('UPDATE deliveries SET lease_expires_at = ? WHERE id = ?')
+                  .run(now - 1, 'lost');
+                side.close();
+              } else {
+                yield* queue.recoverStaleDeliveries(now + 120_000);
+                if (state !== 'reclaimed') yield* queue.claimDelivery;
+              }
+              return yield* Effect.exit(queue.heartbeatDelivery('lost', 1));
+            }).pipe(Effect.provide(queueLayer(path))),
+          ),
+        );
+
+        expect(exit._tag).toBe('Failure');
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  // The heartbeat fence alone is not enough: a worker that lost its lease still
+  // reaches the writes that end the delivery. Both are fenced on `attempts`, so
+  // a stale one cannot complete, requeue, or condemn the claim that replaced it.
+  it.each(['finish', 'retry'])(
+    'refuses a stale %s against a delivery a newer claim owns',
+    async (write) => {
+      const result = await run(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.receiveDelivery({
+            id: 'stolen',
+            event: 'notification',
+            body: '{}',
+            source: 'notification',
+          });
+          yield* queue.claimDelivery;
+          const now = yield* Clock.currentTimeMillis;
+          yield* queue.recoverStaleDeliveries(now + 120_000);
+          const current = yield* queue.claimDelivery;
+          const stale =
+            write === 'finish'
+              ? yield* Effect.exit(queue.finishDelivery('stolen', 1, 'completed'))
+              : yield* Effect.exit(queue.retryDelivery('stolen', 1, 'stale worker', true));
+          return { current, stale, status: yield* queue.deliveryStatus('stolen') };
+        }),
+      );
+
+      expect(result.current).toMatchObject({ id: 'stolen', attempts: 2 });
+      expect(result.stale._tag).toBe('Failure');
+      // Untouched: the newer claim still holds it.
+      expect(result.status).toBe('processing');
+    },
+  );
+
+  // Both stamps rewind to the same pre-v10 shape: 9 exercises the version path,
+  // 10 the presence guard, which is the only thing that heals a database
+  // stamped current by a build that never ran the ALTERs. The two v10 cases
+  // rewind one artifact each: breaking both at once passes with either guard
+  // clause deleted, so neither would be pinned.
+  it.each([
+    [9, 'both'],
+    [10, 'lease'],
+    [10, 'installation'],
+  ])('upgrades a version-%i database missing %s', async (version, artifact) => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(WorkQueue, (queue) => queue.counts).pipe(Effect.provide(queueLayer(path))),
+      ),
+    );
+    const database = new Database(path);
+    if (artifact !== 'installation') {
+      database.exec('ALTER TABLE deliveries DROP COLUMN lease_expires_at');
+    }
+    if (artifact !== 'lease') {
+      database.exec('ALTER TABLE capability_audit ADD COLUMN installation_id INTEGER');
+    }
+    // Written before the migration, so the drop is shown to carry existing rows
+    // rather than merely leaving the table writable afterwards.
+    database
+      .query(
+        `INSERT INTO capability_audit
+           (job_id, repository, actor, capability, input, outcome, created_at)
+         VALUES (1, 'edloidas/lictor', 'daemon', 'legacy', '{}', 'ok', 1)`,
+      )
+      .run();
+    database.exec(`PRAGMA user_version = ${version}`);
+    database.close();
+
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* queue.receiveDelivery({
+              id: 'delivery-lease',
+              event: 'notification',
+              body: '{}',
+              source: 'notification',
+            });
+            yield* queue.claimDelivery;
+            const now = yield* Clock.currentTimeMillis;
+            const reclaimed = yield* queue.recoverStaleDeliveries(now + 60_001);
+            const enqueued = yield* queue.enqueue(work('delivery-audit'), 10);
+            yield* queue.recordAudit({
+              jobId: enqueued.jobId,
+              repository: 'edloidas/lictor',
+              actor: 'daemon',
+              capability: 'get_issue',
+              input: '{}',
+              outcome: 'ok',
+            });
+            return {
+              reclaimed,
+              status: yield* queue.deliveryStatus('delivery-lease'),
+              audit: yield* queue.auditLog(enqueued.jobId),
+              legacy: yield* queue.auditLog(1),
+            };
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(result.reclaimed).toBe(1);
+      expect(result.status).toBe('pending');
+      expect(result.audit.at(-1)).toMatchObject({ actor: 'daemon', capability: 'get_issue' });
+      expect(result.legacy.at(0)).toMatchObject({ actor: 'daemon', capability: 'legacy' });
+
+      const after = new Database(path);
+      const columns = (
+        after.query('PRAGMA table_info(capability_audit)').all() as { name: string }[]
+      ).map((column) => column.name);
+      const indexes = (
+        after.query('PRAGMA index_list(capability_audit)').all() as { name: string }[]
+      ).map((index) => index.name);
+      after.close();
+
+      expect(columns).not.toContain('installation_id');
+      expect(indexes).toContain('capability_audit_job');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   // `capability_audit` is created with `IF NOT EXISTS`, so a database that
   // already has the table skips it entirely and needs the column added by
   // hand. Without the ALTER, every audit write on an existing install fails.
@@ -570,7 +866,7 @@ describe('WorkQueue', () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
     const database = new Database(path, { create: true });
-    database.exec('PRAGMA user_version = 7');
+    database.exec('PRAGMA user_version = 11');
     database.close();
 
     try {

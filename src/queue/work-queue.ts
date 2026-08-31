@@ -8,6 +8,7 @@ import { type WorkItem, WorkItemSchema } from '../work-item.ts';
 
 const WORKER_LEASE_MS = 60_000;
 const DAEMON_LEASE_MS = 30_000;
+const DELIVERY_LEASE_MS = 60_000;
 
 export type InboxStatus = 'pending' | 'processing' | 'completed' | 'failed';
 
@@ -84,6 +85,23 @@ type JobRow = {
   readonly leaseExpiresAt?: number | null;
 };
 
+/**
+ * `QueueError.operation` for every delivery write fenced on `attempts`, the way
+ * the job writes are fenced on `attemptNumber`. Status alone is not enough: the
+ * sweep returns a reclaimed row to `pending` and the next claim increments it,
+ * so a row a newer claim has taken is `processing` again.
+ *
+ * ! A failure carrying one of these means a newer claim owns the row. The
+ * ! caller must abandon it — retrying writes over whoever holds it now.
+ *
+ * Named so the consumer matches on a value, not a copied string literal.
+ */
+export const CLAIM_FENCED_OPERATIONS = {
+  finish: 'finish delivery',
+  retry: 'retry delivery',
+  renew: 'renew delivery lease',
+} as const;
+
 const migrate = (database: Database) => {
   database.exec('PRAGMA journal_mode = WAL');
   database.exec('PRAGMA foreign_keys = ON');
@@ -103,19 +121,22 @@ const migrate = (database: Database) => {
     (database.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(
       (existing) => existing.name === column,
     );
-  // Every v9 artifact checked, not a sample: one missing piece would fail on
-  // every use — the v6 equality-guard failure, one version later.
+  // Every v10 artifact checked, not a sample: one missing piece would fail on
+  // every use — the v6 equality-guard failure, one version later. The
+  // `installation_id` check is negative so a database predating its drop heals.
   if (
-    version.user_version === 9 &&
+    version.user_version === 10 &&
     deliveriesHaveSource() &&
+    hasColumn('deliveries', 'lease_expires_at') &&
     hasColumn('capability_audit', 'actor') &&
+    !hasColumn('capability_audit', 'installation_id') &&
     hasTable('notification_cursors') &&
     hasTable('poller_state') &&
     hasTable('subject_branches') &&
     hasTable('thread_liveness')
   )
     return;
-  if (version.user_version > 9) {
+  if (version.user_version > 10) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -165,7 +186,8 @@ const migrate = (database: Database) => {
         received_at INTEGER NOT NULL,
         claimed_at INTEGER,
         processed_at INTEGER,
-        last_error TEXT
+        last_error TEXT,
+        lease_expires_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS deliveries_claimable ON deliveries(status, received_at);
     `);
@@ -218,15 +240,23 @@ const migrate = (database: Database) => {
           WHERE status = 'running' AND lease_expires_at IS NULL;
       `);
     }
-    // Column presence, not the stamp, for the same reason as the v9 guard:
+    // Column presence, not the stamp, for the same reason as the guard above:
     // `recordAudit` names this column, so an unrepaired table fails forever.
     if (hasTable('capability_audit') && !hasColumn('capability_audit', 'actor')) {
       database.exec('ALTER TABLE capability_audit ADD COLUMN actor TEXT');
+    }
+    // App-era vocabulary no code sets any more. The drop keeps the
+    // `capability_audit_job` index and every row.
+    if (hasTable('capability_audit') && hasColumn('capability_audit', 'installation_id')) {
+      database.exec('ALTER TABLE capability_audit DROP COLUMN installation_id');
     }
     // Ordered after the CREATE TABLE IF NOT EXISTS above: a fresh table is
     // created complete; only one predating the column reaches this ALTER.
     if (!deliveriesHaveSource()) {
       database.exec("ALTER TABLE deliveries ADD COLUMN source TEXT NOT NULL DEFAULT 'webhook'");
+    }
+    if (!hasColumn('deliveries', 'lease_expires_at')) {
+      database.exec('ALTER TABLE deliveries ADD COLUMN lease_expires_at INTEGER');
     }
     database.exec(`
       CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs(status, available_at, id);
@@ -240,7 +270,6 @@ const migrate = (database: Database) => {
         id INTEGER PRIMARY KEY,
         job_id INTEGER NOT NULL,
         repository TEXT NOT NULL,
-        installation_id INTEGER,
         actor TEXT,
         capability TEXT NOT NULL,
         input TEXT NOT NULL,
@@ -278,7 +307,7 @@ const migrate = (database: Database) => {
         expires_at INTEGER NOT NULL,
         PRIMARY KEY (repository, subject_kind, subject_number)
       );
-      PRAGMA user_version = 9;
+      PRAGMA user_version = 10;
     `);
     // ! Condemned, not drained: no decoder exists for webhook bodies anymore,
     // ! so leaving one claimable kills the delivery worker on a defect per cycle.
@@ -397,7 +426,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       database
         .query(
           `UPDATE deliveries SET status = 'pending', claimed_at = NULL,
-             last_error = 'process restarted' WHERE status = 'processing'`,
+             lease_expires_at = NULL, last_error = 'process restarted'
+           WHERE status = 'processing'`,
         )
         .run(),
     );
@@ -441,48 +471,105 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             const attempts = row.attempts + 1;
             database
               .query(
-                `UPDATE deliveries SET status = 'processing', attempts = ?, claimed_at = ?
+                `UPDATE deliveries SET status = 'processing', attempts = ?, claimed_at = ?,
+                   lease_expires_at = ?
                  WHERE id = ? AND status = 'pending'`,
               )
-              .run(attempts, now, row.id);
+              .run(attempts, now, now + DELIVERY_LEASE_MS, row.id);
             return { ...row, status: 'processing' as const, attempts };
           })
           .immediate(),
       );
     });
 
-    const finishDelivery = (id: string, status: 'completed' | 'failed', error?: string) =>
+    const finishDelivery = (
+      id: string,
+      attempts: number,
+      status: 'completed' | 'failed',
+      error?: string,
+    ) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
-        yield* attempt('finish delivery', () => {
+        yield* attempt(CLAIM_FENCED_OPERATIONS.finish, () => {
           const result = database
             .query(
-              `UPDATE deliveries SET status = ?, processed_at = ?, last_error = ?
-               WHERE id = ? AND status = 'processing'`,
+              `UPDATE deliveries SET status = ?, processed_at = ?, last_error = ?,
+                 lease_expires_at = NULL
+               WHERE id = ? AND status = 'processing' AND attempts = ?`,
             )
-            .run(status, now, error ?? null, id);
-          if (result.changes !== 1) throw new Error(`Delivery ${id} is not processing`);
+            .run(status, now, error ?? null, id, attempts);
+          if (result.changes !== 1) throw new Error(`Delivery ${id} attempt ${attempts} is stale`);
         });
       });
 
-    const retryDelivery = (id: string, error: string, terminalAfterAttempts = true) =>
-      attempt('retry delivery', () => {
+    const retryDelivery = (
+      id: string,
+      attempts: number,
+      error: string,
+      terminalAfterAttempts = true,
+    ) =>
+      attempt(CLAIM_FENCED_OPERATIONS.retry, () => {
         const result = database
           .query(
             `UPDATE deliveries SET
                status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
                claimed_at = NULL,
+               lease_expires_at = NULL,
                processed_at = CASE WHEN attempts >= ? THEN unixepoch('subsec') * 1000 ELSE NULL END,
                last_error = ?
-             WHERE id = ? AND status = 'processing'`,
+             WHERE id = ? AND status = 'processing' AND attempts = ?`,
           )
           .run(
             terminalAfterAttempts ? config.workerMaxAttempts : Number.MAX_SAFE_INTEGER,
             terminalAfterAttempts ? config.workerMaxAttempts : Number.MAX_SAFE_INTEGER,
             error,
             id,
+            attempts,
           );
-        if (result.changes !== 1) throw new Error(`Delivery ${id} is not processing`);
+        if (result.changes !== 1) throw new Error(`Delivery ${id} attempt ${attempts} is stale`);
+      });
+
+    const heartbeatDelivery = (id: string, attempts: number) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        yield* attempt(CLAIM_FENCED_OPERATIONS.renew, () => {
+          const result = database
+            .query(
+              `UPDATE deliveries SET lease_expires_at = ?
+               WHERE id = ? AND status = 'processing' AND attempts = ?
+                 AND lease_expires_at > ?`,
+            )
+            .run(now + DELIVERY_LEASE_MS, id, attempts, now);
+          if (result.changes !== 1) throw new Error(`Delivery ${id} attempt ${attempts} is stale`);
+        });
+      });
+
+    /**
+     * Returns a delivery whose worker died mid-processing, on the same tick as
+     * `recoverStale` does for jobs. The attempt budget, not the expiry, is what
+     * condemns a row, so the terminal branch mirrors `retryDelivery`.
+     *
+     * A `NULL` lease never matches this, which is what the startup reset is
+     * still for: it covers rows claimed before the column existed.
+     */
+    const recoverStaleDeliveries = (olderThan: number) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        return yield* attempt(
+          'recover stale deliveries',
+          () =>
+            database
+              .query(
+                `UPDATE deliveries SET
+                 status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
+                 claimed_at = NULL,
+                 lease_expires_at = NULL,
+                 processed_at = CASE WHEN attempts >= ? THEN ? ELSE NULL END,
+                 last_error = 'delivery lease expired'
+               WHERE status = 'processing' AND lease_expires_at < ?`,
+              )
+              .run(config.workerMaxAttempts, config.workerMaxAttempts, now, olderThan).changes,
+        );
       });
 
     const deliveryStatus = (id: string) =>
@@ -847,8 +934,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           database
             .query(
               `INSERT INTO capability_audit
-                (job_id, repository, installation_id, actor, capability, input, outcome, created_at)
-               VALUES (?, ?, NULL, ?, ?, ?, ?, ?)`,
+                (job_id, repository, actor, capability, input, outcome, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
             )
             .run(
               entry.jobId,
@@ -1174,6 +1261,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       claimDelivery,
       finishDelivery,
       retryDelivery,
+      heartbeatDelivery,
+      recoverStaleDeliveries,
       deliveryStatus,
       notificationCursor,
       advanceNotificationCursor,

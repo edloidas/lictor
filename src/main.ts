@@ -218,7 +218,9 @@ const Application = Layer.merge(
               yield* health.suspend;
             }
             yield* queue.heartbeatDaemon;
-            yield* queue.recoverStale(yield* Clock.currentTimeMillis);
+            const tick = yield* Clock.currentTimeMillis;
+            yield* queue.recoverStale(tick);
+            yield* queue.recoverStaleDeliveries(tick);
           }),
         ).pipe(
           Effect.tapError((cause) => stop('Daemon ownership heartbeat failed', Cause.fail(cause))),
