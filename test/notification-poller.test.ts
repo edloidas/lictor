@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { HttpClient, HttpClientRequest, HttpClientResponse } from '@effect/platform';
 import { Effect, Layer, Logger, Redacted } from 'effect';
-import { LictorConfig } from '../src/config.ts';
+import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { GitHubClient } from '../src/github/client.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
 import { NotificationPoller } from '../src/notifications/poller.ts';
@@ -19,6 +19,7 @@ const config = (
     expectedLogin: 'adiutriel',
     trustedSenders: ['edloidas'],
     databasePath: ':memory:',
+    stateDir: stateDirOf(':memory:'),
     policyPath: 'unused',
     controlSocketPath: '/tmp/lictor-poller.sock',
     deliveryMaxBytes: 1024 * 1024,

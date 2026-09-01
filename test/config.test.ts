@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { ConfigProvider, Effect, Layer } from 'effect';
 import { LictorConfig, legacyStateConflict } from '../src/config.ts';
 
@@ -46,6 +46,19 @@ describe('LictorConfig', () => {
     );
 
     expect(config.databasePath).toBe(expected);
+  });
+
+  // Resolved, not just split: the value becomes `CODEX_HOME` for a child that
+  // runs in a session checkout, where a relative directory would mean somewhere else.
+  test.each([
+    ['~/elsewhere/lictor.sqlite', join(homedir(), 'elsewhere')],
+    ['data/lictor.sqlite', resolve('data')],
+  ])('derives the state directory from the database path %p', async (value, expected) => {
+    const config = await Effect.runPromise(
+      load(new Map([...required, ['LICTOR_DATABASE_PATH', value]])),
+    );
+
+    expect(config.stateDir).toBe(expected);
   });
 
   test('leaves a path without a tilde exactly as given', async () => {

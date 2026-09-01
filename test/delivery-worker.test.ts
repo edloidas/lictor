@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { HttpClient, HttpClientRequest, HttpClientResponse } from '@effect/platform';
 import { Clock, Effect, Fiber, Layer, Logger, Redacted, Schema } from 'effect';
-import { LictorConfig } from '../src/config.ts';
+import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { DeliveryWorker, isTerminalFailure } from '../src/delivery-worker.ts';
 import { GitHubClient, GitHubRequestError } from '../src/github/client.ts';
 import {
@@ -18,6 +18,7 @@ const config = LictorConfig.make({
   trustedSenders: ['edloidas'],
   autoAcceptInviters: [],
   databasePath: ':memory:',
+  stateDir: stateDirOf(':memory:'),
   policyPath: 'unused',
   controlSocketPath: '/tmp/lictor-delivery.sock',
   deliveryMaxBytes: 1024 * 1024,

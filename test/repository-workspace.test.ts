@@ -49,6 +49,7 @@ const config = (home: string) =>
     trustedSenders: ['edloidas'],
     autoAcceptInviters: [],
     databasePath: join(home, 'lictor.sqlite'),
+    stateDir: home,
     policyPath: join(home, 'policy.toml'),
     controlSocketPath: join(home, 'lictor.sock'),
     deliveryMaxBytes: 1024,

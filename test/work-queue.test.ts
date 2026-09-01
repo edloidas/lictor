@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Clock, Effect, Layer, Redacted } from 'effect';
-import { LictorConfig } from '../src/config.ts';
+import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
 
@@ -15,6 +15,7 @@ const config = (databasePath: string) =>
     trustedSenders: ['edloidas'],
     autoAcceptInviters: [],
     databasePath,
+    stateDir: stateDirOf(databasePath),
     policyPath: 'policy.toml',
     controlSocketPath: '/tmp/lictor.sock',
     deliveryMaxBytes: 1024,

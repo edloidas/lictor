@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, renameSync, statfsSync, statSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { Data, Effect, Option, Redacted, Ref } from 'effect';
 import { LictorConfig } from '../config.ts';
 import { ProcessRunner } from '../executor/process-runner.ts';
@@ -195,7 +195,7 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
        * Keyed by job id alone: a session belongs to exactly one attempt of one
        * job, never to a repository, so nothing outlives the id that named it.
        */
-      const root = join(dirname(resolve(config.databasePath)), 'sessions');
+      const root = join(config.stateDir, 'sessions');
 
       const command = (
         args: readonly string[],

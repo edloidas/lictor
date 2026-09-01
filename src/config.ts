@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { Config, Effect } from 'effect';
 
 const loginList = (name: string) =>
@@ -77,6 +77,12 @@ const expandHome = (value: string): string => {
 const statePath = (name: string, fallback: string) =>
   Config.string(name).pipe(Config.withDefault(join(HOME, fallback)), Config.map(expandHome));
 
+/**
+ * Everything beside the database follows it, so relocating the database relocates
+ * all state. Deliberately not its own setting: a second knob could disagree.
+ */
+export const stateDirOf = (databasePath: string): string => dirname(resolve(databasePath));
+
 const positiveInteger = (name: string, fallback: number, maximum: number) =>
   Config.integer(name).pipe(
     Config.withDefault(fallback),
@@ -95,6 +101,7 @@ const positiveInteger = (name: string, fallback: number, maximum: number) =>
  */
 export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig', {
   effect: Effect.gen(function* () {
+    const databasePath = yield* statePath('LICTOR_DATABASE_PATH', 'lictor.sqlite');
     return {
       /**
        * Personal access token for the account the daemon acts as.
@@ -123,13 +130,9 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
        * Empty accepts nothing; nobody is ever declined.
        */
       autoAcceptInviters: yield* loginList('LICTOR_AUTO_ACCEPT_INVITERS'),
-      /**
-       * Local SQLite file used for durable work.
-       *
-       * `CODEX_HOME` is derived from this path's directory, so moving it moves
-       * the agent's home with it — see `src/executor/agent-executor.ts`.
-       */
-      databasePath: yield* statePath('LICTOR_DATABASE_PATH', 'lictor.sqlite'),
+      /** Local SQLite file used for durable work. `stateDir` follows it. */
+      databasePath,
+      stateDir: stateDirOf(databasePath),
       policyPath: yield* statePath('LICTOR_POLICY_PATH', 'policy.toml'),
       controlSocketPath: yield* statePath('LICTOR_SOCKET_PATH', 'lictor.sock'),
       deliveryMaxBytes: yield* positiveInteger(

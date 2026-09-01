@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { HttpClient, HttpClientResponse } from '@effect/platform';
 import { Effect, Layer, Logger, Redacted, Ref } from 'effect';
-import { LictorConfig } from '../src/config.ts';
+import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { GitHubClient } from '../src/github/client.ts';
 import { GitHubCredential } from '../src/github/credential.ts';
 import { GitHubIdentity } from '../src/github/identity.ts';
@@ -15,6 +15,7 @@ const config = (expectedLogin: string, trustedSenders: readonly string[] = []) =
       trustedSenders: [...trustedSenders],
       autoAcceptInviters: [],
       databasePath: ':memory:',
+      stateDir: stateDirOf(':memory:'),
       policyPath: 'unused',
       controlSocketPath: '/tmp/lictor.sock',
       deliveryMaxBytes: 1024,
