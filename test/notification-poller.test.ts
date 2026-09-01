@@ -313,8 +313,8 @@ describe('NotificationPoller', () => {
   it('commits the row before marking the thread read', async () => {
     const result = await run([{ body: [thread('1')] }]);
 
-    const store = result.calls.findIndex(
-      (call) => call === 'STORE notification:1:2026-08-21T10:00:00Z',
+    const store = result.calls.findIndex((call) =>
+      call.startsWith('STORE notification:1:2026-08-21T10:00:00Z:'),
     );
     const mark = result.calls.findIndex(
       (call) => call.startsWith('PATCH') && call.includes('/notifications/threads/1'),

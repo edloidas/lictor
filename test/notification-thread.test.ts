@@ -68,8 +68,28 @@ describe('decodeThreads', () => {
 });
 
 describe('deliveryIdFor', () => {
-  it('joins the prefix, id and updated_at', () => {
-    expect(deliveryIdFor(thread())).toBe('notification:14567:2026-08-21T10:00:00Z');
+  const idFor = (input: ReturnType<typeof thread>) => deliveryIdFor(input, JSON.stringify(input));
+
+  it('keeps the thread id and updated_at greppable ahead of a 6-hex body hash', () => {
+    expect(idFor(thread())).toMatch(/^notification:14567:2026-08-21T10:00:00Z:[0-9a-f]{6}$/);
+  });
+
+  it('is stable for an identical body', () => {
+    expect(idFor(thread())).toBe(idFor(thread()));
+  });
+
+  // Same second, different payload: the case the digest exists for.
+  it('differs for a different body with the same updated_at', () => {
+    const later = thread({
+      subject: {
+        ...thread().subject,
+        latest_comment_url: 'https://api.github.com/repos/edloidas/sandbox/issues/comments/100',
+      },
+    });
+
+    expect(idFor(later)).not.toBe(idFor(thread()));
+    const withoutDigest = (id: string) => id.replace(/:[0-9a-f]{6}$/, '');
+    expect(withoutDigest(idFor(later))).toBe(withoutDigest(idFor(thread())));
   });
 });
 
