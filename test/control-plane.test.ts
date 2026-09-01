@@ -62,6 +62,7 @@ describe('local control plane', () => {
         trustedSenders: [],
         autoAcceptInviters: [],
         databasePath,
+        stateDir: directory,
         policyPath: 'unused',
         controlSocketPath: socketPath,
         deliveryMaxBytes: 1024,

@@ -1,5 +1,5 @@
 import { mkdirSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { Data, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
 import type { WorkItem } from '../work-item.ts';
@@ -62,11 +62,11 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
       config.codexHome ||
       // Follows daemon state by default: `~/.lictor/codex` is the path
       // `codex login` must be run against. Overridden by LICTOR_CODEX_HOME.
-      join(dirname(resolve(config.databasePath)), 'codex');
+      join(config.stateDir, 'codex');
     yield* Effect.sync(() => mkdirSync(codexHome, { recursive: true, mode: 0o700 }));
     // Operator-authored standing instructions — the one trusted prose in the
     // prompt, so it is prepended ahead of the untrusted JSON, never inside it.
-    const soulPath = join(dirname(resolve(config.databasePath)), 'SOUL.md');
+    const soulPath = join(config.stateDir, 'SOUL.md');
     const readSoul = Effect.tryPromise({
       try: () => Bun.file(soulPath).text(),
       catch: (cause) =>

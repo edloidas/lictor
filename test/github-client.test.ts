@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { HttpClient, HttpClientResponse } from '@effect/platform';
 import { Effect, Layer, Redacted } from 'effect';
-import { LictorConfig } from '../src/config.ts';
+import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { GitHubClient } from '../src/github/client.ts';
 import { GitHubCredential } from '../src/github/credential.ts';
 import type { ContextRef } from '../src/work-item.ts';
@@ -14,6 +14,7 @@ const ConfigLive = Layer.succeed(
     trustedSenders: ['edloidas'],
     autoAcceptInviters: [],
     databasePath: ':memory:',
+    stateDir: stateDirOf(':memory:'),
     policyPath: 'unused',
     controlSocketPath: '/tmp/lictor-client.sock',
     deliveryMaxBytes: 1024,

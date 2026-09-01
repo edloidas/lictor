@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { Effect, Layer, Redacted } from 'effect';
-import { LictorConfig } from '../src/config.ts';
+import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { AgentExecutor, ExecutorError } from '../src/executor/agent-executor.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
 import { Policy } from '../src/policy.ts';
@@ -43,6 +43,7 @@ const config = (maxAttempts = 3) =>
     trustedSenders: ['edloidas'],
     autoAcceptInviters: [],
     databasePath: ':memory:',
+    stateDir: stateDirOf(':memory:'),
     policyPath: 'policy.toml',
     controlSocketPath: '/tmp/lictor.sock',
     deliveryMaxBytes: 1024,

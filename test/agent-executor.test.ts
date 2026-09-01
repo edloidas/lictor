@@ -3,7 +3,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Effect, Redacted, Ref } from 'effect';
-import { LictorConfig } from '../src/config.ts';
+import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { AgentExecutor, buildPrompt } from '../src/executor/agent-executor.ts';
 import { type ProcessRequest, ProcessRunner } from '../src/executor/process-runner.ts';
 import type { WorkItem } from '../src/work-item.ts';
@@ -31,6 +31,7 @@ const config = (executor: 'codex' | 'disabled' = 'codex', databasePath = ':memor
     trustedSenders: ['edloidas'],
     autoAcceptInviters: [],
     databasePath,
+    stateDir: stateDirOf(databasePath),
     policyPath: 'policy.toml',
     controlSocketPath: '/tmp/lictor.sock',
     deliveryMaxBytes: 1024,

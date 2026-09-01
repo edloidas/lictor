@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { HttpClient, HttpClientRequest, HttpClientResponse } from '@effect/platform';
 import { Effect, Layer, Redacted, Ref } from 'effect';
-import { LictorConfig } from '../src/config.ts';
+import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { CapabilityBroker } from '../src/github/capability-broker.ts';
 import { GitHubClient } from '../src/github/client.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
@@ -32,6 +32,7 @@ const ConfigLive = Layer.succeed(
     trustedSenders: [],
     autoAcceptInviters: [],
     databasePath: ':memory:',
+    stateDir: stateDirOf(':memory:'),
     policyPath: 'unused',
     controlSocketPath: '/tmp/lictor.sock',
     deliveryMaxBytes: 1024,
