@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { Schema } from 'effect';
 
 export const NotificationThread = Schema.Struct({
@@ -42,8 +43,12 @@ export const UNMENTIONABLE_REASONS: ReadonlySet<string> = new Set([
   'invitation',
 ]);
 
-export const deliveryIdFor = (thread: NotificationThread): string =>
-  `notification:${thread.id}:${thread.updated_at}`;
+// `updated_at` has second resolution; the digest keeps two same-second
+// observations apart. `body` must be the exact string the row stores.
+export const deliveryIdFor = (thread: NotificationThread, body: string): string => {
+  const digest = createHash('sha256').update(body).digest('hex').slice(0, 6);
+  return `notification:${thread.id}:${thread.updated_at}:${digest}`;
+};
 
 export type SubjectRef = {
   readonly kind: 'issue' | 'pull_request';

@@ -215,10 +215,11 @@ export class NotificationPoller extends Effect.Service<NotificationPoller>()('No
           );
           break;
         }
+        const body = JSON.stringify(thread);
         yield* queue.receiveDelivery({
-          id: deliveryIdFor(thread),
+          id: deliveryIdFor(thread, body),
           event: NOTIFICATION_EVENT,
-          body: JSON.stringify(thread),
+          body,
           source: 'notification',
         });
         // ! After the row commits, never before: until the mark lands, GitHub

@@ -8,6 +8,7 @@ import { GitHubClient } from '../src/github/client.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
 import { GitHubIdentity } from '../src/github/identity.ts';
 import { NotificationPoller } from '../src/notifications/poller.ts';
+import { decodeThread, deliveryIdFor } from '../src/notifications/thread.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import { Worker } from '../src/worker.ts';
@@ -53,6 +54,11 @@ const thread = {
   repository: { full_name: 'edloidas/lictor' },
 };
 
+// The poller stores the decoded thread, not the wire payload, so the id hashes
+// the decoded serialization.
+const storedThread = Effect.runSync(decodeThread(thread));
+const deliveryId = deliveryIdFor(storedThread, JSON.stringify(storedThread));
+
 const issue = {
   title: 'Exercise the pipeline',
   html_url: 'https://github.com/edloidas/lictor/issues/17',
@@ -93,7 +99,7 @@ const replyFor = (url: string, listCalls: number): unknown => {
 };
 
 describe('notification-to-agent pipeline', () => {
-  it('polls, marks read after committing, acknowledges once, executes, and completes', async () => {
+  it('polls, marks read once, acknowledges once, executes, and completes', async () => {
     const result = await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
@@ -217,9 +223,7 @@ describe('notification-to-agent pipeline', () => {
               executions: yield* Ref.get(executions),
               reactions: yield* Ref.get(reactions),
               calls: yield* Ref.get(calls),
-              deliveryStatus: yield* queue.deliveryStatus(
-                'notification:14567:2026-08-21T10:00:00Z',
-              ),
+              deliveryStatus: yield* queue.deliveryStatus(deliveryId),
             };
           }).pipe(Effect.provide(Runtime), Effect.provide(Logger.remove(Logger.defaultLogger)));
         }),
@@ -232,7 +236,7 @@ describe('notification-to-agent pipeline', () => {
     expect(result.counts.pending).toBe(0);
     expect(result.executions).toBe(1);
     expect(result.reactions).toEqual(['edloidas/lictor:{"kind":"issue_comment","id":99}']);
-    // Marked read exactly once, and only after the row was committed.
+    // Marked read exactly once; store-then-mark ordering is pinned in the poller suite.
     expect(
       result.calls.filter((call) => call.startsWith('PATCH') && call.includes('/threads/14567')),
     ).toHaveLength(1);
