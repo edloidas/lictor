@@ -34,6 +34,13 @@ type Candidate = {
   readonly ref: ContextRef;
   readonly url: string;
   readonly body: string | undefined;
+  /** GraphQL's `lastEditedAt`, verbatim, once an edit has been attributed. */
+  readonly editedAt?: string;
+};
+
+type Edit = {
+  readonly editor: string | undefined;
+  readonly lastEditedAt: string | undefined;
 };
 
 const PAGE_SIZE = 100;
@@ -70,6 +77,7 @@ const Review = Schema.Struct({
 
 const Comment = Schema.Struct({
   id: Schema.Number,
+  node_id: Schema.String,
   html_url: Schema.String,
   body: Schema.optionalWith(Schema.String, { nullable: true }),
   user: Schema.optionalWith(User, { nullable: true }),
@@ -405,22 +413,153 @@ const fetchTriggeringEvent = <E>(
     return rescinded ? undefined : chosen;
   });
 
+const EditNode = Schema.Struct({
+  id: Schema.String,
+  editor: Schema.optionalWith(User, { nullable: true }),
+  lastEditedAt: Schema.optionalWith(Schema.String, { nullable: true }),
+});
+
+const EditsResponse = Schema.Struct({
+  data: Schema.optionalWith(
+    Schema.Struct({
+      nodes: Schema.optionalWith(Schema.Array(Schema.NullOr(EditNode)), { nullable: true }),
+      repository: Schema.optionalWith(
+        Schema.Struct({
+          issueOrPullRequest: Schema.optionalWith(EditNode, { nullable: true }),
+        }),
+        { nullable: true },
+      ),
+    }),
+    { nullable: true },
+  ),
+  errors: Schema.optionalWith(Schema.Array(Schema.Struct({ message: Schema.String })), {
+    nullable: true,
+  }),
+});
+
+const EDITS_QUERY =
+  'query($ids:[ID!]!,$owner:String!,$name:String!,$number:Int!,$comments:Boolean!,$subject:Boolean!){nodes(ids:$ids) @include(if:$comments){id ... on IssueComment{editor{login} lastEditedAt} ... on PullRequestReviewComment{editor{login} lastEditedAt}} repository(owner:$owner,name:$name) @include(if:$subject){issueOrPullRequest(number:$number){... on Issue{id editor{login} lastEditedAt} ... on PullRequest{id editor{login} lastEditedAt}}}}';
+
+const toEdit = (node: Schema.Schema.Type<typeof EditNode>): Edit => ({
+  editor: node.editor?.login,
+  lastEditedAt: node.lastEditedAt ?? undefined,
+});
+
+const isEdited = (created: string, updated: string): boolean =>
+  Date.parse(created) !== Date.parse(updated);
+
 /**
- * ! Keyed on `created_at`, never `updated_at` — a security property. REST names
- * ! no editor for a comment, so keying on edits would let anyone able to edit a
- * ! comment have the job attributed to its original, possibly trusted, author.
- * ! Cost: a mention added by editing is not acted on; a new comment still is.
+ * Who last edited each candidate whose REST timestamps disagree, and when.
+ *
+ * REST names no editor, so GraphQL is the only source of that identity. One
+ * request serves the whole thread: comments by node id, the subject by number.
+ * A subject's `updated_at` moves on any activity, not only a body edit, so it is
+ * asked about on nearly every thread; a comment only when it was really edited.
  */
+const fetchEdits = <E>(
+  client: Authenticated<E>,
+  repository: string,
+  number: number,
+  commentIds: readonly string[],
+  subjectEdited: boolean,
+): Effect.Effect<
+  { readonly comments: ReadonlyMap<string, Edit>; readonly subject: Edit | undefined },
+  NotificationError
+> =>
+  Effect.gen(function* () {
+    const comments = new Map<string, Edit>();
+    if (commentIds.length === 0 && !subjectEdited) return { comments, subject: undefined };
+
+    const path = '/graphql';
+    const [owner, name] = repository.split('/');
+    const body = {
+      query: EDITS_QUERY,
+      variables: {
+        ids: commentIds,
+        owner,
+        name,
+        number,
+        comments: commentIds.length > 0,
+        subject: subjectEdited,
+      },
+    };
+    const response = yield* client
+      .execute(HttpClientRequest.bodyUnsafeJson(HttpClientRequest.post(path), body))
+      .pipe(
+        Effect.mapError(
+          (cause) =>
+            new NotificationError({ message: `Could not reach GitHub for ${path}`, cause }),
+        ),
+      );
+    if (response.status < 200 || response.status >= 300) {
+      return yield* new NotificationError({
+        message: `GitHub returned status ${response.status} for ${path}`,
+      });
+    }
+    const parsed = yield* Effect.flatMap(readJson(response, path), (json) =>
+      decodeJson(EditsResponse, json, path),
+    );
+    // A 200 with no `data` is the GraphQL shape of a failed request. Partial
+    // data beside `errors` is kept: a node GitHub could not resolve comes back
+    // null and its candidate keeps its creation, which is the safe direction.
+    if (parsed.data === undefined) {
+      return yield* new NotificationError({
+        message: `GitHub returned no data for ${path}`,
+        cause: parsed.errors,
+      });
+    }
+    for (const node of parsed.data.nodes ?? []) {
+      if (node !== null) comments.set(node.id, toEdit(node));
+    }
+    const subjectNode = parsed.data.repository?.issueOrPullRequest;
+    return { comments, subject: subjectNode === undefined ? undefined : toEdit(subjectNode) };
+  });
+
+/**
+ * ! An edited text belongs to the less trusted of its author and its editor.
+ * ! REST names no editor, so keying on `updated_at` alone would attribute a
+ * ! stranger's edit to the original, possibly trusted, author; and a trusted
+ * ! user tidying a stranger's comment did not write the instruction in it, so
+ * ! a foreign edit never lifts a body above the trust it was posted with. With
+ * ! no named editor the candidate keeps its creation: lost, not misattributed.
+ */
+const attributed = (
+  candidate: Candidate,
+  edit: Edit | undefined,
+  trusted: ReadonlySet<string>,
+): Candidate => {
+  if (edit?.editor === undefined || edit.lastEditedAt === undefined) return candidate;
+  const at = parseDate(edit.lastEditedAt);
+  if (at === undefined) return candidate;
+  const original = candidate.author;
+  const elevates =
+    trusted.has(normalizeLogin(edit.editor)) &&
+    (original === undefined || !trusted.has(normalizeLogin(original)));
+  return {
+    ...candidate,
+    at,
+    author: elevates ? original : edit.editor,
+    editedAt: edit.lastEditedAt,
+  };
+};
+
 const commentCandidate = (
   comment: Schema.Schema.Type<typeof Comment>,
   kind: 'issue_comment' | 'review_comment',
-): Candidate => ({
-  at: Date.parse(comment.created_at),
-  author: comment.user?.login,
-  ref: { kind, id: comment.id },
-  url: comment.html_url,
-  body: comment.body,
-});
+  edit: Edit | undefined,
+  trusted: ReadonlySet<string>,
+): Candidate =>
+  attributed(
+    {
+      at: Date.parse(comment.created_at),
+      author: comment.user?.login,
+      ref: { kind, id: comment.id },
+      url: comment.html_url,
+      body: comment.body,
+    },
+    edit,
+    trusted,
+  );
 
 /**
  * Order within one second, where GitHub's timestamps cannot separate candidates.
@@ -501,6 +640,9 @@ export const qualifyNotification = (input: {
           ? undefined
           : parseDate(input.thread.last_read_at));
 
+      const selfLogin = normalizeLogin(input.policy.selfLogin);
+      const trusted = new Set(input.policy.trustedSenders.map(normalizeLogin));
+
       const github = yield* GitHubClient;
       const client = yield* github.authenticated;
       const repository = input.thread.repository.full_name;
@@ -525,9 +667,25 @@ export const qualifyNotification = (input: {
         reviews = yield* fetchReviews(client, repository, ref.number);
       }
 
+      // Reviews are not consulted: an edited review stays attributed to whoever
+      // submitted it.
+      const edits = yield* fetchEdits(
+        client,
+        repository,
+        ref.number,
+        [...conversationComments, ...reviewComments]
+          .filter((comment) => isEdited(comment.created_at, comment.updated_at))
+          .map((comment) => comment.node_id),
+        isEdited(subject.created_at, subject.updated_at),
+      );
+
       const candidates: Candidate[] = [
-        ...conversationComments.map((comment) => commentCandidate(comment, 'issue_comment')),
-        ...reviewComments.map((comment) => commentCandidate(comment, 'review_comment')),
+        ...conversationComments.map((comment) =>
+          commentCandidate(comment, 'issue_comment', edits.comments.get(comment.node_id), trusted),
+        ),
+        ...reviewComments.map((comment) =>
+          commentCandidate(comment, 'review_comment', edits.comments.get(comment.node_id), trusted),
+        ),
         // Targeted at the pull request, not the review: GitHub has no reactions
         // endpoint for a review, while `contextUrl` still points at the review.
         ...reviews.map((review) => ({
@@ -537,19 +695,18 @@ export const qualifyNotification = (input: {
           url: review.html_url,
           body: review.body,
         })),
+        attributed(
+          {
+            at: Date.parse(subject.created_at),
+            author: subject.user?.login,
+            ref: { kind: 'body', number: ref.number },
+            url: subject.html_url,
+            body: subject.body,
+          },
+          edits.subject,
+          trusted,
+        ),
       ];
-      // Gated on when the issue was opened, not any later edit — see
-      // `commentCandidate`: `subject.user` opened it and REST names no editor.
-      const openedAt = Date.parse(subject.created_at);
-      if (since === undefined || openedAt >= since) {
-        candidates.push({
-          at: openedAt,
-          author: subject.user?.login,
-          ref: { kind: 'body', number: ref.number },
-          url: subject.html_url,
-          body: subject.body,
-        });
-      }
 
       // The reviews endpoint takes no `since`, so hold its candidates to the
       // same window or old reviews re-trigger on every sweep.
@@ -561,9 +718,6 @@ export const qualifyNotification = (input: {
           ? []
           : [{ ...candidate, author: candidate.author }],
       );
-
-      const selfLogin = normalizeLogin(input.policy.selfLogin);
-      const trusted = new Set(input.policy.trustedSenders.map(normalizeLogin));
 
       // The newest *trusted* mention triggers. Letting an untrusted one win and
       // then refusing hands every participant a mute button; self-activity is
@@ -705,8 +859,9 @@ export const qualifyNotification = (input: {
       const continued = useContinuation;
       const work: WorkItem = {
         ...common,
-        // Identities only: one job per thread per activity window means no
-        // timestamp and no html url, or every edit becomes a new job.
+        // Identities, plus the edit time only where an edit was attributed: an
+        // unedited candidate keeps a timestamp-free identity so a replay dedupes,
+        // while a second edit of the same text is a second instruction.
         interactionId: JSON.stringify([
           repository,
           ref.kind,
@@ -715,6 +870,7 @@ export const qualifyNotification = (input: {
           triggering.ref,
           sender,
           selfLogin,
+          ...(triggering.editedAt === undefined ? [] : [triggering.editedAt]),
         ]),
         sender,
         reasons: [continued ? 'continued' : 'mentioned'],

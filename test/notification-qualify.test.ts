@@ -37,6 +37,7 @@ const issue = (overrides: Record<string, unknown> = {}) => ({
 const comment = (overrides: Record<string, unknown> = {}) => {
   const base = {
     id: 99,
+    node_id: `IC_${overrides.id ?? 99}`,
     html_url: 'https://github.com/edloidas/sandbox/issues/7#issuecomment-99',
     body: 'hey @adiutriel take a look',
     user: { login: 'edloidas' },
@@ -110,6 +111,20 @@ const issueRoutes = (
     ['/issues/7/comments', { body: comments }],
     ['/pulls/7/comments', { body: [] }],
     ['/issues/7', { body: subject }],
+  ] as const;
+
+/** One GraphQL reply: `nodes` for edited comments, the subject when asked. */
+const graphql = (nodes: readonly unknown[], subject?: unknown) =>
+  [
+    '/graphql',
+    {
+      body: {
+        data: {
+          nodes,
+          ...(subject === undefined ? {} : { repository: { issueOrPullRequest: subject } }),
+        },
+      },
+    },
   ] as const;
 
 const qualified = <A>(exit: Exit.Exit<A, unknown>): A => {
@@ -301,23 +316,239 @@ describe('qualifyNotification', () => {
     expect(qualified(result.exit).work).toBeUndefined();
   });
 
-  // `comment.user` is who wrote the comment; REST reports no editor. Keying a
-  // candidate on `updated_at` would let a maintainer rewrite someone else's
-  // comment and have the job attributed to that trusted author.
-  it('ignores a mention inserted by editing an existing comment', async () => {
-    const result = await run(
-      qualifyNotification({
-        deliveryId: 'delivery',
-        thread: thread(),
-        policy,
-        cursorMs: Date.parse('2026-08-21T09:00:00Z'),
-      }),
-      issueRoutes(issue(), [
-        comment({ created_at: '2026-08-20T08:00:00Z', updated_at: '2026-08-21T10:00:00Z' }),
-      ]),
-    );
+  describe('edited text', () => {
+    const edited = comment({
+      created_at: '2026-08-20T08:00:00Z',
+      updated_at: '2026-08-21T10:00:00Z',
+    });
+    const cursorMs = Date.parse('2026-08-21T09:00:00Z');
+    const editedAt = '2026-08-21T10:00:00Z';
 
-    expect(qualified(result.exit).work).toBeUndefined();
+    // `comment.user` is who wrote the comment; REST reports no editor, so the
+    // edit is attributed only once GraphQL names who made it.
+    it('attributes a mention inserted by editing to the editor', async () => {
+      const result = await run(
+        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        [
+          graphql([{ id: 'IC_99', editor: { login: 'friend' }, lastEditedAt: editedAt }]),
+          ...issueRoutes(issue(), [edited]),
+        ],
+      );
+
+      const work = qualified(result.exit).work;
+      expect(work?.sender).toBe('friend');
+      expect(work?.reasons).toEqual(['mentioned']);
+      expect(work?.context).toEqual({ kind: 'issue_comment', id: 99 });
+      expect(result.requests.some((url) => url.endsWith('/graphql'))).toBe(true);
+    });
+
+    // The attack this exists to stop: someone with write access rewrites a
+    // trusted author's comment. The text is theirs now, and they are not
+    // trusted. The comment is created inside the window so that the window
+    // filter cannot be what drops it — only attribution can.
+    it('does not attribute an edit to the original author', async () => {
+      const result = await run(
+        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        [
+          graphql([{ id: 'IC_99', editor: { login: 'stranger' }, lastEditedAt: editedAt }]),
+          ...issueRoutes(issue(), [
+            comment({ created_at: '2026-08-21T09:30:00Z', updated_at: editedAt }),
+          ]),
+        ],
+      );
+
+      expect(qualified(result.exit).work).toBeUndefined();
+    });
+
+    // The other direction: a trusted user tidying a stranger's comment did not
+    // write the instruction in it, so the edit must not lift it to their trust.
+    it("does not lift a stranger's text to the trust of whoever edited it", async () => {
+      const result = await run(
+        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        [
+          graphql([{ id: 'IC_99', editor: { login: 'edloidas' }, lastEditedAt: editedAt }]),
+          ...issueRoutes(issue(), [comment({ ...edited, user: { login: 'stranger' } })]),
+        ],
+      );
+
+      expect(qualified(result.exit).work).toBeUndefined();
+    });
+
+    it("attributes a trusted author's text edited by another trusted user to the editor", async () => {
+      const result = await run(
+        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        [
+          graphql([{ id: 'IC_99', editor: { login: 'friend' }, lastEditedAt: editedAt }]),
+          ...issueRoutes(issue(), [comment({ ...edited, user: { login: 'edloidas' } })]),
+        ],
+      );
+
+      expect(qualified(result.exit).work?.sender).toBe('friend');
+    });
+
+    // A comment whose author account is gone has no trust to compare against;
+    // a trusted edit of it is treated like any other foreign edit and dropped.
+    it('drops a trusted edit of a comment whose author is gone', async () => {
+      const result = await run(
+        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        [
+          graphql([{ id: 'IC_99', editor: { login: 'edloidas' }, lastEditedAt: editedAt }]),
+          ...issueRoutes(issue(), [comment({ ...edited, user: null })]),
+        ],
+      );
+
+      expect(qualified(result.exit).work).toBeUndefined();
+    });
+
+    // While live, an edit by an untrusted participant continues the work the
+    // same way a fresh reply from them would.
+    it('lets an untrusted editor continue live work', async () => {
+      const result = await run(
+        qualifyNotification({
+          deliveryId: 'delivery',
+          thread: thread(),
+          policy,
+          cursorMs,
+          live: true,
+        }),
+        [
+          graphql([{ id: 'IC_99', editor: { login: 'stranger' }, lastEditedAt: editedAt }]),
+          ...issueRoutes(issue(), [edited]),
+        ],
+      );
+
+      const work = qualified(result.exit).work;
+      expect(work?.sender).toBe('stranger');
+      expect(work?.reasons).toEqual(['continued']);
+    });
+
+    // GraphQL reports no editor for some historical edits. Falling back to the
+    // author there would be exactly the misattribution the lookup prevents.
+    it('ignores an edit whose editor GraphQL does not name', async () => {
+      const result = await run(
+        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        [
+          graphql([{ id: 'IC_99', editor: null, lastEditedAt: editedAt }]),
+          ...issueRoutes(issue(), [edited]),
+        ],
+      );
+
+      expect(qualified(result.exit).work).toBeUndefined();
+    });
+
+    it('spends no request on a thread where nothing was edited', async () => {
+      const result = await run(
+        qualifyNotification({
+          deliveryId: 'delivery',
+          thread: thread(),
+          policy,
+          cursorMs: undefined,
+        }),
+        issueRoutes(issue(), [comment()]),
+      );
+
+      expect(qualified(result.exit).work?.sender).toBe('edloidas');
+      expect(result.requests.some((url) => url.endsWith('/graphql'))).toBe(false);
+    });
+
+    // An enrichment failure, inside the retry budget like every other one.
+    it('fails with NotificationError when the editor lookup is refused', async () => {
+      const result = await run(
+        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        [
+          ['/graphql', { status: 502, body: { message: 'Bad Gateway' } }],
+          ...issueRoutes(issue(), [edited]),
+        ],
+      );
+
+      expect(Exit.isFailure(result.exit)).toBe(true);
+      expect(String(result.exit)).toContain('NotificationError');
+      expect(String(result.exit)).toContain('status 502');
+    });
+
+    it('fails with NotificationError when GraphQL answers with errors and no data', async () => {
+      const result = await run(
+        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        [
+          ['/graphql', { body: { data: null, errors: [{ message: 'Something went wrong' }] } }],
+          ...issueRoutes(issue(), [edited]),
+        ],
+      );
+
+      expect(Exit.isFailure(result.exit)).toBe(true);
+      expect(String(result.exit)).toContain('NotificationError');
+    });
+
+    // Once edits are actionable, an identity without the edit time would dedupe
+    // a second instruction as a replay of the first. Unedited identities stay
+    // byte-identical so nothing already queued changes meaning.
+    it('gives each edit its own identity and keeps unedited ones unchanged', async () => {
+      const at = async (lastEditedAt: string) =>
+        qualified(
+          (
+            await run(
+              qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+              [
+                graphql([{ id: 'IC_99', editor: { login: 'edloidas' }, lastEditedAt }]),
+                ...issueRoutes(issue(), [
+                  comment({ updated_at: lastEditedAt, created_at: '2026-08-20T08:00:00Z' }),
+                ]),
+              ],
+            )
+          ).exit,
+        ).work?.interactionId;
+      const unedited = qualified(
+        (
+          await run(
+            qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+            issueRoutes(issue(), [comment()]),
+          )
+        ).exit,
+      ).work?.interactionId;
+
+      const first = await at('2026-08-21T10:00:00Z');
+      const replay = await at('2026-08-21T10:00:00Z');
+      const second = await at('2026-08-21T10:40:00Z');
+
+      expect(JSON.parse(unedited ?? '')).toEqual([
+        'edloidas/sandbox',
+        'issue',
+        7,
+        'mentioned',
+        { kind: 'issue_comment', id: 99 },
+        'edloidas',
+        'adiutriel',
+      ]);
+      expect(JSON.parse(first ?? '')).toEqual([
+        ...JSON.parse(unedited ?? ''),
+        '2026-08-21T10:00:00Z',
+      ]);
+      expect(replay).toBe(first);
+      expect(second).not.toBe(first);
+    });
+
+    // GitHub answers a node it cannot resolve with `null` beside an `errors`
+    // entry. That is one comment gone between two requests, not a failed
+    // delivery; its candidate keeps its creation.
+    it('keeps a candidate at its creation when GraphQL cannot resolve its node', async () => {
+      const result = await run(
+        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        [
+          [
+            '/graphql',
+            {
+              body: {
+                data: { nodes: [null] },
+                errors: [{ message: "Could not resolve to a node with the global id of 'IC_99'" }],
+              },
+            },
+          ],
+          ...issueRoutes(issue(), [edited]),
+        ],
+      );
+
+      expect(qualified(result.exit).work).toBeUndefined();
+    });
   });
 
   it('drops her own activity structurally', async () => {
@@ -364,29 +595,58 @@ describe('qualifyNotification', () => {
     expect(qualified(result.exit).work).toBeUndefined();
   });
 
-  // `subject.user` is who opened the issue, and REST exposes no editor
-  // identity for a body. Keying the body candidate on `updated_at` would let
-  // anyone able to edit the body insert a mention and have it attributed to the
-  // original — possibly trusted — author.
-  it('ignores a body mention inserted after the issue was opened', async () => {
-    const result = await run(
-      qualifyNotification({
-        deliveryId: 'delivery',
-        thread: thread(),
-        policy,
-        cursorMs: Date.parse('2026-08-21T09:00:00Z'),
-      }),
-      issueRoutes(
-        issue({
-          body: 'cc @adiutriel',
-          created_at: '2026-08-20T08:00:00Z',
-          updated_at: '2026-08-21T10:00:00Z',
-        }),
-        [],
-      ),
-    );
+  describe('edited body', () => {
+    const editedIssue = issue({
+      body: 'cc @adiutriel',
+      created_at: '2026-08-20T08:00:00Z',
+      updated_at: '2026-08-21T10:00:00Z',
+    });
+    const cursorMs = Date.parse('2026-08-21T09:00:00Z');
+    const editedAt = '2026-08-21T10:00:00Z';
 
-    expect(qualified(result.exit).work).toBeUndefined();
+    // `subject.user` is who opened the issue; an edited body belongs to its
+    // editor, and GraphQL is the only place that names them.
+    it('attributes a body mention inserted by editing to the editor', async () => {
+      const result = await run(
+        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        [
+          graphql([], { id: 'I_7', editor: { login: 'friend' }, lastEditedAt: editedAt }),
+          ...issueRoutes(editedIssue, []),
+        ],
+      );
+
+      const work = qualified(result.exit).work;
+      expect(work?.sender).toBe('friend');
+      expect(work?.context).toEqual({ kind: 'body', number: 7 });
+      expect(work?.interactionId).toContain(editedAt);
+    });
+
+    it('does not attribute a body edit to whoever opened the issue', async () => {
+      const result = await run(
+        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        [
+          graphql([], { id: 'I_7', editor: { login: 'stranger' }, lastEditedAt: editedAt }),
+          ...issueRoutes(editedIssue, []),
+        ],
+      );
+
+      expect(qualified(result.exit).work).toBeUndefined();
+    });
+
+    // An issue's `updated_at` moves on any activity. A comment landing on an old
+    // issue is not a body edit, and its mention-carrying body must stay where it
+    // was opened — outside this window.
+    it('keeps a body at its opening when activity moved updated_at without an edit', async () => {
+      const result = await run(
+        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        [
+          graphql([], { id: 'I_7', editor: null, lastEditedAt: null }),
+          ...issueRoutes(editedIssue, []),
+        ],
+      );
+
+      expect(qualified(result.exit).work).toBeUndefined();
+    });
   });
 
   // `GET /issues/{n}/comments` takes no `direction`, so `Link: rel="last"` is

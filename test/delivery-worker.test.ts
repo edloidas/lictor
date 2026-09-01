@@ -60,6 +60,7 @@ const issue = {
 const comments = [
   {
     id: 99,
+    node_id: 'IC_99',
     html_url: 'https://github.com/edloidas/lictor/issues/17#issuecomment-99',
     body: '@adiutriel please look',
     user: { login: 'edloidas' },
