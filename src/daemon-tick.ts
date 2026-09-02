@@ -1,4 +1,4 @@
-import { Clock, Effect, Option } from 'effect';
+import { Clock, Effect, Option, Schedule } from 'effect';
 import { CredentialHealth } from './github/credential-health.ts';
 import { GitHubIdentity } from './github/identity.ts';
 import { WorkQueue } from './queue/work-queue.ts';
@@ -8,16 +8,7 @@ import { WorkQueue } from './queue/work-queue.ts';
  * ends in `BunRuntime.runMain` — importing it to reach this starts the daemon.
  */
 export const daemonTick = Effect.gen(function* () {
-  const identity = yield* GitHubIdentity;
-  const health = yield* CredentialHealth;
   const queue = yield* WorkQueue;
-  // `verified` is memoized for process lifetime, so expiry is noticed from the verdict
-  // already carried — revocation surfaces via the next 401 latching the breaker.
-  const verified = yield* identity.verified.pipe(Effect.option);
-  const expiresAt = Option.getOrUndefined(verified)?.tokenExpiresAt;
-  if (expiresAt !== undefined && expiresAt <= (yield* Clock.currentTimeMillis)) {
-    yield* health.suspend;
-  }
   yield* queue.heartbeatDaemon;
   const tick = yield* Clock.currentTimeMillis;
   yield* queue.recoverStale(tick);
@@ -27,3 +18,29 @@ export const daemonTick = Effect.gen(function* () {
 export const maintenanceLoop = Effect.forever(
   Effect.zipRight(Effect.sleep('10 seconds'), daemonTick),
 );
+
+/**
+ * Suspends the credential once its verified expiry has passed.
+ *
+ * ! Watched on its own fiber, never from `daemonTick`: `verified` retries an
+ * ! unreachable GitHub without limit, and `Effect.option` bounds a failure, not
+ * ! a fiber still waiting on one. Read inside the tick it defers the ownership
+ * ! heartbeat for the length of the outage, the lease lapses, and a second
+ * ! daemon claims the database out from under this one.
+ */
+export const credentialExpiryWatch = Effect.gen(function* () {
+  const identity = yield* GitHubIdentity;
+  const health = yield* CredentialHealth;
+  const verified = yield* Effect.option(identity.verified);
+  const expiresAt = Option.getOrUndefined(verified)?.tokenExpiresAt;
+  if (expiresAt === undefined) {
+    return;
+  }
+  // Polled rather than slept through to the moment: a classic token's expiry is
+  // months out, and `setTimeout` past ~24.8 days fires immediately.
+  yield* Effect.repeat(Clock.currentTimeMillis, {
+    schedule: Schedule.spaced('10 seconds'),
+    until: (now) => now >= expiresAt,
+  });
+  yield* health.suspend;
+});

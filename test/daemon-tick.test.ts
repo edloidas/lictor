@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { Effect, Fiber, Layer, Redacted, TestClock, TestContext } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
-import { daemonTick, maintenanceLoop } from '../src/daemon-tick.ts';
+import { credentialExpiryWatch, daemonTick, maintenanceLoop } from '../src/daemon-tick.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
 import {
   GitHubIdentity,
@@ -145,37 +145,6 @@ describe('daemonTick', () => {
     expect(result.after.workerHeartbeatAt).toBe(61_000);
   });
 
-  it('suspends the credential once its verified expiry has passed', async () => {
-    const result = await run(
-      Effect.gen(function* () {
-        const health = yield* CredentialHealth;
-        yield* TestClock.adjust('61 seconds');
-        yield* daemonTick;
-        return yield* health.isRejected;
-      }),
-      Effect.succeed({ login: 'adiutriel', tokenExpiresAt: 61_000 }),
-    );
-
-    expect(result).toBe(true);
-  });
-
-  it.each([
-    ['an expiry still ahead', 120_000],
-    ['no expiry at all', undefined],
-  ])('leaves the credential healthy with %s', async (_case, tokenExpiresAt) => {
-    const result = await run(
-      Effect.gen(function* () {
-        const health = yield* CredentialHealth;
-        yield* TestClock.adjust('61 seconds');
-        yield* daemonTick;
-        return yield* health.isRejected;
-      }),
-      Effect.succeed({ login: 'adiutriel', tokenExpiresAt }),
-    );
-
-    expect(result).toBe(false);
-  });
-
   it('runs the tick every ten seconds for as long as it is forked', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -200,21 +169,70 @@ describe('daemonTick', () => {
     expect(result.second.workerHeartbeatAt).toBe(21_000);
   });
 
-  it('still reclaims when the identity probe fails', async () => {
+  // `Effect.never` is the faithful double: an unreachable GitHub makes the probe
+  // retry without limit rather than fail, and a tick reading its verdict stalls.
+  it('renews ownership and reclaims while the identity probe is still pending', async () => {
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
-        const health = yield* CredentialHealth;
         yield* queue.enqueue(work);
         yield* queue.claim;
         yield* TestClock.adjust('61 seconds');
-        yield* daemonTick;
-        return { counts: yield* queue.counts, rejected: yield* health.isRejected };
+        const tick = yield* Effect.fork(daemonTick);
+        yield* TestClock.adjust('1 second');
+        yield* Fiber.interrupt(tick);
+        return { counts: yield* queue.counts, diagnostics: yield* queue.diagnostics };
       }),
-      Effect.fail(new GitHubIdentityError({ message: 'GitHub is unreachable', transient: true })),
+      Effect.never,
     );
 
     expect(result.counts.interrupted).toBe(1);
-    expect(result.rejected).toBe(false);
+    expect(result.diagnostics.workerHeartbeatAt).toBe(61_000);
+  });
+});
+
+describe('credentialExpiryWatch', () => {
+  // The watch only reads the clock on the ten-second grid, so an expiry landing
+  // exactly on one is the only case that reaches the equality arm.
+  it.each([
+    ['an expiry between two polls', 61_000, 60_000, 70_000],
+    ['an expiry on a poll', 60_000, 50_000, 60_000],
+  ])('suspends the credential after %s', async (_case, tokenExpiresAt, healthyAt, rejectedAt) => {
+    const result = await run(
+      Effect.gen(function* () {
+        const health = yield* CredentialHealth;
+        const watch = yield* Effect.fork(credentialExpiryWatch);
+        yield* TestClock.adjust(healthyAt);
+        const before = yield* health.isRejected;
+        yield* TestClock.adjust(rejectedAt - healthyAt);
+        const after = yield* health.isRejected;
+        yield* Fiber.interrupt(watch);
+        return { before, after };
+      }),
+      Effect.succeed({ login: 'adiutriel', tokenExpiresAt }),
+    );
+
+    expect(result.before).toBe(false);
+    expect(result.after).toBe(true);
+  });
+
+  it.each([
+    ['the token never expires', Effect.succeed(live)],
+    [
+      // Not transient: those retry forever inside `verified` and never escape.
+      'the credential was refused',
+      Effect.fail(new GitHubIdentityError({ message: 'GitHub rejected the credential' })),
+    ],
+  ])('returns without suspending when %s', async (_case, verified) => {
+    const result = await run(
+      Effect.gen(function* () {
+        const health = yield* CredentialHealth;
+        yield* credentialExpiryWatch;
+        return yield* health.isRejected;
+      }),
+      verified,
+    );
+
+    expect(result).toBe(false);
   });
 });
