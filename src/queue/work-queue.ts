@@ -442,12 +442,17 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         }
         const now = yield* Clock.currentTimeMillis;
         return yield* attempt('receive delivery', () => {
+          // A redelivery is a fresh arrival GitHub still owns, so `attempts` resets:
+          // keeping the count condemns the row on its next claim without running it,
+          // and the thread was marked read at receipt — the notification is gone.
+          // Safe only because the branch requires `failed`: no live claim holds an
+          // attempt number the reset would move out from under.
           const result = database
             .query(
               `INSERT INTO deliveries (id, event, body, source, status, received_at)
                VALUES (?, ?, ?, ?, 'pending', ?)
               ON CONFLICT(id) DO UPDATE SET event = excluded.event, body = excluded.body,
-                source = excluded.source, status = 'pending', claimed_at = NULL,
+                source = excluded.source, status = 'pending', attempts = 0, claimed_at = NULL,
                 processed_at = NULL, last_error = NULL
               WHERE deliveries.status = 'failed'`,
             )
@@ -458,7 +463,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
 
     const claimDelivery = Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
-      return yield* attempt('claim delivery', () =>
+      const outcome = yield* attempt('claim delivery', () =>
         database
           .transaction(() => {
             const row = database
@@ -469,6 +474,20 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               .get() as InboxDelivery | null;
             if (row === null) return undefined;
             const attempts = row.attempts + 1;
+            // `retryDelivery` and `recoverStaleDeliveries` read the budget only after
+            // an attempt is spent, so a row returned to `pending` above the ceiling
+            // runs once more unless the claim refuses it first.
+            if (attempts > config.workerMaxAttempts) {
+              database
+                .query(
+                  `UPDATE deliveries SET status = 'failed', claimed_at = NULL,
+                     lease_expires_at = NULL, processed_at = ?,
+                     last_error = 'attempt limit exhausted'
+                   WHERE id = ? AND status = 'pending'`,
+                )
+                .run(now, row.id);
+              return { condemned: row } as const;
+            }
             database
               .query(
                 `UPDATE deliveries SET status = 'processing', attempts = ?, claimed_at = ?,
@@ -480,6 +499,19 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           })
           .immediate(),
       );
+      if (outcome !== undefined && 'condemned' in outcome) {
+        // The caller only sees an empty claim and a delivery has no dead-letter
+        // count, so this log is the sole trace of the drop.
+        yield* Effect.logError('Refused a delivery past its attempt budget').pipe(
+          Effect.annotateLogs({
+            delivery: outcome.condemned.id,
+            event: outcome.condemned.event,
+            attempts: outcome.condemned.attempts,
+          }),
+        );
+        return undefined;
+      }
+      return outcome;
     });
 
     const finishDelivery = (
@@ -513,6 +545,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           .query(
             `UPDATE deliveries SET
                status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
+               attempts = ?,
                claimed_at = NULL,
                lease_expires_at = NULL,
                processed_at = CASE WHEN attempts >= ? THEN unixepoch('subsec') * 1000 ELSE NULL END,
@@ -521,6 +554,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           )
           .run(
             terminalAfterAttempts ? config.workerMaxAttempts : Number.MAX_SAFE_INTEGER,
+            // ! Opting out of the budget refunds the attempt, so `attempts` counts only
+            // ! what this delivery's own processing spent. Without it a dead credential
+            // ! burns one per cycle and `claimDelivery` condemns the whole inbox.
+            terminalAfterAttempts ? attempts : attempts - 1,
             terminalAfterAttempts ? config.workerMaxAttempts : Number.MAX_SAFE_INTEGER,
             error,
             id,

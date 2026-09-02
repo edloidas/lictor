@@ -3,7 +3,7 @@ import { describe, expect, it } from 'bun:test';
 import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Clock, Effect, Layer, Redacted } from 'effect';
+import { Clock, Effect, Layer, Logger, Redacted } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
@@ -446,6 +446,143 @@ describe('WorkQueue', () => {
 
     expect(result.statuses).toEqual(['pending', 'pending', 'failed']);
     expect(result.next).toBeUndefined();
+  });
+
+  // The startup reset returns a `processing` row to `pending` without reading the
+  // budget, so the claim is the only thing between a restart and one extra run.
+  it('refuses a delivery a restart returned to pending past the attempt budget', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-budget-'));
+    const path = join(directory, 'queue.sqlite');
+
+    try {
+      const spent = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* queue.receiveDelivery({
+              id: 'ceiling',
+              event: 'notification',
+              body: '{}',
+              source: 'notification',
+            });
+            // Two expiries, then a claim that spends the last attempt the budget allows.
+            for (let pass = 0; pass < 2; pass += 1) {
+              yield* queue.claimDelivery;
+              const now = yield* Clock.currentTimeMillis;
+              yield* queue.recoverStaleDeliveries(now + 60_001);
+            }
+            return yield* queue.claimDelivery;
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      const logged: string[] = [];
+      const afterRestart = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            return {
+              claimed: yield* queue.claimDelivery,
+              status: yield* queue.deliveryStatus('ceiling'),
+            };
+          }).pipe(
+            Effect.provide(queueLayer(path)),
+            Effect.provide(
+              Logger.replace(
+                Logger.defaultLogger,
+                Logger.make<unknown, void>(({ message }) => {
+                  logged.push(String(message));
+                }),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      const side = new Database(path);
+      const condemned = side
+        .query('SELECT attempts, last_error AS lastError FROM deliveries WHERE id = ?')
+        .get('ceiling') as { attempts: number; lastError: string | null };
+      side.close();
+
+      expect(spent).toMatchObject({ id: 'ceiling', attempts: 3, status: 'processing' });
+      expect(afterRestart.claimed).toBeUndefined();
+      expect(afterRestart.status).toBe('failed');
+      // Refused before the increment, so the row records the three attempts it ran.
+      expect(condemned).toEqual({ attempts: 3, lastError: 'attempt limit exhausted' });
+      // The log is the drop's only trace; the caller just sees an empty claim.
+      expect(logged).toContain('Refused a delivery past its attempt budget');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('gives a redelivered failed delivery its whole budget back', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const delivery = {
+          id: 'exhausted',
+          event: 'notification',
+          body: '{}',
+          source: 'notification',
+        } as const;
+        yield* queue.receiveDelivery(delivery);
+        const spent: (number | undefined)[] = [];
+        for (let pass = 0; pass < 3; pass += 1) {
+          const claimed = yield* queue.claimDelivery;
+          spent.push(claimed?.attempts);
+          if (claimed === undefined) break;
+          yield* queue.retryDelivery(claimed.id, claimed.attempts, 'transport failed');
+        }
+        const exhausted = yield* queue.deliveryStatus('exhausted');
+        yield* queue.receiveDelivery(delivery);
+        return { spent, exhausted, revived: yield* queue.claimDelivery };
+      }),
+    );
+
+    expect(result.spent).toEqual([1, 2, 3]);
+    expect(result.exhausted).toBe('failed');
+    expect(result.revived).toMatchObject({ id: 'exhausted', attempts: 1, status: 'processing' });
+  });
+
+  // Driven to the ceiling first: from a virgin row a refund and a reset to zero look
+  // identical, and the raised ceiling is never exercised.
+  it('spends no attempt on a retry that opts out of the budget', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.receiveDelivery({
+          id: 'dead-credential',
+          event: 'notification',
+          body: '{}',
+          source: 'notification',
+        });
+        const spent: (number | undefined)[] = [];
+        const claim = (terminalAfterAttempts: boolean) =>
+          Effect.gen(function* () {
+            const claimed = yield* queue.claimDelivery;
+            spent.push(claimed?.attempts);
+            if (claimed === undefined) return;
+            yield* queue.retryDelivery(
+              claimed.id,
+              claimed.attempts,
+              'identity rejected',
+              terminalAfterAttempts,
+            );
+          });
+        // Two budgeted failures leave the row one short of the budget.
+        yield* claim(true);
+        yield* claim(true);
+        for (let cycle = 0; cycle < 3; cycle += 1) yield* claim(false);
+        return { spent, status: yield* queue.deliveryStatus('dead-credential') };
+      }),
+    );
+
+    // The row idles at the ceiling instead of crossing it: zeroing the count would
+    // restart the sequence at 1, and a real ceiling would flip the status to `failed`.
+    expect(result.spent).toEqual([1, 2, 3, 3, 3]);
+    expect(result.status).toBe('pending');
   });
 
   // Aged and read through a side handle rather than timed: the renewal has to
