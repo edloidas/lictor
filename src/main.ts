@@ -1,8 +1,9 @@
 import { FetchHttpClient } from '@effect/platform';
 import { BunHttpServer, BunRuntime } from '@effect/platform-bun';
-import { Cause, Clock, Effect, Exit, Layer, Option } from 'effect';
+import { Cause, Clock, Effect, Exit, Layer } from 'effect';
 import { LictorConfig, legacyStateConflict, port } from './config.ts';
 import { ControlPlane, ControlServer } from './control/control-plane.ts';
+import { maintenanceLoop } from './daemon-tick.ts';
 import { DeliveryWorker } from './delivery-worker.ts';
 import { describeCause, failureOperation } from './diagnostics.ts';
 import { AgentExecutor } from './executor/agent-executor.ts';
@@ -202,27 +203,7 @@ const Application = Layer.merge(
         ),
       );
       yield* Effect.forkScoped(
-        Effect.forever(
-          Effect.gen(function* () {
-            yield* Effect.sleep('10 seconds');
-            const health = yield* CredentialHealth;
-            // `verified` is memoized for process lifetime, so expiry is noticed
-            // from the verdict already carried — revocation surfaces via the next
-            // 401 latching the breaker.
-            const verified = yield* identity.verified.pipe(Effect.option);
-            if (
-              Option.isSome(verified) &&
-              verified.value.tokenExpiresAt !== undefined &&
-              verified.value.tokenExpiresAt <= (yield* Clock.currentTimeMillis)
-            ) {
-              yield* health.suspend;
-            }
-            yield* queue.heartbeatDaemon;
-            const tick = yield* Clock.currentTimeMillis;
-            yield* queue.recoverStale(tick);
-            yield* queue.recoverStaleDeliveries(tick);
-          }),
-        ).pipe(
+        maintenanceLoop.pipe(
           Effect.tapError((cause) => stop('Daemon ownership heartbeat failed', Cause.fail(cause))),
         ),
       );
