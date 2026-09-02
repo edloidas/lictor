@@ -3,7 +3,7 @@ import { BunHttpServer, BunRuntime } from '@effect/platform-bun';
 import { Cause, Clock, Effect, Exit, Layer } from 'effect';
 import { LictorConfig, legacyStateConflict, port } from './config.ts';
 import { ControlPlane, ControlServer } from './control/control-plane.ts';
-import { maintenanceLoop } from './daemon-tick.ts';
+import { credentialExpiryWatch, maintenanceLoop } from './daemon-tick.ts';
 import { DeliveryWorker } from './delivery-worker.ts';
 import { describeCause, failureOperation } from './diagnostics.ts';
 import { AgentExecutor } from './executor/agent-executor.ts';
@@ -206,6 +206,10 @@ const Application = Layer.merge(
         maintenanceLoop.pipe(
           Effect.tapError((cause) => stop('Daemon ownership heartbeat failed', Cause.fail(cause))),
         ),
+      );
+      // `CredentialHealth` is a latch, so the watch completes rather than loops.
+      yield* Effect.forkScoped(
+        supervised('credential expiry watch', 'once', credentialExpiryWatch),
       );
       yield* Effect.forkScoped(
         Effect.forever(
