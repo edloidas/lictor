@@ -64,11 +64,11 @@ const Subject = Schema.Struct({
  * A submitted pull-request review, whose own body can carry the mention.
  *
  * A third comment species GitHub notifies on; `/pulls/{n}/comments` holds only
- * inline threads. Carries `submitted_at` and its endpoint takes no `since`, so
- * the window filter is applied here.
+ * inline threads.
  */
 const Review = Schema.Struct({
   id: Schema.Number,
+  node_id: Schema.String,
   html_url: Schema.String,
   body: Schema.optionalWith(Schema.String, { nullable: true }),
   user: Schema.optionalWith(User, { nullable: true }),
@@ -348,7 +348,7 @@ const fetchComments = <E>(
 
 // Paginated newest-first like the comment streams: the endpoint returns
 // oldest-first, takes no `since`, and reading only page 1 hides the newest
-// reviews past a hundred. Window filtering happens on the candidates.
+// reviews past a hundred.
 const fetchReviews = <E>(
   client: Authenticated<E>,
   repository: string,
@@ -438,7 +438,7 @@ const EditsResponse = Schema.Struct({
 });
 
 const EDITS_QUERY =
-  'query($ids:[ID!]!,$owner:String!,$name:String!,$number:Int!,$comments:Boolean!,$subject:Boolean!){nodes(ids:$ids) @include(if:$comments){id ... on IssueComment{editor{login} lastEditedAt} ... on PullRequestReviewComment{editor{login} lastEditedAt}} repository(owner:$owner,name:$name) @include(if:$subject){issueOrPullRequest(number:$number){... on Issue{id editor{login} lastEditedAt} ... on PullRequest{id editor{login} lastEditedAt}}}}';
+  'query($ids:[ID!]!,$owner:String!,$name:String!,$number:Int!,$nodes:Boolean!,$subject:Boolean!){nodes(ids:$ids) @include(if:$nodes){id ... on IssueComment{editor{login} lastEditedAt} ... on PullRequestReviewComment{editor{login} lastEditedAt} ... on PullRequestReview{editor{login} lastEditedAt}} repository(owner:$owner,name:$name) @include(if:$subject){issueOrPullRequest(number:$number){... on Issue{id editor{login} lastEditedAt} ... on PullRequest{id editor{login} lastEditedAt}}}}';
 
 const toEdit = (node: Schema.Schema.Type<typeof EditNode>): Edit => ({
   editor: node.editor?.login,
@@ -448,38 +448,66 @@ const toEdit = (node: Schema.Schema.Type<typeof EditNode>): Edit => ({
 const isEdited = (created: string, updated: string): boolean =>
   Date.parse(created) !== Date.parse(updated);
 
+type Edits = { readonly nodes: ReadonlyMap<string, Edit>; readonly subject: Edit | undefined };
+
+// GitHub's ceiling on one `nodes(ids:)` lookup. Reviews are asked about
+// unconditionally, so a first sweep of a busy pull request can exceed it.
+const EDITS_PAGE_SIZE = 100;
+
 /**
- * Who last edited each candidate whose REST timestamps disagree, and when.
+ * Who last edited each candidate that may have been edited, and when.
  *
  * REST names no editor, so GraphQL is the only source of that identity. One
- * request serves the whole thread: comments by node id, the subject by number.
- * A subject's `updated_at` moves on any activity, not only a body edit, so it is
- * asked about on nearly every thread; a comment only when it was really edited.
+ * request serves the whole thread: comments and reviews by node id, the subject
+ * by number. A subject's `updated_at` moves on any activity, not only a body
+ * edit, so it is asked about on nearly every thread; a comment only when its
+ * timestamps disagree; a review always, since REST gives it no `updated_at`.
  */
 const fetchEdits = <E>(
   client: Authenticated<E>,
   repository: string,
   number: number,
-  commentIds: readonly string[],
+  nodeIds: readonly string[],
   subjectEdited: boolean,
-): Effect.Effect<
-  { readonly comments: ReadonlyMap<string, Edit>; readonly subject: Edit | undefined },
-  NotificationError
-> =>
+): Effect.Effect<Edits, NotificationError> =>
   Effect.gen(function* () {
-    const comments = new Map<string, Edit>();
-    if (commentIds.length === 0 && !subjectEdited) return { comments, subject: undefined };
+    const nodes = new Map<string, Edit>();
+    if (nodeIds.length === 0 && !subjectEdited) return { nodes, subject: undefined };
 
+    let subject: Edit | undefined;
+    for (let start = 0; start === 0 || start < nodeIds.length; start += EDITS_PAGE_SIZE) {
+      const page = yield* fetchEditsPage(
+        client,
+        repository,
+        number,
+        nodeIds.slice(start, start + EDITS_PAGE_SIZE),
+        subjectEdited && start === 0,
+      );
+      for (const [id, edit] of page.nodes) nodes.set(id, edit);
+      if (start === 0) subject = page.subject;
+    }
+    return { nodes, subject };
+  });
+
+const fetchEditsPage = <E>(
+  client: Authenticated<E>,
+  repository: string,
+  number: number,
+  nodeIds: readonly string[],
+  subjectEdited: boolean,
+): Effect.Effect<Edits, NotificationError> =>
+  Effect.gen(function* () {
+    const nodes = new Map<string, Edit>();
     const path = '/graphql';
     const [owner, name] = repository.split('/');
     const body = {
       query: EDITS_QUERY,
       variables: {
-        ids: commentIds,
+        ids: nodeIds,
         owner,
         name,
         number,
-        comments: commentIds.length > 0,
+        nodes: nodeIds.length > 0,
         subject: subjectEdited,
       },
     };
@@ -509,10 +537,10 @@ const fetchEdits = <E>(
       });
     }
     for (const node of parsed.data.nodes ?? []) {
-      if (node !== null) comments.set(node.id, toEdit(node));
+      if (node !== null) nodes.set(node.id, toEdit(node));
     }
     const subjectNode = parsed.data.repository?.issueOrPullRequest;
-    return { comments, subject: subjectNode === undefined ? undefined : toEdit(subjectNode) };
+    return { nodes, subject: subjectNode === undefined ? undefined : toEdit(subjectNode) };
   });
 
 /**
@@ -664,37 +692,48 @@ export const qualifyNotification = (input: {
           `/repos/${repository}/pulls/${ref.number}/comments`,
           since,
         );
-        reviews = yield* fetchReviews(client, repository, ref.number);
+        // The endpoint takes no `since`; unwindowed, every old review would
+        // re-trigger on each sweep and be asked about on each.
+        reviews = (yield* fetchReviews(client, repository, ref.number)).filter(
+          (review) =>
+            since === undefined ||
+            (review.submitted_at !== undefined && Date.parse(review.submitted_at) >= since),
+        );
       }
 
-      // Reviews are not consulted: an edited review stays attributed to whoever
-      // submitted it.
       const edits = yield* fetchEdits(
         client,
         repository,
         ref.number,
         [...conversationComments, ...reviewComments]
           .filter((comment) => isEdited(comment.created_at, comment.updated_at))
-          .map((comment) => comment.node_id),
+          .map((comment) => comment.node_id)
+          .concat(reviews.map((review) => review.node_id)),
         isEdited(subject.created_at, subject.updated_at),
       );
 
       const candidates: Candidate[] = [
         ...conversationComments.map((comment) =>
-          commentCandidate(comment, 'issue_comment', edits.comments.get(comment.node_id), trusted),
+          commentCandidate(comment, 'issue_comment', edits.nodes.get(comment.node_id), trusted),
         ),
         ...reviewComments.map((comment) =>
-          commentCandidate(comment, 'review_comment', edits.comments.get(comment.node_id), trusted),
+          commentCandidate(comment, 'review_comment', edits.nodes.get(comment.node_id), trusted),
         ),
         // Targeted at the pull request, not the review: GitHub has no reactions
         // endpoint for a review, while `contextUrl` still points at the review.
-        ...reviews.map((review) => ({
-          at: review.submitted_at === undefined ? Number.NaN : Date.parse(review.submitted_at),
-          author: review.user?.login,
-          ref: { kind: 'review', id: review.id, number: ref.number } as const,
-          url: review.html_url,
-          body: review.body,
-        })),
+        ...reviews.map((review) =>
+          attributed(
+            {
+              at: review.submitted_at === undefined ? Number.NaN : Date.parse(review.submitted_at),
+              author: review.user?.login,
+              ref: { kind: 'review', id: review.id, number: ref.number },
+              url: review.html_url,
+              body: review.body,
+            },
+            edits.nodes.get(review.node_id),
+            trusted,
+          ),
+        ),
         attributed(
           {
             at: Date.parse(subject.created_at),
@@ -708,8 +747,6 @@ export const qualifyNotification = (input: {
         ),
       ];
 
-      // The reviews endpoint takes no `since`, so hold its candidates to the
-      // same window or old reviews re-trigger on every sweep.
       const windowed =
         since === undefined ? candidates : candidates.filter((candidate) => candidate.at >= since);
 
