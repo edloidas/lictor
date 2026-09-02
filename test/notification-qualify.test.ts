@@ -69,8 +69,18 @@ const run = <A, E>(
     Effect.scoped(
       Effect.gen(function* () {
         const requests = yield* Ref.make<string[]>([]);
-        const client = HttpClient.make((request) =>
-          Ref.update(requests, (items) => [...items, request.url]).pipe(
+        const bodies = yield* Ref.make<unknown[]>([]);
+        const client = HttpClient.make((request) => {
+          const body = request.body;
+          return Ref.update(requests, (items) => [...items, request.url]).pipe(
+            Effect.zipRight(
+              body._tag === 'Uint8Array'
+                ? Ref.update(bodies, (items) => [
+                    ...items,
+                    JSON.parse(new TextDecoder().decode(body.body)),
+                  ])
+                : Effect.void,
+            ),
             Effect.as(
               (() => {
                 const match = routes.find(([fragment]) => request.url.includes(fragment));
@@ -84,8 +94,8 @@ const run = <A, E>(
                 );
               })(),
             ),
-          ),
-        );
+          );
+        });
         const GitHubLive = Layer.succeed(
           GitHubClient,
           GitHubClient.make({
@@ -98,7 +108,7 @@ const run = <A, E>(
           }),
         );
         const exit = yield* Effect.exit(Effect.provide(effect, GitHubLive));
-        return { exit, requests: yield* Ref.get(requests) };
+        return { exit, requests: yield* Ref.get(requests), bodies: yield* Ref.get(bodies) };
       }),
     ),
   );
@@ -649,6 +659,177 @@ describe('qualifyNotification', () => {
     });
   });
 
+  describe('edited review', () => {
+    const pullThread = thread({
+      subject: {
+        title: 'Fix the thing',
+        url: 'https://api.github.com/repos/edloidas/sandbox/pulls/12',
+        type: 'PullRequest',
+      },
+    });
+    const review = (overrides: Record<string, unknown> = {}) => ({
+      id: 7001,
+      node_id: 'PRR_7001',
+      html_url: 'https://github.com/edloidas/sandbox/pull/12#pullrequestreview-7001',
+      body: 'looks off, @adiutriel can you check',
+      user: { login: 'edloidas' },
+      submitted_at: '2026-08-21T09:30:00Z',
+      ...overrides,
+    });
+    const pullRoutes = (reviews: readonly Record<string, unknown>[]) =>
+      [
+        ['/issues/12/comments', { body: [] }],
+        ['/pulls/12/comments', { body: [] }],
+        ['/pulls/12/reviews', { body: reviews }],
+        [
+          '/issues/12',
+          { body: issue({ html_url: 'https://github.com/edloidas/sandbox/pull/12' }) },
+        ],
+      ] as const;
+    const cursorMs = Date.parse('2026-08-21T09:00:00Z');
+    const editedAt = '2026-08-21T10:00:00Z';
+    const qualify = (routes: readonly (readonly [string, Reply])[]) =>
+      run(
+        qualifyNotification({ deliveryId: 'delivery', thread: pullThread, policy, cursorMs }),
+        routes,
+      );
+
+    // REST gives a review no `updated_at`, so unlike a comment there is no local
+    // signal that it was edited: every review in the window is asked about.
+    it('attributes a mention inserted by editing a review to the editor', async () => {
+      const result = await qualify([
+        graphql([{ id: 'PRR_7001', editor: { login: 'friend' }, lastEditedAt: editedAt }]),
+        ...pullRoutes([review()]),
+      ]);
+
+      const work = qualified(result.exit).work;
+      expect(work?.sender).toBe('friend');
+      expect(work?.context).toEqual({ kind: 'review', id: 7001, number: 12 });
+      expect(work?.interactionId).toContain(editedAt);
+    });
+
+    // The attack this exists to stop: someone with write access rewrites a
+    // trusted reviewer's submitted review. The review is submitted inside the
+    // window so that the window filter cannot be what drops it.
+    it('does not attribute a review edit to whoever submitted it', async () => {
+      const result = await qualify([
+        graphql([{ id: 'PRR_7001', editor: { login: 'stranger' }, lastEditedAt: editedAt }]),
+        ...pullRoutes([review()]),
+      ]);
+
+      expect(qualified(result.exit).work).toBeUndefined();
+    });
+
+    it("does not lift a stranger's review to the trust of whoever edited it", async () => {
+      const result = await qualify([
+        graphql([{ id: 'PRR_7001', editor: { login: 'edloidas' }, lastEditedAt: editedAt }]),
+        ...pullRoutes([review({ user: { login: 'stranger' } })]),
+      ]);
+
+      expect(qualified(result.exit).work).toBeUndefined();
+    });
+
+    it('keeps an unedited review attributed to its submitter', async () => {
+      const result = await qualify([
+        graphql([{ id: 'PRR_7001', editor: null, lastEditedAt: null }]),
+        ...pullRoutes([review()]),
+      ]);
+
+      const work = qualified(result.exit).work;
+      expect(work?.sender).toBe('edloidas');
+      expect(work?.interactionId).not.toContain(editedAt);
+    });
+
+    // A review submitted before the window is neither a candidate nor asked about.
+    it('asks about no review submitted before the window', async () => {
+      const result = await qualify([
+        graphql([{ id: 'PRR_7001', editor: { login: 'friend' }, lastEditedAt: editedAt }]),
+        ...pullRoutes([review({ submitted_at: '2026-08-20T08:00:00Z' })]),
+      ]);
+
+      expect(qualified(result.exit).work).toBeUndefined();
+      expect(result.requests.some((url) => url.endsWith('/graphql'))).toBe(false);
+    });
+
+    it('asks about a review submitted at the very start of the window', async () => {
+      const result = await qualify([
+        graphql([{ id: 'PRR_7001', editor: { login: 'friend' }, lastEditedAt: editedAt }]),
+        ...pullRoutes([review({ submitted_at: '2026-08-21T09:00:00Z' })]),
+      ]);
+
+      expect(qualified(result.exit).work?.sender).toBe('friend');
+    });
+
+    // GitHub caps one `nodes(ids:)` lookup at a hundred ids, and a thread with no
+    // cursor asks about every review the pull request ever received.
+    it('splits the edit lookup so no request carries more than a hundred ids', async () => {
+      const reviews = Array.from({ length: 250 }, (_, index) =>
+        review({
+          id: 8000 + index,
+          node_id: `PRR_${8000 + index}`,
+          body: 'no mention here',
+          submitted_at: '2026-08-20T08:00:00Z',
+        }),
+      );
+      const result = await run(
+        qualifyNotification({
+          deliveryId: 'delivery',
+          thread: pullThread,
+          policy,
+          cursorMs: undefined,
+        }),
+        [
+          graphql([{ id: 'PRR_7001', editor: { login: 'friend' }, lastEditedAt: editedAt }]),
+          ...pullRoutes([...reviews, review()]),
+        ],
+      );
+
+      const variables = result.bodies.map(
+        (body) => (body as { variables: { ids: string[]; subject: boolean } }).variables,
+      );
+      expect(variables.map((page) => page.ids.length)).toEqual([100, 100, 51]);
+      expect(variables.flatMap((page) => page.ids).toSorted()).toEqual(
+        [...reviews.map((item) => item.node_id), 'PRR_7001'].toSorted(),
+      );
+      expect(variables.filter((page) => page.subject)).toHaveLength(0);
+      expect(qualified(result.exit).work?.sender).toBe('friend');
+    });
+
+    it('asks about an edited subject on the first page of the edit lookup only', async () => {
+      const reviews = Array.from({ length: 101 }, (_, index) =>
+        review({ id: 8000 + index, node_id: `PRR_${8000 + index}`, body: 'no mention here' }),
+      );
+      const result = await qualify([
+        graphql([], { id: 'PR_12', editor: null, lastEditedAt: null }),
+        ['/issues/12/comments', { body: [] }],
+        ['/pulls/12/comments', { body: [] }],
+        ['/pulls/12/reviews', { body: reviews }],
+        [
+          '/issues/12',
+          {
+            body: issue({
+              html_url: 'https://github.com/edloidas/sandbox/pull/12',
+              updated_at: '2026-08-21T10:00:00Z',
+            }),
+          },
+        ],
+      ]);
+
+      const subjectFlags = result.bodies.map(
+        (body) => (body as { variables: { subject: boolean } }).variables.subject,
+      );
+      expect(subjectFlags).toEqual([true, false]);
+      expect(qualified(result.exit).work).toBeUndefined();
+    });
+
+    it('spends no request on a pull request with no review in the window', async () => {
+      const result = await qualify(pullRoutes([]));
+
+      expect(qualified(result.exit).work).toBeUndefined();
+      expect(result.requests.some((url) => url.endsWith('/graphql'))).toBe(false);
+    });
+  });
+
   // `GET /issues/{n}/comments` takes no `direction`, so `Link: rel="last"` is
   // the only handle on the newest comments. Walking back from the last page is
   // what makes the page budget a safe truncation: it drops the oldest comments,
@@ -1057,6 +1238,7 @@ describe('qualifyNotification', () => {
         cursorMs: undefined,
       }),
       [
+        graphql([{ id: 'PRR_7001', editor: null, lastEditedAt: null }]),
         ['/issues/12/comments', { body: [] }],
         ['/pulls/12/comments', { body: [] }],
         [
@@ -1065,6 +1247,7 @@ describe('qualifyNotification', () => {
             body: [
               {
                 id: 7001,
+                node_id: 'PRR_7001',
                 html_url: 'https://github.com/edloidas/sandbox/pull/12#pullrequestreview-7001',
                 body: 'looks off, @adiutriel can you check',
                 user: { login: 'friend' },
