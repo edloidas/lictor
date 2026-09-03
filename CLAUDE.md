@@ -93,6 +93,10 @@ indistinguishable from a revoked token.
   loop dies. Wrap anything that throws — `JSON.parse` above all — in `Effect.try`
 - Secrets are `Config.redacted` and stay `Redacted` until the moment they are
   used, so a logged service or error trace cannot leak them
+- `SOUL.md` beside the database is the operator's persona: prepended to every
+  agent prompt as trusted prose, re-read per job, bounded at 32 KiB, and the only
+  place operator text enters the prompt unescaped. A missing file is a supported
+  configuration; a dangling symlink or an oversized file is logged, never fatal
 - **In tests, provide `Service.DefaultWithoutDependencies`, not
   `Service.Default`.** `Default` bakes in `FetchHttpClient.layer`, which wins over
   any client provided from outside — a suite using `Default` silently calls the
