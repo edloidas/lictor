@@ -54,6 +54,17 @@ instance its own paths rather than pointing it at the same home.
 If a `.lictor/` directory from an earlier version is still present in the working
 directory, startup refuses rather than opening a fresh database beside it.
 
+### Persona
+
+An optional `SOUL.md` in the same directory as the database (`~/.lictor/SOUL.md`
+by default) is prepended to every agent prompt as your standing instructions. It
+is re-read on every job, so edits are live without a restart — a symlink into a
+repository you version separately is fine and preferred. `LICTOR_DATABASE_PATH`
+moves it along with the rest of the state. Startup logs whether a persona was
+found. A dangling symlink is reported as a warning and the agent runs on the
+bare prompt rather than failing the job; a file over 32 KiB is truncated to its
+first 32 KiB, still used, and reported as a warning.
+
 The example environment starts with `LICTOR_EXECUTOR=disabled`, empty trusted
 principals, and no implicit GitHub mutation authority. This lets you verify token
 authentication, polling, durable receipt, and policy loading before Codex can

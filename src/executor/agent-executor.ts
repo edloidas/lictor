@@ -1,7 +1,9 @@
 import { mkdirSync } from 'node:fs';
+import { lstat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { Data, Effect, Schema } from 'effect';
+import { Cause, Data, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
+import { describeCause } from '../diagnostics.ts';
 import type { WorkItem } from '../work-item.ts';
 import { ProcessRunner } from './process-runner.ts';
 
@@ -28,6 +30,48 @@ const bounded = (value: string, max: number): string =>
     .subarray(0, max)
     .toString('utf8')
     .replace(/\uFFFD$/u, '');
+
+const personaBoundBytes = 32 * 1024;
+
+type Persona =
+  | { readonly state: 'present'; readonly text: string; readonly bytes: number }
+  | { readonly state: 'absent' }
+  | { readonly state: 'dangling'; readonly reason: string }
+  | { readonly state: 'unreadable'; readonly reason: string };
+
+// ENOENT alone cannot tell a missing file from a symlink whose target moved,
+// so a failed read is classified by whether the path itself still exists.
+const loadPersona = (path: string): Effect.Effect<Persona> =>
+  Effect.tryPromise({ try: () => Bun.file(path).text(), catch: (cause) => cause }).pipe(
+    Effect.map((text): Persona => ({ state: 'present', text, bytes: Buffer.byteLength(text) })),
+    Effect.catchAll((error) =>
+      Effect.tryPromise(() => lstat(path)).pipe(
+        Effect.match({
+          onFailure: (): Persona => ({ state: 'absent' }),
+          onSuccess: (): Persona => ({
+            state:
+              (error as { readonly code?: unknown }).code === 'ENOENT' ? 'dangling' : 'unreadable',
+            reason: describeCause(Cause.fail(error)),
+          }),
+        }),
+      ),
+    ),
+  );
+
+const warnBrokenPersona = (path: string, persona: Persona): Effect.Effect<void> => {
+  switch (persona.state) {
+    case 'dangling':
+      return Effect.logWarning('Persona symlink is dangling').pipe(
+        Effect.annotateLogs({ path, error: persona.reason }),
+      );
+    case 'unreadable':
+      return Effect.logWarning('Persona could not be read').pipe(
+        Effect.annotateLogs({ path, error: persona.reason }),
+      );
+    default:
+      return Effect.void;
+  }
+};
 
 export const buildPrompt = (work: WorkItem): string => {
   const metadata = {
@@ -67,14 +111,27 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
     // Operator-authored standing instructions — the one trusted prose in the
     // prompt, so it is prepended ahead of the untrusted JSON, never inside it.
     const soulPath = join(config.stateDir, 'SOUL.md');
-    const readSoul = Effect.tryPromise({
-      try: () => Bun.file(soulPath).text(),
-      catch: (cause) =>
-        new ExecutorError({ message: `Could not read ${soulPath}`, retryable: false, cause }),
-    }).pipe(
-      Effect.catchAll(() => Effect.succeed('')),
-      Effect.map((soul) => bounded(soul, 32 * 1024)),
+    const readSoul = loadPersona(soulPath).pipe(
+      Effect.tap((persona) => warnBrokenPersona(soulPath, persona)),
+      Effect.map((persona) =>
+        persona.state === 'present' ? bounded(persona.text, personaBoundBytes) : '',
+      ),
     );
+
+    const persona = yield* loadPersona(soulPath);
+    yield* warnBrokenPersona(soulPath, persona);
+    if (persona.state === 'present') {
+      yield* Effect.logInfo('Persona loaded').pipe(
+        Effect.annotateLogs({ path: soulPath, bytes: persona.bytes }),
+      );
+      if (persona.bytes > personaBoundBytes) {
+        yield* Effect.logWarning('Persona exceeds the prompt bound and is truncated').pipe(
+          Effect.annotateLogs({ path: soulPath, bytes: persona.bytes, bound: personaBoundBytes }),
+        );
+      }
+    } else if (persona.state === 'absent') {
+      yield* Effect.logInfo('Persona not configured').pipe(Effect.annotateLogs({ path: soulPath }));
+    }
 
     const execute = (
       work: WorkItem,
