@@ -3,7 +3,7 @@ import { describe, expect, it } from 'bun:test';
 import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Clock, Effect, Layer, Logger, Redacted } from 'effect';
+import { Clock, Effect, Layer, Logger, Redacted, TestClock, TestContext } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
@@ -282,6 +282,47 @@ describe('WorkQueue', () => {
     expect(result.counts.running).toBe(1);
   });
 
+  // The cutoff is exclusive and `daemonTick` passes the current tick as it, so a
+  // lease expiring exactly on one belongs to the pass after. Both arms run off the
+  // lease the claim reported; a `Clock` read taken beside it would fall on either
+  // side by accident.
+  it('holds a job whose lease expires exactly on the reclaim cutoff', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-job-cutoff-'));
+    const path = join(directory, 'queue.sqlite');
+    const attemptStatus = (side: Database) =>
+      (side.query('SELECT status FROM attempts WHERE job_id = ?').get(1) as { status: string })
+        .status;
+    let side: Database | undefined;
+
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* queue.enqueue(work('delivery-1'));
+            const lease = (yield* queue.claim)?.leaseExpiresAt ?? 0;
+            side = new Database(path);
+            const onCutoff = yield* queue.recoverStale(lease);
+            const held = yield* queue.counts;
+            const heldAttempt = attemptStatus(side);
+            const pastCutoff = yield* queue.recoverStale(lease + 1);
+            const sweptAttempt = attemptStatus(side);
+            return { onCutoff, held, heldAttempt, pastCutoff, sweptAttempt };
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(result.onCutoff).toBe(0);
+      expect(result.held.running).toBe(1);
+      expect(result.heldAttempt).toBe('running');
+      expect(result.pastCutoff).toBe(1);
+      expect(result.sweptAttempt).toBe('interrupted');
+    } finally {
+      side?.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('rejects completion from a stale attempt without changing the newer claim', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -332,6 +373,61 @@ describe('WorkQueue', () => {
       expect(recovered.beforeClaim.interrupted).toBe(1);
       expect(recovered.claimed?.attempts).toBe(2);
     } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  // Startup reads its cutoff from `Clock` while the layer is still being built,
+  // so landing it exactly on a lease means stopping the clock first. The first
+  // boot's own claim cannot serve as the stale row: releasing ownership
+  // interrupts it on the way out, so the row is rewritten by hand.
+  it('holds a job whose lease expires exactly on the startup cutoff', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-startup-'));
+    const path = join(directory, 'queue.sqlite');
+    const boot = <A, E>(effect: Effect.Effect<A, E, WorkQueue>) =>
+      Effect.scoped(Effect.provide(effect, queueLayer(path)));
+    const countsAtBoot = boot(Effect.flatMap(WorkQueue, (queue) => queue.counts));
+    const attemptStatus = (side: Database) =>
+      (side.query('SELECT status FROM attempts WHERE job_id = ?').get(1) as { status: string })
+        .status;
+    let side: Database | undefined;
+
+    try {
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          yield* boot(
+            Effect.gen(function* () {
+              const queue = yield* WorkQueue;
+              yield* queue.enqueue(work('delivery-1'));
+              yield* queue.claim;
+            }),
+          );
+          side = new Database(path);
+          side
+            .query(
+              `UPDATE jobs SET status = 'running', worker_id = 'dead-worker',
+                 lease_expires_at = ? WHERE delivery_id = ?`,
+            )
+            .run(60_000, 'delivery-1');
+          side.query("UPDATE attempts SET status = 'running', finished_at = NULL").run();
+          yield* TestClock.adjust('60 seconds');
+          const onCutoff = yield* countsAtBoot;
+          const heldAttempt = attemptStatus(side);
+          yield* TestClock.adjust('1 millis');
+          const pastCutoff = yield* countsAtBoot;
+          const sweptAttempt = attemptStatus(side);
+          return { onCutoff, heldAttempt, pastCutoff, sweptAttempt };
+        }).pipe(Effect.provide(TestContext.TestContext)),
+      );
+
+      expect(result.onCutoff.running).toBe(1);
+      expect(result.onCutoff.interrupted).toBe(0);
+      expect(result.heldAttempt).toBe('running');
+      expect(result.pastCutoff.running).toBe(0);
+      expect(result.pastCutoff.interrupted).toBe(1);
+      expect(result.sweptAttempt).toBe('interrupted');
+    } finally {
+      side?.close();
       rmSync(directory, { recursive: true, force: true });
     }
   });
@@ -418,6 +514,47 @@ describe('WorkQueue', () => {
 
     expect(result.reclaimed).toBe(0);
     expect(result.status).toBe('processing');
+  });
+
+  // Same exclusive cutoff as `recoverStale`, read through a side handle because
+  // a delivery claim does not report its lease.
+  it('holds a delivery whose lease expires exactly on the reclaim cutoff', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-cutoff-'));
+    const path = join(directory, 'queue.sqlite');
+    let side: Database | undefined;
+
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* queue.receiveDelivery({
+              id: 'edge',
+              event: 'notification',
+              body: '{}',
+              source: 'notification',
+            });
+            yield* queue.claimDelivery;
+            side = new Database(path);
+            const { leaseExpiresAt: lease } = side
+              .query('SELECT lease_expires_at AS leaseExpiresAt FROM deliveries WHERE id = ?')
+              .get('edge') as { leaseExpiresAt: number };
+            const onCutoff = yield* queue.recoverStaleDeliveries(lease);
+            const held = yield* queue.deliveryStatus('edge');
+            const pastCutoff = yield* queue.recoverStaleDeliveries(lease + 1);
+            return { onCutoff, held, pastCutoff, status: yield* queue.deliveryStatus('edge') };
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(result.onCutoff).toBe(0);
+      expect(result.held).toBe('processing');
+      expect(result.pastCutoff).toBe(1);
+      expect(result.status).toBe('pending');
+    } finally {
+      side?.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   // The budget, not the expiry, is what condemns the row: a delivery whose
