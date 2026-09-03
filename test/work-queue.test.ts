@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Clock, Effect, Layer, Logger, Redacted, TestClock, TestContext } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
-import { WorkQueue } from '../src/queue/work-queue.ts';
+import { QueueFull, WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
 
 const config = (databasePath: string) =>
@@ -205,7 +205,8 @@ describe('WorkQueue', () => {
       }),
     );
     expect(result.operation).toBe('enqueue');
-    expect((result.cause as Error).message).toBe('QUEUE_DEPTH_LIMIT');
+    expect(result.cause).toBeInstanceOf(QueueFull);
+    expect(result.cause).toMatchObject({ limit: 1 });
   });
 
   it('completes a claimed job', async () => {
