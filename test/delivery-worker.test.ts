@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'bun:test';
 import { HttpClient, HttpClientRequest, HttpClientResponse } from '@effect/platform';
-import { Clock, Effect, Fiber, Layer, Logger, Redacted, Schema } from 'effect';
+import {
+  Clock,
+  Effect,
+  Fiber,
+  Layer,
+  Logger,
+  Redacted,
+  Schema,
+  TestClock,
+  TestContext,
+} from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { DeliveryWorker, isTerminalFailure } from '../src/delivery-worker.ts';
 import { GitHubClient, GitHubRequestError } from '../src/github/client.ts';
@@ -11,6 +21,7 @@ import {
 } from '../src/github/identity.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { QueueError, WorkQueue } from '../src/queue/work-queue.ts';
+import type { WorkItem } from '../src/work-item.ts';
 
 const config = LictorConfig.make({
   githubToken: Redacted.make('pat-value'),
@@ -83,6 +94,7 @@ const services = (
     readonly reactionStatus?: number;
     readonly firstRequestDelayMs?: number;
     readonly requests?: string[];
+    readonly maxQueueDepth?: number;
   } = {},
 ) => {
   const ConfigLive = Layer.succeed(LictorConfig, config);
@@ -125,7 +137,7 @@ const services = (
   const PolicyLive = Layer.effect(
     Policy,
     parsePolicy(
-      '[defaults]\nexecution = "automatic"\n[repositories]\nallow = ["edloidas/lictor"]',
+      `[defaults]\nexecution = "automatic"\n[limits]\nmaxQueueDepth = ${options.maxQueueDepth ?? 10_000}\n[repositories]\nallow = ["edloidas/lictor"]`,
       ['edloidas'],
     ).pipe(Effect.map(Policy.make)),
   );
@@ -365,6 +377,66 @@ describe('DeliveryWorker', () => {
       expect(result.counts.pending).toBe(0);
     },
   );
+
+  // Driven under the test clock because the assertion is the length of the
+  // sleep: every pass leaves the same refunded `pending` row behind, so the row
+  // alone cannot show it.
+  it('waits the backoff cap on every pass while the job queue is full', async () => {
+    const filler: WorkItem = {
+      deliveryId: 'filler',
+      interactionId: 'interaction-filler',
+      repository: 'edloidas/lictor',
+      sender: 'edloidas',
+      targets: ['adiutriel'],
+      reasons: ['assigned'],
+      subject: {
+        kind: 'issue',
+        number: 1,
+        title: 'Occupies the only slot',
+        url: 'https://github.com/edloidas/lictor/issues/1',
+      },
+    };
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.enqueue(filler);
+          yield* queue.receiveDelivery({
+            id: 'delivery-1',
+            event: 'notification',
+            body,
+            source: 'notification',
+          });
+          const worker = yield* DeliveryWorker;
+          const pass = Effect.gen(function* () {
+            const fiber = yield* Effect.fork(worker.runOnce);
+            yield* TestClock.adjust('59 seconds');
+            const early = yield* Fiber.poll(fiber);
+            yield* TestClock.adjust('1 second');
+            const done = yield* Fiber.poll(fiber);
+            return { early: early._tag, done: done._tag };
+          });
+          const passes = [yield* pass, yield* pass];
+          return { passes, next: yield* queue.claimDelivery };
+        }).pipe(
+          Effect.provide(Logger.remove(Logger.defaultLogger)),
+          Effect.provide(
+            services(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }), [], {
+              maxQueueDepth: 1,
+            }),
+          ),
+          Effect.provide(TestContext.TestContext),
+        ),
+      ),
+    );
+
+    expect(result.passes).toEqual([
+      { early: 'None', done: 'Some' },
+      { early: 'None', done: 'Some' },
+    ]);
+    // Two refunded passes leave the row where a fresh claim finds attempt 1.
+    expect(result.next).toMatchObject({ id: 'delivery-1', status: 'processing', attempts: 1 });
+  });
 
   // Parse and schema failures are properties of the stored bytes, so they are
   // condemned on the first pass and stay condemned — a later pass must not
