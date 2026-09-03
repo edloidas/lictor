@@ -1,6 +1,6 @@
 import { FetchHttpClient } from '@effect/platform';
 import { BunHttpServer, BunRuntime } from '@effect/platform-bun';
-import { Cause, Clock, Effect, Exit, Layer } from 'effect';
+import { Cause, Clock, Effect, Layer } from 'effect';
 import { LictorConfig, legacyStateConflict, port } from './config.ts';
 import { ControlPlane, ControlServer } from './control/control-plane.ts';
 import { credentialExpiryWatch, supervisedMaintenanceLoop } from './daemon-tick.ts';
@@ -17,6 +17,7 @@ import { NotificationPoller } from './notifications/poller.ts';
 import { Policy } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 import { Server } from './server.ts';
+import { supervisor } from './supervision.ts';
 import { Worker } from './worker.ts';
 import { DiskStat, RepositoryWorkspace } from './workspace/repository-workspace.ts';
 
@@ -87,31 +88,6 @@ const Services = Layer.mergeAll(
   PollerLive,
 );
 /**
- * Runs work that must not end quietly, and stops the daemon if it does.
- *
- * The whole exit is inspected: a defect bypasses `tapError` and `ignore` alike,
- * so a dead fiber looks exactly like a healthy idle one; `completes: 'never'`
- * treats even a *successful* return as the bug it is for a loop; interruption,
- * by contrast, is clean shutdown and must not fire a second `SIGTERM`.
- */
-const supervised = <A, E, R>(
-  name: string,
-  /** `never` for a loop, where returning at all is the bug. */
-  completes: 'never' | 'once',
-  work: Effect.Effect<A, E, R>,
-) =>
-  Effect.exit(work).pipe(
-    Effect.flatMap((exit) => {
-      if (Exit.isSuccess(exit)) {
-        return completes === 'never' ? stop(`The ${name} stopped`) : Effect.void;
-      }
-      return Cause.isInterruptedOnly(exit.cause)
-        ? Effect.void
-        : stop(`The ${name} stopped`, exit.cause);
-    }),
-  );
-
-/**
  * Logs why the daemon is stopping and stops it.
  *
  * The cause is described, not rendered: rendering walks the nested chain, which
@@ -119,9 +95,16 @@ const supervised = <A, E, R>(
  * `Authorization` header.
  */
 const stop = (message: string, cause?: Cause.Cause<unknown>) =>
-  Effect.logFatal(message)
-    .pipe(Effect.annotateLogs(cause === undefined ? {} : { reason: describeCause(cause) }))
-    .pipe(Effect.zipRight(Effect.sync(() => process.kill(process.pid, 'SIGTERM'))));
+  Effect.logFatal(message).pipe(
+    Effect.annotateLogs(
+      cause === undefined
+        ? {}
+        : { reason: describeCause(cause), operation: failureOperation(cause) ?? 'unknown' },
+    ),
+    Effect.zipRight(Effect.sync(() => process.kill(process.pid, 'SIGTERM'))),
+  );
+
+const supervised = supervisor(stop);
 
 const Application = Layer.merge(
   Server,

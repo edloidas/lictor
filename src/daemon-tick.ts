@@ -1,7 +1,8 @@
-import { Cause, Clock, Effect, Option, Schedule } from 'effect';
+import { Clock, Effect, Option, Schedule } from 'effect';
 import { CredentialHealth } from './github/credential-health.ts';
 import { GitHubIdentity } from './github/identity.ts';
 import { WorkQueue } from './queue/work-queue.ts';
+import { type FatalAction, supervisor } from './supervision.ts';
 
 /**
  * One pass of the daemon's short-cadence upkeep. Kept out of `main.ts`, which
@@ -19,18 +20,8 @@ export const maintenanceLoop = Effect.forever(
   Effect.zipRight(Effect.sleep('10 seconds'), daemonTick),
 );
 
-/**
- * The maintenance loop under the supervision that stops the daemon with it.
- *
- * Failures only: an interrupt is clean shutdown and must not fire the fatal
- * action.
- */
-export const supervisedMaintenanceLoop = (
-  fatal: (message: string, cause: Cause.Cause<unknown>) => Effect.Effect<void>,
-) =>
-  maintenanceLoop.pipe(
-    Effect.tapError((cause) => fatal('Daemon ownership heartbeat failed', Cause.fail(cause))),
-  );
+export const supervisedMaintenanceLoop = (fatal: FatalAction) =>
+  supervisor(fatal)('daemon maintenance loop', 'never', maintenanceLoop);
 
 /**
  * Suspends the credential once its verified expiry has passed.
