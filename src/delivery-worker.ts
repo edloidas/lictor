@@ -37,6 +37,8 @@ export const isTerminalFailure = (
 
 type ProcessRequirements = GitHubClient | GitHubIdentity | LictorConfig | Policy | WorkQueue;
 
+const DELIVERY_BACKOFF_CAP_MS = 60_000;
+
 const claimLost: ReadonlySet<string> = new Set(Object.values(CLAIM_FENCED_OPERATIONS));
 
 /** Whether a failure means this worker no longer holds the delivery. */
@@ -203,7 +205,10 @@ export class DeliveryWorker extends Effect.Service<DeliveryWorker>()('DeliveryWo
       const stored = yield* queue.claimDelivery;
       if (stored === undefined) return false;
       const backoff = Effect.sleep(
-        Math.min(config.workerRetryBaseMs * 2 ** Math.max(0, stored.attempts - 1), 60_000),
+        Math.min(
+          config.workerRetryBaseMs * 2 ** Math.max(0, stored.attempts - 1),
+          DELIVERY_BACKOFF_CAP_MS,
+        ),
       );
       const process = Effect.gen(function* () {
         yield* processBySource[stored.source](stored);
@@ -238,16 +243,14 @@ export class DeliveryWorker extends Effect.Service<DeliveryWorker>()('DeliveryWo
             .retryDelivery(stored.id, stored.attempts, String(error), false)
             .pipe(Effect.zipRight(Effect.sleep(config.workerRetryBaseMs))),
         ),
-        Effect.catchTag('QueueError', (error) =>
-          queue
-            .retryDelivery(
-              stored.id,
-              stored.attempts,
-              String(error),
-              (error.cause as Error | undefined)?.message !== 'QUEUE_DEPTH_LIMIT',
-            )
-            .pipe(Effect.zipRight(backoff)),
-        ),
+        Effect.catchTag('QueueError', (error) => {
+          // The opt-out refunds the attempt, so `attempts` does not climb on this
+          // path and `backoff` would never ramp. Sleep the cap directly.
+          const queueFull = (error.cause as Error | undefined)?.message === 'QUEUE_DEPTH_LIMIT';
+          return queue
+            .retryDelivery(stored.id, stored.attempts, String(error), !queueFull)
+            .pipe(Effect.zipRight(queueFull ? Effect.sleep(DELIVERY_BACKOFF_CAP_MS) : backoff));
+        }),
         Effect.catchIf(isTerminalFailure, (error) =>
           // Terminal row: nothing reads it again, so log the reason here.
           Effect.logError('Delivery failed permanently').pipe(
