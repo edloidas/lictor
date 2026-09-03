@@ -209,6 +209,46 @@ describe('WorkQueue', () => {
     expect(result.cause).toMatchObject({ limit: 1 });
   });
 
+  it('counts a claimed job toward queue depth and frees it on completion', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(work('depth-held'), 1);
+        const job = yield* queue.claim;
+        const whileRunning = yield* Effect.flip(queue.enqueue(work('depth-next'), 1));
+        yield* queue.complete(job?.id ?? -1, job?.attempts ?? -1, 'done');
+        const afterCompletion = yield* queue.enqueue(work('depth-next'), 1);
+        return { whileRunning, afterCompletion, counts: yield* queue.counts };
+      }),
+    );
+
+    expect(result.whileRunning.cause).toBeInstanceOf(QueueFull);
+    expect(result.afterCompletion.inserted).toBe(true);
+    expect(result.counts.completed).toBe(1);
+    expect(result.counts.pending).toBe(1);
+  });
+
+  it('dedupes a replay at full queue depth on either key', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(work('depth-drained'));
+        const drained = yield* queue.claim;
+        yield* queue.complete(drained?.id ?? -1, drained?.attempts ?? -1, 'done');
+        const queued = work('depth-replay');
+        const redelivery = { ...work('depth-redelivered'), interactionId: queued.interactionId };
+        const first = yield* queue.enqueue(queued, 1);
+        const sameDelivery = yield* queue.enqueue(queued, 1);
+        const sameInteraction = yield* queue.enqueue(redelivery, 1);
+        return { first, sameDelivery, sameInteraction };
+      }),
+    );
+
+    expect(result.first).toEqual({ jobId: 2, inserted: true });
+    expect(result.sameDelivery).toEqual({ jobId: result.first.jobId, inserted: false });
+    expect(result.sameInteraction).toEqual({ jobId: result.first.jobId, inserted: false });
+  });
+
   it('completes a claimed job', async () => {
     const counts = await run(
       Effect.gen(function* () {
