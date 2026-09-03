@@ -7,7 +7,7 @@ import {
   maintenanceLoop,
   supervisedMaintenanceLoop,
 } from '../src/daemon-tick.ts';
-import { failureOperation } from '../src/diagnostics.ts';
+import { describeCause, failureOperation } from '../src/diagnostics.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
 import {
   GitHubIdentity,
@@ -15,6 +15,7 @@ import {
   type VerifiedIdentity,
 } from '../src/github/identity.ts';
 import { QueueError, WorkQueue } from '../src/queue/work-queue.ts';
+import type { FatalAction } from '../src/supervision.ts';
 import type { WorkItem } from '../src/work-item.ts';
 
 const config = LictorConfig.make({
@@ -201,51 +202,91 @@ describe('daemonTick', () => {
   });
 });
 
-const ownershipLost = new QueueError({
-  operation: 'renew daemon ownership',
-  cause: new Error('Daemon ownership was lost'),
-});
+const queueError = (operation: string, message: string) =>
+  new QueueError({ operation, cause: new Error(message) });
+
+const ownershipLost = queueError('renew daemon ownership', 'Daemon ownership was lost');
+
+const recorder = () => {
+  const calls: { message: string; reason: string; operation: string | undefined }[] = [];
+  const fatal: FatalAction = (message, cause) =>
+    Effect.sync(() => {
+      calls.push({
+        message,
+        reason: cause === undefined ? 'none' : describeCause(cause),
+        operation: cause === undefined ? undefined : failureOperation(cause),
+      });
+    });
+  return { calls, fatal };
+};
 
 describe('supervisedMaintenanceLoop', () => {
-  it('hands a failed ownership heartbeat to the fatal action and ends the loop', async () => {
-    const fatal: { message: string; operation: string | undefined }[] = [];
+  it.each([
+    [
+      'the ownership heartbeat fails',
+      (queue: WorkQueue) =>
+        WorkQueue.make({ ...queue, heartbeatDaemon: Effect.fail(ownershipLost) }),
+      { reason: 'QueueError', operation: 'renew daemon ownership' },
+    ],
+    [
+      // Both recovery calls, because wrapping either one in `Effect.ignore` left
+      // every test green before these two cases existed.
+      'a job reclaim fails',
+      (queue: WorkQueue) =>
+        WorkQueue.make({
+          ...queue,
+          recoverStale: () => Effect.fail(queueError('recover stale jobs', 'Reclaim failed')),
+        }),
+      { reason: 'QueueError', operation: 'recover stale jobs' },
+    ],
+    [
+      'a delivery reclaim fails',
+      (queue: WorkQueue) =>
+        WorkQueue.make({
+          ...queue,
+          recoverStaleDeliveries: () =>
+            Effect.fail(queueError('recover stale deliveries', 'Reclaim failed')),
+        }),
+      { reason: 'QueueError', operation: 'recover stale deliveries' },
+    ],
+    [
+      // The gap this test file existed without: a throw inside `Effect.gen` is a
+      // defect, so the error channel never carries it and the fiber dies unseen.
+      'the tick dies of a defect',
+      (queue: WorkQueue) =>
+        WorkQueue.make({
+          ...queue,
+          heartbeatDaemon: Effect.sync(() => {
+            throw new Error('database handle closed');
+          }),
+        }),
+      { reason: 'Defect: Error: database handle closed', operation: undefined },
+    ],
+  ])('stops the daemon when %s', async (_case, overlay, expected) => {
+    const { calls, fatal } = recorder();
     const exit = await run(
       Effect.gen(function* () {
-        const loop = yield* Effect.fork(
-          supervisedMaintenanceLoop((message, cause) =>
-            Effect.sync(() => {
-              fatal.push({ message, operation: failureOperation(cause) });
-            }),
-          ),
-        );
+        const loop = yield* Effect.fork(supervisedMaintenanceLoop(fatal));
         yield* TestClock.adjust('10 seconds');
         return yield* Fiber.await(loop);
       }),
       undefined,
-      (queue) => WorkQueue.make({ ...queue, heartbeatDaemon: Effect.fail(ownershipLost) }),
+      overlay,
     );
 
-    // The operation names the statement that failed, so this fails on a wrapper
-    // that reports a cause of its own rather than the one the loop raised.
-    expect(fatal).toEqual([
-      { message: 'Daemon ownership heartbeat failed', operation: 'renew daemon ownership' },
-    ]);
-    expect(exit).toStrictEqual(Exit.fail(ownershipLost));
+    expect(calls).toEqual([{ message: 'The daemon maintenance loop stopped', ...expected }]);
+    // Supervision consumes the cause rather than re-raising it: the fatal action
+    // is taking the process down, so the fiber has nothing left to report.
+    expect(exit).toStrictEqual(Exit.void);
   });
 
-  it('stays silent while the heartbeat holds, and through the interrupt that ends it', async () => {
-    const fatal: string[] = [];
+  it('stays silent while the tick holds', async () => {
+    const { calls, fatal } = recorder();
     const beat = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
         yield* TestClock.adjust('1 second');
-        const loop = yield* Effect.fork(
-          supervisedMaintenanceLoop((message) =>
-            Effect.sync(() => {
-              fatal.push(message);
-            }),
-          ),
-        );
+        const loop = yield* Effect.fork(supervisedMaintenanceLoop(fatal));
         yield* TestClock.adjust('30 seconds');
         const diagnostics = yield* queue.diagnostics;
         yield* Fiber.interrupt(loop);
@@ -256,7 +297,7 @@ describe('supervisedMaintenanceLoop', () => {
     // Three cadences of a loop that really ran: without this, a wrapper that
     // never reached the loop at all would satisfy the assertion below.
     expect(beat.workerHeartbeatAt).toBe(31_000);
-    expect(fatal).toEqual([]);
+    expect(calls).toEqual([]);
   });
 });
 
