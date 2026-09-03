@@ -228,6 +228,36 @@ describe('WorkQueue', () => {
     expect(result.counts.pending).toBe(1);
   });
 
+  // One status per queue: parked together at depth 1 they trip the limit either
+  // way, so a merged case would pin neither status.
+  it.each(['retry', 'interrupted'] as const)(
+    'counts a job parked in %s toward queue depth',
+    async (status) => {
+      const result = await run(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.enqueue(work('depth-parked'), 1);
+          const job = yield* queue.claim;
+          if (status === 'retry') {
+            const now = yield* Clock.currentTimeMillis;
+            yield* queue.fail(job?.id ?? -1, job?.attempts ?? -1, 'temporary', now + 60_000);
+          } else {
+            yield* queue.recoverStale((job?.leaseExpiresAt ?? 0) + 1);
+          }
+          const rejected = yield* Effect.flip(queue.enqueue(work('depth-next'), 1));
+          return { rejected, counts: yield* queue.counts };
+        }),
+      );
+
+      // pending and running at 0 leave the parked status as the only row the
+      // depth count could be reading.
+      expect(result.counts).toMatchObject({ [status]: 1, pending: 0, running: 0 });
+      expect(result.rejected.operation).toBe('enqueue');
+      expect(result.rejected.cause).toBeInstanceOf(QueueFull);
+      expect(result.rejected.cause).toMatchObject({ limit: 1 });
+    },
+  );
+
   it('dedupes a replay at full queue depth on either key', async () => {
     const result = await run(
       Effect.gen(function* () {
