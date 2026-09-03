@@ -1,14 +1,20 @@
 import { describe, expect, it } from 'bun:test';
-import { Effect, Fiber, Layer, Redacted, TestClock, TestContext } from 'effect';
+import { Effect, Exit, Fiber, Layer, Redacted, TestClock, TestContext } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
-import { credentialExpiryWatch, daemonTick, maintenanceLoop } from '../src/daemon-tick.ts';
+import {
+  credentialExpiryWatch,
+  daemonTick,
+  maintenanceLoop,
+  supervisedMaintenanceLoop,
+} from '../src/daemon-tick.ts';
+import { failureOperation } from '../src/diagnostics.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
 import {
   GitHubIdentity,
   GitHubIdentityError,
   type VerifiedIdentity,
 } from '../src/github/identity.ts';
-import { WorkQueue } from '../src/queue/work-queue.ts';
+import { QueueError, WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
 
 const config = LictorConfig.make({
@@ -39,10 +45,14 @@ const live: VerifiedIdentity = { login: 'adiutriel', tokenExpiresAt: undefined }
 const run = <A, E>(
   effect: Effect.Effect<A, E, WorkQueue | CredentialHealth | GitHubIdentity>,
   verified: Effect.Effect<VerifiedIdentity, GitHubIdentityError> = Effect.succeed(live),
+  overlay: (queue: WorkQueue) => WorkQueue = (queue) => queue,
 ) => {
   const ConfigLive = Layer.succeed(LictorConfig, config);
+  const QueueLive = Layer.effect(WorkQueue, Effect.map(WorkQueue, overlay)).pipe(
+    Layer.provide(WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive))),
+  );
   const services = Layer.mergeAll(
-    WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive)),
+    QueueLive,
     CredentialHealth.Default,
     Layer.succeed(GitHubIdentity, GitHubIdentity.make({ verified })),
   );
@@ -188,6 +198,65 @@ describe('daemonTick', () => {
 
     expect(result.counts.interrupted).toBe(1);
     expect(result.diagnostics.workerHeartbeatAt).toBe(61_000);
+  });
+});
+
+const ownershipLost = new QueueError({
+  operation: 'renew daemon ownership',
+  cause: new Error('Daemon ownership was lost'),
+});
+
+describe('supervisedMaintenanceLoop', () => {
+  it('hands a failed ownership heartbeat to the fatal action and ends the loop', async () => {
+    const fatal: { message: string; operation: string | undefined }[] = [];
+    const exit = await run(
+      Effect.gen(function* () {
+        const loop = yield* Effect.fork(
+          supervisedMaintenanceLoop((message, cause) =>
+            Effect.sync(() => {
+              fatal.push({ message, operation: failureOperation(cause) });
+            }),
+          ),
+        );
+        yield* TestClock.adjust('10 seconds');
+        return yield* Fiber.await(loop);
+      }),
+      undefined,
+      (queue) => WorkQueue.make({ ...queue, heartbeatDaemon: Effect.fail(ownershipLost) }),
+    );
+
+    // The operation names the statement that failed, so this fails on a wrapper
+    // that reports a cause of its own rather than the one the loop raised.
+    expect(fatal).toEqual([
+      { message: 'Daemon ownership heartbeat failed', operation: 'renew daemon ownership' },
+    ]);
+    expect(exit).toStrictEqual(Exit.fail(ownershipLost));
+  });
+
+  it('stays silent while the heartbeat holds, and through the interrupt that ends it', async () => {
+    const fatal: string[] = [];
+    const beat = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* TestClock.adjust('1 second');
+        const loop = yield* Effect.fork(
+          supervisedMaintenanceLoop((message) =>
+            Effect.sync(() => {
+              fatal.push(message);
+            }),
+          ),
+        );
+        yield* TestClock.adjust('30 seconds');
+        const diagnostics = yield* queue.diagnostics;
+        yield* Fiber.interrupt(loop);
+        return diagnostics;
+      }),
+    );
+
+    // Three cadences of a loop that really ran: without this, a wrapper that
+    // never reached the loop at all would satisfy the assertion below.
+    expect(beat.workerHeartbeatAt).toBe(31_000);
+    expect(fatal).toEqual([]);
   });
 });
 
