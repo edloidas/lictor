@@ -4,8 +4,10 @@ import {
   Clock,
   Effect,
   Fiber,
+  identity,
   Layer,
   Logger,
+  Queue,
   Redacted,
   Schema,
   TestClock,
@@ -95,10 +97,13 @@ const services = (
     readonly firstRequestDelayMs?: number;
     readonly requests?: string[];
     readonly maxQueueDepth?: number;
+    readonly queue?: (queue: WorkQueue) => WorkQueue;
   } = {},
 ) => {
   const ConfigLive = Layer.succeed(LictorConfig, config);
-  const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
+  const QueueLive = Layer.effect(WorkQueue, Effect.map(WorkQueue, options.queue ?? identity)).pipe(
+    Layer.provide(WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive))),
+  );
   const IdentityLive = Layer.succeed(GitHubIdentity, GitHubIdentity.make({ verified }));
   let delayed = false;
   const client = HttpClient.make((request) => {
@@ -396,6 +401,10 @@ describe('DeliveryWorker', () => {
         url: 'https://github.com/edloidas/lictor/issues/1',
       },
     };
+    // `TestClock.adjust` supervises no fibers under a bare `TestContext`, so a
+    // stub parked on a real timer would let the clock warp before the cap sleep
+    // is registered. Hold on the refund: it is the last write before that sleep.
+    const refunded = await Effect.runPromise(Queue.unbounded<void>());
     const result = await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
@@ -410,6 +419,7 @@ describe('DeliveryWorker', () => {
           const worker = yield* DeliveryWorker;
           const pass = Effect.gen(function* () {
             const fiber = yield* Effect.fork(worker.runOnce);
+            yield* Queue.take(refunded);
             yield* TestClock.adjust('59 seconds');
             const early = yield* Fiber.poll(fiber);
             yield* TestClock.adjust('1 second');
@@ -423,6 +433,14 @@ describe('DeliveryWorker', () => {
           Effect.provide(
             services(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }), [], {
               maxQueueDepth: 1,
+              queue: (queue) =>
+                WorkQueue.make({
+                  ...queue,
+                  retryDelivery: (...args) =>
+                    queue
+                      .retryDelivery(...args)
+                      .pipe(Effect.tap(() => Queue.offer(refunded, undefined))),
+                }),
             }),
           ),
           Effect.provide(TestContext.TestContext),

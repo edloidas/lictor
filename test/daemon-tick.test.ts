@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'bun:test';
-import { Effect, Exit, Fiber, Layer, Redacted, TestClock, TestContext } from 'effect';
+import {
+  Chunk,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Redacted,
+  TestClock,
+  TestContext,
+} from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import {
   credentialExpiryWatch,
@@ -42,6 +52,27 @@ const config = LictorConfig.make({
 });
 
 const live: VerifiedIdentity = { login: 'adiutriel', tokenExpiresAt: undefined };
+
+// `TestClock.adjust` supervises no fibers under a bare `TestContext`: it yields a
+// few real-timer turns and warps. A double parked on a real timer ahead of the
+// first sleep — none does today — would see the clock move before that sleep is
+// registered. Hold until the fiber has a sleep on the clock, or has ended.
+const forkSleeping = <A, E, R>(self: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const before = Chunk.size(yield* TestClock.sleeps());
+    const fiber = yield* Effect.fork(self);
+    const deadline = performance.now() + 3000;
+    while (
+      Chunk.size(yield* TestClock.sleeps()) === before &&
+      Option.isNone(yield* Fiber.poll(fiber))
+    ) {
+      if (performance.now() > deadline) {
+        return yield* Effect.dieMessage('The forked fiber never reached the test clock');
+      }
+      yield* Effect.yieldNow();
+    }
+    return fiber;
+  });
 
 const run = <A, E>(
   effect: Effect.Effect<A, E, WorkQueue | CredentialHealth | GitHubIdentity>,
@@ -163,7 +194,7 @@ describe('daemonTick', () => {
         // Forked off the epoch, so a tick that fires before its first sleep
         // writes a heartbeat distinguishable from the one ownership opened with.
         yield* TestClock.adjust('1 second');
-        const loop = yield* Effect.fork(maintenanceLoop);
+        const loop = yield* forkSleeping(maintenanceLoop);
         yield* TestClock.adjust('9 seconds');
         const early = yield* queue.diagnostics;
         yield* TestClock.adjust('1 second');
@@ -189,6 +220,8 @@ describe('daemonTick', () => {
         yield* queue.enqueue(work);
         yield* queue.claim;
         yield* TestClock.adjust('61 seconds');
+        // A plain fork, not `forkSleeping`: the tick has no sleep to reach, and a
+        // tick that stalls on the probe must fail the assertions below, not the hold.
         const tick = yield* Effect.fork(daemonTick);
         yield* TestClock.adjust('1 second');
         yield* Fiber.interrupt(tick);
@@ -266,7 +299,7 @@ describe('supervisedMaintenanceLoop', () => {
     const { calls, fatal } = recorder();
     const exit = await run(
       Effect.gen(function* () {
-        const loop = yield* Effect.fork(supervisedMaintenanceLoop(fatal));
+        const loop = yield* forkSleeping(supervisedMaintenanceLoop(fatal));
         yield* TestClock.adjust('10 seconds');
         return yield* Fiber.await(loop);
       }),
@@ -286,7 +319,7 @@ describe('supervisedMaintenanceLoop', () => {
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
         yield* TestClock.adjust('1 second');
-        const loop = yield* Effect.fork(supervisedMaintenanceLoop(fatal));
+        const loop = yield* forkSleeping(supervisedMaintenanceLoop(fatal));
         yield* TestClock.adjust('30 seconds');
         const diagnostics = yield* queue.diagnostics;
         yield* Fiber.interrupt(loop);
@@ -311,7 +344,7 @@ describe('credentialExpiryWatch', () => {
     const result = await run(
       Effect.gen(function* () {
         const health = yield* CredentialHealth;
-        const watch = yield* Effect.fork(credentialExpiryWatch);
+        const watch = yield* forkSleeping(credentialExpiryWatch);
         yield* TestClock.adjust(healthyAt);
         const before = yield* health.isRejected;
         yield* TestClock.adjust(rejectedAt - healthyAt);
