@@ -102,6 +102,14 @@ export const CLAIM_FENCED_OPERATIONS = {
   renew: 'renew delivery lease',
 } as const;
 
+/**
+ * Carried as the `cause` of the `QueueError` from an `enqueue` that found the
+ * queue at `limit`.
+ */
+export class QueueFull extends Data.TaggedError('QueueFull')<{
+  readonly limit: number;
+}> {}
+
 const migrate = (database: Database) => {
   database.exec('PRAGMA journal_mode = WAL');
   database.exec('PRAGMA foreign_keys = ON');
@@ -696,7 +704,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('pending', 'retry', 'interrupted', 'running')",
             )
             .get() as { count: number };
-          if (active.count >= maxDepth) throw new Error('QUEUE_DEPTH_LIMIT');
+          if (active.count >= maxDepth) throw new QueueFull({ limit: maxDepth });
           const result = database
             .query(
               `INSERT INTO jobs

@@ -12,6 +12,7 @@ import {
   type DeliverySource,
   type InboxDelivery,
   type QueueError,
+  QueueFull,
   WorkQueue,
 } from './queue/work-queue.ts';
 import type { ContextRef, WorkItem } from './work-item.ts';
@@ -44,6 +45,8 @@ const claimLost: ReadonlySet<string> = new Set(Object.values(CLAIM_FENCED_OPERAT
 /** Whether a failure means this worker no longer holds the delivery. */
 const isClaimLost = (error: unknown): error is QueueError =>
   isTagged('QueueError')(error) && claimLost.has((error as QueueError).operation);
+
+const isQueueFull = (error: QueueError): boolean => error.cause instanceof QueueFull;
 
 /**
  * Eyes reaction on the triggering comment, and the audit row recording it.
@@ -246,7 +249,7 @@ export class DeliveryWorker extends Effect.Service<DeliveryWorker>()('DeliveryWo
         Effect.catchTag('QueueError', (error) => {
           // The opt-out refunds the attempt, so `attempts` does not climb on this
           // path and `backoff` would never ramp. Sleep the cap directly.
-          const queueFull = (error.cause as Error | undefined)?.message === 'QUEUE_DEPTH_LIMIT';
+          const queueFull = isQueueFull(error);
           return queue
             .retryDelivery(stored.id, stored.attempts, String(error), !queueFull)
             .pipe(Effect.zipRight(queueFull ? Effect.sleep(DELIVERY_BACKOFF_CAP_MS) : backoff));
