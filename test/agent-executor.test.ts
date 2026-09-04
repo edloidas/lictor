@@ -101,6 +101,17 @@ const captureInput = (
   ).then(() => observed?.input);
 };
 
+/** Runs one job against a Codex that exits 1 with the given stderr. */
+const failWith = (stderr: string, databasePath = ':memory:') =>
+  runWith(
+    Effect.flatMap(AgentExecutor, (agent) => Effect.flip(agent.execute(work))),
+    ProcessRunner.make({
+      run: () => Effect.succeed({ exitCode: 1, stdout: '', stderr, outputTruncated: false }),
+    }),
+    'codex',
+    databasePath,
+  );
+
 describe('buildPrompt', () => {
   it('contains bounded normalized metadata and explicit trust boundaries', () => {
     const prompt = buildPrompt(work);
@@ -268,6 +279,60 @@ describe('AgentExecutor', () => {
 
     expect(error.retryable).toBe(true);
     expect(error.message).toBe('Codex exited with status 2');
+  });
+
+  it('diagnoses an expired Codex credential as permanent without quoting stderr', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lictor-codex-'));
+
+    const error = await failWith(
+      [
+        'ERROR codex_login::auth::manager: Failed to refresh token: 401 Unauthorized:',
+        '{"code":"refresh_token_reused"}',
+        'LICTOR_GITHUB_TOKEN=must-not-surface',
+      ].join('\n'),
+      join(dir, 'lictor.sqlite'),
+    );
+
+    expect(error.retryable).toBe(false);
+    expect(error.message).toBe(
+      `Codex exited with status 1: Codex rejected the credential in CODEX_HOME — run \`CODEX_HOME=${join(dir, 'codex')} codex login\``,
+    );
+    expect(String(error)).not.toContain('must-not-surface');
+  });
+
+  it('diagnoses an unauthenticated CODEX_HOME as permanent', async () => {
+    const error = await failWith(
+      [
+        'ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket:',
+        'ERROR codex_api::endpoint::responses: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header',
+      ].join('\n'),
+    );
+
+    expect(error.retryable).toBe(false);
+    expect(error.message).toContain('codex login');
+  });
+
+  it('keeps an unrelated 401 in agent tool output retryable', async () => {
+    const error = await failWith(
+      [
+        'exec bash -lc `curl -sf https://internal.example/data`',
+        'curl: (22) The requested URL returned error: 401 Unauthorized',
+      ].join('\n'),
+    );
+
+    expect(error).toMatchObject({ retryable: true, message: 'Codex exited with status 1' });
+  });
+
+  it('diagnoses an untrusted workspace as permanent', async () => {
+    const error = await failWith(
+      'Not inside a trusted directory and --skip-git-repo-check was not specified.',
+    );
+
+    expect(error).toMatchObject({
+      retryable: false,
+      message:
+        'Codex exited with status 1: Codex refused the workspace as untrusted — it is not a git repository',
+    });
   });
 
   it('fails permanently without spawning when execution is disabled', async () => {
