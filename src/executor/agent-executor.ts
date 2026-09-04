@@ -182,55 +182,65 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
         );
       }
 
+      const budgetMs = Math.min(timeoutMs, config.executorTimeoutMs);
+
       return Effect.flatMap(readSoul, (soul) =>
-        processes.run({
-          command: [
-            'codex',
-            'exec',
-            '--ephemeral',
-            '--color',
-            'never',
-            '--model',
-            config.codexModel,
-            ...(jobId === undefined
-              ? []
-              : [
-                  '-c',
-                  'mcp_servers.lictor.command="bun"',
-                  '-c',
-                  `mcp_servers.lictor.args=${JSON.stringify([
-                    mcpClientPath,
-                    controlSocketPath,
-                    String(jobId),
-                    String(attemptNumber),
-                    workerId ?? '',
-                  ])}`,
-                ]),
-            // --approve-for-me implies workspace-write; adding --sandbox is a
-            // clap conflict on codex >= 0.147.
-            '--approve-for-me',
-            '--cd',
-            workdir,
-            '-',
-          ],
-          cwd: workdir,
-          input: `${[soul, buildPrompt(work)]
-            .filter(Boolean)
-            .join(
-              '\n\n',
-            )}\n\nReturn only JSON matching {"status":"completed|needs_input|rejected|failed","summary":"bounded summary","artifacts":["relative/path"]}.`,
-          timeoutMs: Math.min(timeoutMs, config.executorTimeoutMs),
-          outputLimitBytes: config.executorOutputBytes,
-          env: {
-            PATH: process.env.PATH ?? '/usr/bin:/bin',
-            HOME: workdir,
-            LANG: process.env.LANG ?? 'C.UTF-8',
-            CODEX_HOME: codexHome,
-            // Token-free, non-interactive: git must fail fast on a credential
-            // need instead of blocking on a prompt until the executor timeout.
-            GIT_TERMINAL_PROMPT: '0',
-          },
-        }),
+        Effect.logInfo('Starting agent process').pipe(
+          Effect.annotateLogs({
+            ...(jobId === undefined ? {} : { job: jobId, attempt: attemptNumber }),
+            timeoutMs: budgetMs,
+          }),
+          Effect.zipRight(
+            processes.run({
+              command: [
+                'codex',
+                'exec',
+                '--ephemeral',
+                '--color',
+                'never',
+                '--model',
+                config.codexModel,
+                ...(jobId === undefined
+                  ? []
+                  : [
+                      '-c',
+                      'mcp_servers.lictor.command="bun"',
+                      '-c',
+                      `mcp_servers.lictor.args=${JSON.stringify([
+                        mcpClientPath,
+                        controlSocketPath,
+                        String(jobId),
+                        String(attemptNumber),
+                        workerId ?? '',
+                      ])}`,
+                    ]),
+                // --approve-for-me implies workspace-write; adding --sandbox is a
+                // clap conflict on codex >= 0.147.
+                '--approve-for-me',
+                '--cd',
+                workdir,
+                '-',
+              ],
+              cwd: workdir,
+              input: `${[soul, buildPrompt(work)]
+                .filter(Boolean)
+                .join(
+                  '\n\n',
+                )}\n\nReturn only JSON matching {"status":"completed|needs_input|rejected|failed","summary":"bounded summary","artifacts":["relative/path"]}.`,
+              timeoutMs: budgetMs,
+              outputLimitBytes: config.executorOutputBytes,
+              env: {
+                PATH: process.env.PATH ?? '/usr/bin:/bin',
+                HOME: workdir,
+                LANG: process.env.LANG ?? 'C.UTF-8',
+                CODEX_HOME: codexHome,
+                // Token-free, non-interactive: git must fail fast on a credential
+                // need instead of blocking on a prompt until the executor timeout.
+                GIT_TERMINAL_PROMPT: '0',
+              },
+            }),
+          ),
+        ),
       ).pipe(
         Effect.flatMap((result) =>
           result.exitCode === 0
@@ -244,6 +254,17 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                   }),
               }).pipe(
                 Effect.flatMap(Schema.decodeUnknown(ExecutorResult)),
+                // ! ParseError renders the rejected value — Codex stdout — into its
+                // ! message, which the worker's outcome log then carries verbatim.
+                // ! Fixed diagnosis instead; retryable stays `true`, as below.
+                Effect.catchTag('ParseError', () =>
+                  Effect.fail(
+                    new ExecutorError({
+                      message: 'Codex returned a result outside the expected schema',
+                      retryable: true,
+                    }),
+                  ),
+                ),
                 Effect.map((value) => ({
                   ...value,
                   summary: bounded(value.summary, 4096),

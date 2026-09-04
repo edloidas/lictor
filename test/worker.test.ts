@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { Effect, Layer, Redacted } from 'effect';
+import { Effect, Layer, Logger, type LogLevel, Redacted } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { AgentExecutor, ExecutorError } from '../src/executor/agent-executor.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
@@ -35,6 +35,35 @@ const prWork: WorkItem = {
     url: 'https://github.com/edloidas/lictor/pull/42',
   },
 };
+
+/** The harness policy below denies this repository and accepts every other. */
+const deniedWork: WorkItem = {
+  ...work,
+  deliveryId: 'delivery-3',
+  interactionId: 'interaction-3',
+  repository: 'edloidas/denied',
+};
+
+type LogLine = {
+  readonly level: LogLevel.LogLevel['label'];
+  readonly message: string;
+  readonly annotations: Record<string, unknown>;
+};
+
+const capture = (lines: LogLine[]) =>
+  Logger.replace(
+    Logger.defaultLogger,
+    Logger.make<unknown, void>(({ annotations, logLevel, message }) => {
+      lines.push({
+        level: logLevel.label,
+        message: String(message),
+        annotations: Object.fromEntries(annotations),
+      });
+    }),
+  );
+
+const annotationsOf = (lines: readonly LogLine[], message: string) =>
+  lines.find((line) => line.message === message)?.annotations;
 
 const config = (maxAttempts = 3) =>
   LictorConfig.make({
@@ -81,7 +110,7 @@ const run = <A, E>(
       forRepository: (repository) => ({
         repository,
         accepted: true,
-        execution: 'automatic',
+        execution: repository === deniedWork.repository ? 'denied' : 'automatic',
         clone: 'denied',
         maxAttempts: 3,
         maxDurationMs: 30 * 60 * 1000,
@@ -424,5 +453,109 @@ describe('Worker.runOnce', () => {
     );
 
     expect(acquireCalls[0]?.ref).toBe('refs/heads/lictor-issue-42');
+  });
+});
+
+describe('Worker.runOnce observability', () => {
+  const observe = (
+    execute: InstanceType<typeof AgentExecutor>['execute'],
+    items: readonly WorkItem[] = [work],
+  ) => {
+    const logs: LogLine[] = [];
+    return run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const worker = yield* Worker;
+        for (const item of items) yield* queue.enqueue(item);
+        for (const _ of items) yield* worker.runOnce;
+        return { logs, counts: yield* queue.counts };
+      }).pipe(Effect.provide(capture(logs))),
+      execute,
+    );
+  };
+
+  it('reports the status and the elapsed time of a completed job', async () => {
+    const { logs } = await observe(
+      () => Effect.sleep('30 millis').pipe(Effect.as({ status: 'completed', summary: 'done' })),
+      [work, prWork],
+    );
+
+    const completed = logs.filter((line) => line.message === 'Completed queued work');
+    // Two jobs, so the annotation has to carry the claimed id rather than a constant.
+    expect(completed.map((line) => line.annotations.job)).toEqual([1, 2]);
+    expect(completed[0]?.annotations.status).toBe('completed');
+    expect(completed[0]?.annotations.attempt).toBe(1);
+    // Measured, not defaulted: the executor was held for 30ms on the real clock.
+    expect(completed[0]?.annotations.durationMs).toBeGreaterThanOrEqual(25);
+  });
+
+  it('reports a job the agent could not finish without asking for input', async () => {
+    const { logs } = await observe(() =>
+      Effect.succeed({ status: 'needs_input', summary: 'which branch?' }),
+    );
+
+    const annotations = annotationsOf(logs, 'Queued work did not complete');
+    expect(annotations?.status).toBe('needs_input');
+    // needs_input is never retried, so there is nothing to schedule.
+    expect(annotations).not.toHaveProperty('retryAt');
+  });
+
+  it('reports the scheduled retry when the agent reports its own failure', async () => {
+    const before = Date.now();
+    const { logs } = await observe(() =>
+      Effect.succeed({ status: 'failed', summary: 'could not push' }),
+    );
+    const after = Date.now();
+
+    const annotations = annotationsOf(logs, 'Queued work did not complete');
+    expect(annotations?.status).toBe('failed');
+    // The first attempt's backoff is workerRetryBaseMs, taken from the finish time.
+    expect(annotations?.retryAt).toBeGreaterThanOrEqual(before + 100);
+    expect(annotations?.retryAt).toBeLessThanOrEqual(after + 100);
+  });
+
+  it('keeps the agent-authored summary out of every log line', async () => {
+    const { logs } = await observe(() =>
+      Effect.succeed({ status: 'failed', summary: 'cat /etc/shadow said root:x:0' }),
+    );
+
+    expect(logs.length).toBeGreaterThan(0);
+    expect(JSON.stringify(logs)).not.toContain('root:x:0');
+  });
+
+  it('reports the elapsed time when the executor itself fails', async () => {
+    const { logs } = await observe(() =>
+      Effect.sleep('30 millis').pipe(
+        Effect.zipRight(Effect.fail(new ExecutorError({ message: 'temporary', retryable: true }))),
+      ),
+    );
+
+    const annotations = annotationsOf(logs, 'Queued work will retry');
+    expect(annotations?.durationMs).toBeGreaterThanOrEqual(25);
+    expect(annotations?.errorCode).toBe('EXECUTOR_RETRYABLE');
+  });
+
+  it('reports a permanent executor failure under its own message and code', async () => {
+    const { logs } = await observe(() =>
+      Effect.fail(new ExecutorError({ message: 'no write access', retryable: false })),
+    );
+
+    const annotations = annotationsOf(logs, 'Queued work failed');
+    expect(annotations?.errorCode).toBe('EXECUTOR_FAILED');
+    expect(annotations).not.toHaveProperty('retryAt');
+  });
+
+  it('reports a claimed job dropped before execution by repository policy', async () => {
+    const { logs, counts } = await observe(
+      () => Effect.die('the executor must not run'),
+      [deniedWork],
+    );
+
+    const annotations = annotationsOf(logs, 'Dropped queued work denied by policy');
+    expect(annotations?.errorCode).toBe('POLICY_COST_LIMIT');
+    expect(annotations?.durationMs).toBeTypeOf('number');
+    // A dropped job is failed, never completed.
+    expect(counts.failed).toBe(1);
+    expect(counts.completed).toBe(0);
   });
 });
