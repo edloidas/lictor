@@ -90,6 +90,15 @@ can reach.
 
 Watch the log on the first mention. `Committed notifications` confirms polling and
 credential scope; `Queued GitHub interaction` confirms qualification and policy.
+Once execution is enabled, every claimed job runs to exactly one outcome line, and
+`durationMs` on that line measures from the claim. `Claimed queued work` opens it.
+A job the repository policy refuses ends there and then, at `Dropped queued work
+denied by policy`. Otherwise `Starting agent process` reports the timeout budget
+the child is given — the policy allowance capped by `LICTOR_EXECUTOR_TIMEOUT_MS`,
+so neither value alone — and the outcome is one of `Completed queued work`,
+`Queued work did not complete`, `Queued work will retry`, or `Queued work
+failed`. No line carries Codex's stdout or stderr: what the agent reported is in
+the database.
 
 ## Activate repository policy
 

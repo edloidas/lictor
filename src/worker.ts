@@ -32,6 +32,9 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       yield* Effect.logInfo('Claimed queued work').pipe(
         Effect.annotateLogs({ job: job.id, attempt: job.attempts }),
       );
+      // Measured from the claim, not the child spawn, so clone and cleanup
+      // count toward every outcome's duration.
+      const claimedAt = yield* Clock.currentTimeMillis;
 
       const keepLease = Effect.forever(
         Effect.sleep('1 second').pipe(
@@ -69,6 +72,14 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         policyTime - job.createdAt > policy.maxJobAgeMs
       ) {
         yield* queue.fail(job.id, job.attempts, 'POLICY_COST_LIMIT');
+        yield* Effect.logWarning('Dropped queued work denied by policy').pipe(
+          Effect.annotateLogs({
+            job: job.id,
+            attempt: job.attempts,
+            errorCode: 'POLICY_COST_LIMIT',
+            durationMs: policyTime - claimedAt,
+          }),
+        );
         return true;
       }
       const retainWorkspace = yield* Ref.make(false);
@@ -149,18 +160,34 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         yield* health.suspend;
       }
       if (result._tag === 'Right') {
+        const finishedAt = yield* Clock.currentTimeMillis;
         if (result.right.status === 'failed' || result.right.status === 'needs_input') {
           const retryAt =
             result.right.status === 'failed' && job.attempts < repositoryPolicy.maxAttempts
-              ? (yield* Clock.currentTimeMillis) +
-                config.workerRetryBaseMs * 2 ** Math.max(0, job.attempts - 1)
+              ? finishedAt + config.workerRetryBaseMs * 2 ** Math.max(0, job.attempts - 1)
               : undefined;
           yield* queue.fail(job.id, job.attempts, result.right.summary, retryAt);
+          // `summary` is parsed out of Codex stdout and stays in the database:
+          // logging it would echo whatever the repository made the agent say.
+          yield* Effect.logWarning('Queued work did not complete').pipe(
+            Effect.annotateLogs({
+              job: job.id,
+              attempt: job.attempts,
+              status: result.right.status,
+              durationMs: finishedAt - claimedAt,
+              ...(retryAt === undefined ? {} : { retryAt }),
+            }),
+          );
           return true;
         }
         yield* queue.complete(job.id, job.attempts, JSON.stringify(result.right));
         yield* Effect.logInfo('Completed queued work').pipe(
-          Effect.annotateLogs({ job: job.id, attempt: job.attempts }),
+          Effect.annotateLogs({
+            job: job.id,
+            attempt: job.attempts,
+            status: result.right.status,
+            durationMs: finishedAt - claimedAt,
+          }),
         );
         return true;
       }
@@ -179,6 +206,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
           attempt: job.attempts,
           error: result.left.message,
           errorCode: result.left.retryable ? 'EXECUTOR_RETRYABLE' : 'EXECUTOR_FAILED',
+          durationMs: now - claimedAt,
           ...(retryAt === undefined ? {} : { retryAt }),
         }),
       );

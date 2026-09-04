@@ -48,15 +48,40 @@ const config = (executor: 'codex' | 'disabled' = 'codex', databasePath = ':memor
     notificationPollMs: 60_000,
   });
 
-type LogLine = { readonly level: LogLevel.LogLevel['label']; readonly message: string };
+type LogLine = {
+  readonly level: LogLevel.LogLevel['label'];
+  readonly message: string;
+  readonly annotations: Record<string, unknown>;
+};
 
 const capturedLogger = (lines: LogLine[]) =>
   Logger.replace(
     Logger.defaultLogger,
-    Logger.make<unknown, void>(({ logLevel, message }) => {
-      lines.push({ level: logLevel.label, message: String(message) });
+    Logger.make<unknown, void>(({ annotations, logLevel, message }) => {
+      lines.push({
+        level: logLevel.label,
+        message: String(message),
+        annotations: Object.fromEntries(annotations),
+      });
     }),
   );
+
+/** Drops annotations so a whole run can be asserted as an exhaustive sequence. */
+const sequence = (lines: readonly LogLine[]) =>
+  lines.map(({ level, message }) => ({ level, message }));
+
+const annotationsOf = (lines: readonly LogLine[], message: string) =>
+  lines.find((line) => line.message === message)?.annotations;
+
+const completingRunner = ProcessRunner.make({
+  run: () =>
+    Effect.succeed({
+      exitCode: 0,
+      stdout: '{"status":"completed","summary":"completed"}',
+      stderr: '',
+      outputTruncated: false,
+    }),
+});
 
 const runWith = <A, E>(
   effect: Effect.Effect<A, E, AgentExecutor>,
@@ -154,7 +179,10 @@ describe('AgentExecutor', () => {
     const input = await captureInput('codex', join(dir, 'lictor.sqlite'), logs);
 
     expect(input?.startsWith('You are handling a trusted GitHub interaction.')).toBe(true);
-    expect(logs).toEqual([{ level: 'INFO', message: 'Persona not configured' }]);
+    expect(sequence(logs)).toEqual([
+      { level: 'INFO', message: 'Persona not configured' },
+      { level: 'INFO', message: 'Starting agent process' },
+    ]);
   });
 
   it('sends the bare prompt and warns when SOUL.md is a dangling symlink', async () => {
@@ -166,9 +194,10 @@ describe('AgentExecutor', () => {
 
     expect(input?.startsWith('You are handling a trusted GitHub interaction.')).toBe(true);
     // Once from the startup probe, once from the job: the broken state is worth repeating.
-    expect(logs).toEqual([
+    expect(sequence(logs)).toEqual([
       { level: 'WARN', message: 'Persona symlink is dangling' },
       { level: 'WARN', message: 'Persona symlink is dangling' },
+      { level: 'INFO', message: 'Starting agent process' },
     ]);
   });
 
@@ -181,9 +210,10 @@ describe('AgentExecutor', () => {
     const input = await captureInput('codex', join(dir, 'lictor.sqlite'), logs);
 
     expect(input?.startsWith(`${'a'.repeat(bound)}\n\nYou are handling`)).toBe(true);
-    expect(logs).toEqual([
+    expect(sequence(logs)).toEqual([
       { level: 'INFO', message: 'Persona loaded' },
       { level: 'WARN', message: 'Persona exceeds the prompt bound and is truncated' },
+      { level: 'INFO', message: 'Starting agent process' },
     ]);
   });
 
@@ -196,7 +226,10 @@ describe('AgentExecutor', () => {
     const input = await captureInput('codex', join(dir, 'lictor.sqlite'), logs);
 
     expect(input?.startsWith(`${'a'.repeat(bound)}\n\nYou are handling`)).toBe(true);
-    expect(logs).toEqual([{ level: 'INFO', message: 'Persona loaded' }]);
+    expect(sequence(logs)).toEqual([
+      { level: 'INFO', message: 'Persona loaded' },
+      { level: 'INFO', message: 'Starting agent process' },
+    ]);
   });
 
   it('sends the bare prompt and warns when SOUL.md exists but cannot be read', async () => {
@@ -207,10 +240,51 @@ describe('AgentExecutor', () => {
     const input = await captureInput('codex', join(dir, 'lictor.sqlite'), logs);
 
     expect(input?.startsWith('You are handling a trusted GitHub interaction.')).toBe(true);
-    expect(logs).toEqual([
+    expect(sequence(logs)).toEqual([
       { level: 'WARN', message: 'Persona could not be read' },
       { level: 'WARN', message: 'Persona could not be read' },
+      { level: 'INFO', message: 'Starting agent process' },
     ]);
+  });
+
+  it('reports the applied timeout as the smaller of the policy budget and the ceiling', async () => {
+    // The test config sets executorTimeoutMs to 5000.
+    const applied = async (timeoutMs: number) => {
+      const logs: LogLine[] = [];
+      await runWith(
+        Effect.flatMap(AgentExecutor, (agent) =>
+          agent.execute(work, '/tmp/lictor-workspace', timeoutMs),
+        ),
+        completingRunner,
+        'codex',
+        ':memory:',
+        capturedLogger(logs),
+      );
+      return annotationsOf(logs, 'Starting agent process')?.timeoutMs;
+    };
+
+    expect(await applied(30 * 60 * 1000)).toBe(5000);
+    expect(await applied(1000)).toBe(1000);
+  });
+
+  it('names the job and attempt on the start line when the worker supplies them', async () => {
+    const logs: LogLine[] = [];
+
+    await runWith(
+      Effect.flatMap(AgentExecutor, (agent) =>
+        agent.execute(work, '/tmp/lictor-workspace', 1000, 7, 2, 'worker-1'),
+      ),
+      completingRunner,
+      'codex',
+      ':memory:',
+      capturedLogger(logs),
+    );
+
+    expect(annotationsOf(logs, 'Starting agent process')).toEqual({
+      job: 7,
+      attempt: 2,
+      timeoutMs: 1000,
+    });
   });
 
   it('passes the prompt to Codex as stdin with fixed arguments', async () => {
@@ -366,5 +440,23 @@ describe('AgentExecutor', () => {
     );
     expect(error.message).toBe('Codex returned a malformed result');
     expect(String(error)).not.toContain('must-not-surface');
+  });
+
+  // Unlike the malformed-JSON case above, a schema rejection used to render
+  // Codex's stdout into its own message, which the worker then logs verbatim.
+  it.each([
+    ['an out-of-schema status', '{"status":"root:x:0:0:leaked","summary":"x"}'],
+    ['a bare JSON string', '"root:x:0:0:leaked"'],
+    ['a non-string summary', '{"status":"completed","summary":{"at":"root:x:0:0:leaked"}}'],
+  ])('rejects %s without quoting what Codex printed', async (_case, stdout) => {
+    const error = await runWith(
+      Effect.flatMap(AgentExecutor, (agent) => Effect.flip(agent.execute(work))),
+      ProcessRunner.make({
+        run: () => Effect.succeed({ exitCode: 0, stdout, stderr: '', outputTruncated: false }),
+      }),
+    );
+
+    expect(error.message).toBe('Codex returned a result outside the expected schema');
+    expect(String(error)).not.toContain('root:x:0:0:leaked');
   });
 });
