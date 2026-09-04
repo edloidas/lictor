@@ -5,7 +5,7 @@ import { Cause, Data, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
 import { describeCause } from '../diagnostics.ts';
 import type { WorkItem } from '../work-item.ts';
-import { ProcessRunner } from './process-runner.ts';
+import { type ProcessResult, ProcessRunner } from './process-runner.ts';
 
 export class ExecutorError extends Data.TaggedError('ExecutorError')<{
   readonly message: string;
@@ -71,6 +71,41 @@ const warnBrokenPersona = (path: string, persona: Persona): Effect.Effect<void> 
     default:
       return Effect.void;
   }
+};
+
+/**
+ * Codex failures that never recover, keyed on its own stderr tracing. Matched,
+ * never echoed — `--approve-for-me` runs shell commands in the workspace, so
+ * that stream carries whatever the repository holds. Which is also why the auth
+ * signature needs a Codex tracing module on the line: a bare `401 Unauthorized`
+ * arrives from whatever the agent ran, and matching it dead-letters a job that
+ * should have retried.
+ */
+const permanentFailures: readonly {
+  readonly signature: RegExp;
+  readonly diagnose: (codexHome: string) => string;
+}[] = [
+  {
+    signature:
+      /^[^\n]*codex_(?:login|api|models_manager)::[^\n]*(?:401 Unauthorized|token_expired|token_revoked|refresh_token_reused|refresh_token_invalidated|Missing bearer or basic authentication)/m,
+    diagnose: (codexHome) =>
+      `Codex rejected the credential in CODEX_HOME — run \`CODEX_HOME=${codexHome} codex login\``,
+  },
+  {
+    signature: /Not inside a trusted directory/,
+    diagnose: () => 'Codex refused the workspace as untrusted — it is not a git repository',
+  },
+];
+
+const exitFailure = (result: ProcessResult, codexHome: string): ExecutorError => {
+  const diagnosis = permanentFailures
+    .find((failure) => failure.signature.test(result.stderr))
+    ?.diagnose(codexHome);
+  const status = `Codex exited with status ${result.exitCode}`;
+  return new ExecutorError({
+    message: diagnosis === undefined ? status : `${status}: ${diagnosis}`,
+    retryable: diagnosis === undefined,
+  });
 };
 
 export const buildPrompt = (work: WorkItem): string => {
@@ -219,12 +254,7 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                       }),
                 })),
               )
-            : Effect.fail(
-                new ExecutorError({
-                  message: `Codex exited with status ${result.exitCode}`,
-                  retryable: true,
-                }),
-              ),
+            : Effect.fail(exitFailure(result, codexHome)),
         ),
         Effect.mapError((cause) =>
           cause instanceof ExecutorError
