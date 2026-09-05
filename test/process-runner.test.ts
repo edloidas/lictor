@@ -13,6 +13,7 @@ describe('ProcessRunner', () => {
           input: '',
           timeoutMs: 5000,
           outputLimitBytes: 5,
+          stderrRetention: 'head',
         });
       }).pipe(Effect.provide(ProcessRunner.Default)),
     );
@@ -36,11 +37,31 @@ describe('ProcessRunner', () => {
           input: '',
           timeoutMs: 5000,
           outputLimitBytes: 1,
+          stderrRetention: 'head',
         });
       }).pipe(Effect.provide(ProcessRunner.Default)),
     );
 
-    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1);
+    expect(result.stdout).toBe('');
+    expect(result.stdoutTruncated).toBe(true);
+  });
+
+  it('keeps the valid prefix when a head cut splits a character', async () => {
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runner = yield* ProcessRunner;
+        return yield* runner.run({
+          command: ['bun', '-e', "process.stdout.write('a€')"],
+          cwd: process.cwd(),
+          input: '',
+          timeoutMs: 5000,
+          outputLimitBytes: 2,
+          stderrRetention: 'head',
+        });
+      }).pipe(Effect.provide(ProcessRunner.Default)),
+    );
+
+    expect(result.stdout).toBe('a');
     expect(result.stdoutTruncated).toBe(true);
   });
 
@@ -54,6 +75,7 @@ describe('ProcessRunner', () => {
           input: '',
           timeoutMs: 5000,
           outputLimitBytes: 5,
+          stderrRetention: 'head',
         });
       }).pipe(Effect.provide(ProcessRunner.Default)),
     );
@@ -72,11 +94,163 @@ describe('ProcessRunner', () => {
           input: '',
           timeoutMs: 5000,
           outputLimitBytes: 5,
+          stderrRetention: 'head',
         });
       }).pipe(Effect.provide(ProcessRunner.Default)),
     );
 
     expect(result.stdoutTruncated).toBe(false);
     expect(result.stderrTruncated).toBe(true);
+  });
+
+  it('keeps the end of stderr when the caller asks for the tail', async () => {
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runner = yield* ProcessRunner;
+        return yield* runner.run({
+          command: ['bun', '-e', "process.stderr.write('abcdefghij')"],
+          cwd: process.cwd(),
+          input: '',
+          timeoutMs: 5000,
+          outputLimitBytes: 5,
+          stderrRetention: 'tail',
+        });
+      }).pipe(Effect.provide(ProcessRunner.Default)),
+    );
+
+    expect(result.stderr).toBe('fghij');
+    expect(result.stderrTruncated).toBe(true);
+  });
+
+  // A `codex exec` session arrives as many chunks over minutes, not one write,
+  // so the eviction accounting is what runs in production.
+  it('keeps the end of stderr across many chunks', async () => {
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runner = yield* ProcessRunner;
+        return yield* runner.run({
+          command: [
+            'bun',
+            '-e',
+            "for (const c of 'abcdefghijklmnopqrstuvwxyz') { process.stderr.write(c); await Bun.sleep(2); }",
+          ],
+          cwd: process.cwd(),
+          input: '',
+          timeoutMs: 5000,
+          outputLimitBytes: 5,
+          stderrRetention: 'tail',
+        });
+      }).pipe(Effect.provide(ProcessRunner.Default)),
+    );
+
+    expect(result.stderr).toBe('vwxyz');
+    expect(result.stderrTruncated).toBe(true);
+  });
+
+  it('retains each stream from its own end in one run', async () => {
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runner = yield* ProcessRunner;
+        return yield* runner.run({
+          command: [
+            'bun',
+            '-e',
+            "process.stdout.write('abcdefghij');process.stderr.write('ABCDEFGHIJ')",
+          ],
+          cwd: process.cwd(),
+          input: '',
+          timeoutMs: 5000,
+          outputLimitBytes: 4,
+          stderrRetention: 'tail',
+        });
+      }).pipe(Effect.provide(ProcessRunner.Default)),
+    );
+
+    expect(result.stdout).toBe('abcd');
+    expect(result.stderr).toBe('GHIJ');
+  });
+
+  it('keeps a tail within the byte limit when the cut splits a character', async () => {
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runner = yield* ProcessRunner;
+        return yield* runner.run({
+          command: ['bun', '-e', "process.stderr.write('a€b')"],
+          cwd: process.cwd(),
+          input: '',
+          timeoutMs: 5000,
+          outputLimitBytes: 3,
+          stderrRetention: 'tail',
+        });
+      }).pipe(Effect.provide(ProcessRunner.Default)),
+    );
+
+    expect(result.stderr).toBe('b');
+  });
+
+  it('invents no replacement character when a tail cut splits a wide character', async () => {
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runner = yield* ProcessRunner;
+        return yield* runner.run({
+          command: ['bun', '-e', "process.stderr.write('\\u{1F600}abc')"],
+          cwd: process.cwd(),
+          input: '',
+          timeoutMs: 5000,
+          outputLimitBytes: 6,
+          stderrRetention: 'tail',
+        });
+      }).pipe(Effect.provide(ProcessRunner.Default)),
+    );
+
+    expect(result.stderr).toBe('abc');
+  });
+
+  // Trimming a byte per full decode took 37s on this shape; the default test
+  // timeout is what fails if it comes back.
+  it('trims a large tail overshoot without re-decoding per byte', async () => {
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runner = yield* ProcessRunner;
+        return yield* runner.run({
+          command: ['bun', '-e', "process.stderr.write('x'.repeat(4_000_000))"],
+          cwd: process.cwd(),
+          input: '',
+          timeoutMs: 20_000,
+          outputLimitBytes: 1024 * 1024,
+          stderrRetention: 'tail',
+        });
+      }).pipe(Effect.provide(ProcessRunner.Default)),
+    );
+
+    expect(Buffer.byteLength(result.stderr)).toBe(1024 * 1024);
+    expect(result.stderrTruncated).toBe(true);
+  });
+
+  it('preserves a signature emitted past the budget', async () => {
+    const signature = 'ERROR codex_login::auth::manager: token_expired';
+    const script = `process.stderr.write('x'.repeat(20000) + '\\n' + ${JSON.stringify(signature)} + '\\n')`;
+
+    const capturing = (stderrRetention: 'head' | 'tail') =>
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const runner = yield* ProcessRunner;
+          return yield* runner.run({
+            command: ['bun', '-e', script],
+            cwd: process.cwd(),
+            input: '',
+            timeoutMs: 5000,
+            outputLimitBytes: 4096,
+            stderrRetention,
+          });
+        }).pipe(Effect.provide(ProcessRunner.Default)),
+      );
+
+    const [tail, head] = await Promise.all([capturing('tail'), capturing('head')]);
+
+    expect(tail.stderr).toContain(signature);
+    expect(head.stderr).not.toContain(signature);
+    expect(tail.stderrTruncated).toBe(true);
+    expect(Buffer.byteLength(tail.stderr)).toBeLessThanOrEqual(4096);
   });
 });
