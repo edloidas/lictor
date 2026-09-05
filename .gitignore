@@ -13,6 +13,7 @@
 # Only reachable now if an operator points a state path back into the repo;
 # the defaults live under ~/.lictor.
 .lictor/
+codex/
 
 # Dependencies
 node_modules/
