@@ -98,14 +98,25 @@ const permanentFailures: readonly {
   },
 ];
 
-const exitFailure = (result: ProcessResult, codexHome: string): ExecutorError => {
+const exitFailure = (
+  result: ProcessResult,
+  codexHome: string,
+  outputLimitBytes: number,
+): ExecutorError => {
   const diagnosis = permanentFailures
     .find((failure) => failure.signature.test(result.stderr))
     ?.diagnose(codexHome);
   const status = `Codex exited with status ${result.exitCode}`;
+  if (diagnosis !== undefined) {
+    return new ExecutorError({ message: `${status}: ${diagnosis}`, retryable: false });
+  }
+  // `capture` keeps the head, so a signature emitted late in a long session is
+  // dropped first — "none matched" and "none survived" are different facts.
   return new ExecutorError({
-    message: diagnosis === undefined ? status : `${status}: ${diagnosis}`,
-    retryable: diagnosis === undefined,
+    message: result.stderrTruncated
+      ? `${status}: cause undetermined, its diagnostics exceeded the ${outputLimitBytes}-byte output budget (LICTOR_EXECUTOR_OUTPUT_BYTES)`
+      : status,
+    retryable: true,
   });
 };
 
@@ -246,41 +257,52 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
               ),
             )
       ).pipe(
-        Effect.flatMap((result) =>
-          result.exitCode === 0
-            ? Effect.try({
-                try: () => JSON.parse(result.stdout) as unknown,
-                catch: (cause) =>
-                  new ExecutorError({
-                    message: 'Codex returned a malformed result',
-                    retryable: false,
-                    cause,
+        Effect.flatMap((result) => {
+          if (result.exitCode !== 0) {
+            return Effect.fail(exitFailure(result, codexHome, config.executorOutputBytes));
+          }
+          // A retry re-runs byte-identical input, so only sampling separates it
+          // from this attempt — not worth another run at the executor budget.
+          if (result.stdoutTruncated) {
+            return Effect.fail(
+              new ExecutorError({
+                message: `Codex wrote more than the ${config.executorOutputBytes}-byte output budget (LICTOR_EXECUTOR_OUTPUT_BYTES) and its result was cut off`,
+                retryable: false,
+              }),
+            );
+          }
+          return Effect.try({
+            try: () => JSON.parse(result.stdout) as unknown,
+            catch: (cause) =>
+              new ExecutorError({
+                message: 'Codex returned a malformed result',
+                retryable: false,
+                cause,
+              }),
+          }).pipe(
+            Effect.flatMap(Schema.decodeUnknown(ExecutorResult)),
+            // ! ParseError renders the rejected value — Codex stdout — into its
+            // ! message, which the worker's outcome log then carries verbatim.
+            // ! Fixed diagnosis instead, never the ParseError's own message.
+            Effect.catchTag('ParseError', () =>
+              Effect.fail(
+                new ExecutorError({
+                  message: 'Codex returned a result outside the expected schema',
+                  retryable: false,
+                }),
+              ),
+            ),
+            Effect.map((value) => ({
+              ...value,
+              summary: bounded(value.summary, 4096),
+              ...(value.artifacts === undefined
+                ? {}
+                : {
+                    artifacts: value.artifacts.slice(0, 50).map((path) => bounded(path, 512)),
                   }),
-              }).pipe(
-                Effect.flatMap(Schema.decodeUnknown(ExecutorResult)),
-                // ! ParseError renders the rejected value — Codex stdout — into its
-                // ! message, which the worker's outcome log then carries verbatim.
-                // ! Fixed diagnosis instead; retryable stays `true`, as below.
-                Effect.catchTag('ParseError', () =>
-                  Effect.fail(
-                    new ExecutorError({
-                      message: 'Codex returned a result outside the expected schema',
-                      retryable: true,
-                    }),
-                  ),
-                ),
-                Effect.map((value) => ({
-                  ...value,
-                  summary: bounded(value.summary, 4096),
-                  ...(value.artifacts === undefined
-                    ? {}
-                    : {
-                        artifacts: value.artifacts.slice(0, 50).map((path) => bounded(path, 512)),
-                      }),
-                })),
-              )
-            : Effect.fail(exitFailure(result, codexHome)),
-        ),
+            })),
+          );
+        }),
         Effect.mapError((cause) =>
           cause instanceof ExecutorError
             ? cause

@@ -80,7 +80,8 @@ const completingRunner = ProcessRunner.make({
       exitCode: 0,
       stdout: '{"status":"completed","summary":"completed"}',
       stderr: '',
-      outputTruncated: false,
+      stdoutTruncated: false,
+      stderrTruncated: false,
     }),
 });
 
@@ -123,7 +124,8 @@ const captureInput = (
             exitCode: 0,
             stdout: '{"status":"completed","summary":"completed"}',
             stderr: '',
-            outputTruncated: false,
+            stdoutTruncated: false,
+            stderrTruncated: false,
           };
         }),
     }),
@@ -134,11 +136,18 @@ const captureInput = (
 };
 
 /** Runs one job against a Codex that exits 1 with the given stderr. */
-const failWith = (stderr: string, databasePath = ':memory:') =>
+const failWith = (stderr: string, databasePath = ':memory:', stderrTruncated = false) =>
   runWith(
     Effect.flatMap(AgentExecutor, (agent) => Effect.flip(agent.execute(work))),
     ProcessRunner.make({
-      run: () => Effect.succeed({ exitCode: 1, stdout: '', stderr, outputTruncated: false }),
+      run: () =>
+        Effect.succeed({
+          exitCode: 1,
+          stdout: '',
+          stderr,
+          stdoutTruncated: false,
+          stderrTruncated,
+        }),
     }),
     'codex',
     databasePath,
@@ -305,7 +314,8 @@ describe('AgentExecutor', () => {
                 exitCode: 0,
                 stdout: '{"status":"completed","summary":"completed"}',
                 stderr: '',
-                outputTruncated: false,
+                stdoutTruncated: false,
+                stderrTruncated: false,
               }),
             ),
         });
@@ -346,7 +356,8 @@ describe('AgentExecutor', () => {
           exitCode: 2,
           stdout: '',
           stderr: 'temporary failure',
-          outputTruncated: false,
+          stdoutTruncated: false,
+          stderrTruncated: false,
         }),
     });
 
@@ -438,14 +449,43 @@ describe('AgentExecutor', () => {
           exitCode: 0,
           stdout: 'not-json',
           stderr: 'LICTOR_GITHUB_TOKEN=must-not-surface',
-          outputTruncated: false,
+          stdoutTruncated: false,
+          stderrTruncated: false,
         }),
     });
     const error = await runWith(
       Effect.flatMap(AgentExecutor, (agent) => Effect.flip(agent.execute(work))),
       runner,
     );
-    expect(error.message).toBe('Codex returned a malformed result');
+    expect(error).toMatchObject({ retryable: false, message: 'Codex returned a malformed result' });
+    expect(String(error)).not.toContain('must-not-surface');
+  });
+
+  it('separates a result cut off at the output budget from a malformed one', async () => {
+    const runner = ProcessRunner.make({
+      run: () =>
+        Effect.succeed({
+          exitCode: 0,
+          // Valid JSON until the budget cut it, so `JSON.parse` would fail here
+          // too — the truncation branch has to be reached first.
+          stdout: '{"status":"completed","summary":"tru',
+          stderr: 'LICTOR_GITHUB_TOKEN=must-not-surface',
+          stdoutTruncated: true,
+          // Deliberately false: with both set, a branch on the wrong stream
+          // reaches the same message and this test cannot tell them apart.
+          stderrTruncated: false,
+        }),
+    });
+    const error = await runWith(
+      Effect.flatMap(AgentExecutor, (agent) => Effect.flip(agent.execute(work))),
+      runner,
+    );
+
+    expect(error).toMatchObject({
+      retryable: false,
+      message:
+        'Codex wrote more than the 4096-byte output budget (LICTOR_EXECUTOR_OUTPUT_BYTES) and its result was cut off',
+    });
     expect(String(error)).not.toContain('must-not-surface');
   });
 
@@ -459,11 +499,47 @@ describe('AgentExecutor', () => {
     const error = await runWith(
       Effect.flatMap(AgentExecutor, (agent) => Effect.flip(agent.execute(work))),
       ProcessRunner.make({
-        run: () => Effect.succeed({ exitCode: 0, stdout, stderr: '', outputTruncated: false }),
+        run: () =>
+          Effect.succeed({
+            exitCode: 0,
+            stdout,
+            stderr: '',
+            stdoutTruncated: false,
+            stderrTruncated: false,
+          }),
       }),
     );
 
-    expect(error.message).toBe('Codex returned a result outside the expected schema');
+    expect(error).toMatchObject({
+      retryable: false,
+      message: 'Codex returned a result outside the expected schema',
+    });
     expect(String(error)).not.toContain('root:x:0:0:leaked');
+  });
+
+  it('reports an exit cause as undetermined when a cut stderr may have dropped it', async () => {
+    const error = await failWith(
+      'exec bash -lc `make`\nbuild log with no signature',
+      ':memory:',
+      true,
+    );
+
+    expect(error).toMatchObject({
+      retryable: true,
+      message:
+        'Codex exited with status 1: cause undetermined, its diagnostics exceeded the 4096-byte output budget (LICTOR_EXECUTOR_OUTPUT_BYTES)',
+    });
+  });
+
+  it('keeps a matched signature permanent even when stderr was cut', async () => {
+    const error = await failWith(
+      'ERROR codex_api::endpoint::responses: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header',
+      ':memory:',
+      true,
+    );
+
+    expect(error.retryable).toBe(false);
+    expect(error.message).toContain('codex login');
+    expect(error.message).not.toContain('undetermined');
   });
 });

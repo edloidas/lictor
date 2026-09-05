@@ -13,7 +13,8 @@ export type ProcessResult = {
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
-  readonly outputTruncated: boolean;
+  readonly stdoutTruncated: boolean;
+  readonly stderrTruncated: boolean;
 };
 
 export class ProcessError extends Data.TaggedError('ProcessError')<{
@@ -98,7 +99,8 @@ export class ProcessRunner extends Effect.Service<ProcessRunner>()('ProcessRunne
               exitCode,
               stdout: stdout.text,
               stderr: stderr.text,
-              outputTruncated: stdout.truncated || stderr.truncated,
+              stdoutTruncated: stdout.truncated,
+              stderrTruncated: stderr.truncated,
             })),
           ),
         (child) =>
