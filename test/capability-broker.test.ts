@@ -80,9 +80,11 @@ const run = <A, E>(
     Effect.scoped(
       Effect.gen(function* () {
         const requests = yield* Ref.make<string[]>([]);
+        const methods = yield* Ref.make<string[]>([]);
         const bodies = yield* Ref.make<string[]>([]);
         const client = HttpClient.make((request) =>
           Ref.update(requests, (items) => [...items, request.url]).pipe(
+            Effect.zipRight(Ref.update(methods, (items) => [...items, request.method])),
             Effect.zipRight(Ref.update(bodies, (items) => [...items, readBody(request)])),
             Effect.as(
               HttpClientResponse.fromWeb(
@@ -130,7 +132,12 @@ const run = <A, E>(
           ),
         );
         const value = yield* effect.pipe(Effect.provide(Layer.merge(BrokerLive, QueueLive)));
-        return { value, requests: yield* Ref.get(requests), bodies: yield* Ref.get(bodies) };
+        return {
+          value,
+          requests: yield* Ref.get(requests),
+          methods: yield* Ref.get(methods),
+          bodies: yield* Ref.get(bodies),
+        };
       }),
     ),
   );
@@ -221,6 +228,8 @@ describe('CapabilityBroker', () => {
       tools.map((tool) => [tool.name, [...(tool.inputSchema.required ?? [])].sort()]),
     );
     expect(required.create_comment).toEqual(['body', 'number']);
+    // No `number` — the issue it opens does not exist yet.
+    expect(required.create_issue).toEqual(['title']);
     expect(required.update_issue).toEqual(['number']);
     expect(required.create_branch).toEqual(['ref', 'sha']);
     expect(required.update_branch).toEqual(['ref', 'sha']);
@@ -246,6 +255,7 @@ describe('CapabilityBroker', () => {
       Object.keys(tools.find((tool) => tool.name === name)?.inputSchema.properties ?? {});
     expect(propertiesOf('update_branch')).toContain('force');
     expect(propertiesOf('merge_pull_request')).toContain('merge_method');
+    expect(propertiesOf('create_issue')).toContain('body');
     expect(propertiesOf('create_blob')).toContain('encoding');
     expect(propertiesOf('create_tree')).toContain('base_tree');
     expect(propertiesOf('list_review_threads')).toContain('after');
@@ -308,7 +318,7 @@ describe('CapabilityBroker', () => {
 
   it('gives every tool an input shape and a description of its own', async () => {
     const tools = await advertisedTools();
-    expect(tools).toHaveLength(15);
+    expect(tools).toHaveLength(16);
     // The guard reads `input.repository` by that name and skips silently when it
     // is absent, so a renamed key turns a refusal into an unaudited redirect.
     for (const tool of tools)
@@ -593,6 +603,52 @@ describe('CapabilityBroker', () => {
     );
 
     expect(result.bodies[0]).toContain('mentioning author and committer');
+  });
+
+  it('opens an issue against the repository collection', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        return yield* broker.callTool({
+          jobId: enqueued.jobId,
+          attemptNumber: claimed?.attempts ?? -1,
+          workerId: claimed?.workerId ?? '',
+          name: 'create_issue',
+          input: { title: 'feat: a test issue', body: 'opened by the broker' },
+        });
+      }),
+      '[defaults.capabilities]\nread = true\nissues = true',
+    );
+    expect(result.methods[0]).toBe('POST');
+    expect(result.requests[0]).toEndWith('/repos/edloidas/lictor/issues');
+    expect(result.bodies[0]).toContain('feat: a test issue');
+    expect(result.bodies[0]).toContain('opened by the broker');
+  });
+
+  it('denies opening an issue without the issues capability', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        return yield* Effect.exit(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'create_issue',
+            input: { title: 'feat: a test issue' },
+          }),
+        );
+      }),
+      '[defaults.capabilities]\nread = true\nissues = false',
+    );
+    expect(String(result.value)).toContain('CAPABILITY_DENIED');
+    expect(result.requests).toHaveLength(0);
   });
 
   // An installation token healed by re-minting. A revoked PAT never does, so a

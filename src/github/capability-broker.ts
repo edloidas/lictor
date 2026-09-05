@@ -12,6 +12,7 @@ export type BrokerTool =
   | 'create_blob'
   | 'create_comment'
   | 'create_commit'
+  | 'create_issue'
   | 'create_tree'
   | 'create_pull_request'
   | 'get_issue'
@@ -42,6 +43,7 @@ const capabilities: Readonly<
   list_review_threads: 'read',
   list_review_comments: 'read',
   create_comment: 'comment',
+  create_issue: 'issues',
   update_issue: 'issues',
   create_branch: 'branches',
   create_blob: 'branches',
@@ -129,6 +131,14 @@ const toolSchemas: Readonly<
       body: { type: 'string', description: 'Comment text, GitHub-flavored markdown.' },
     },
     required: ['number', 'body'],
+  },
+  create_issue: {
+    description: 'Open a new issue on the job repository.',
+    properties: {
+      title: { type: 'string' },
+      body: { type: 'string', description: 'Description, GitHub-flavored markdown.' },
+    },
+    required: ['title'],
   },
   update_issue: {
     description: 'Update an issue. Only the fields sent are changed.',
@@ -365,6 +375,8 @@ const route = (repository: string, tool: BrokerTool, input: Readonly<Record<stri
         method: 'POST',
         path: `${base}/issues/${number(input, 'number')}/comments`,
       } as const;
+    case 'create_issue':
+      return { method: 'POST', path: `${base}/issues` } as const;
     case 'update_issue':
       return { method: 'PATCH', path: `${base}/issues/${number(input, 'number')}` } as const;
     case 'create_branch':
