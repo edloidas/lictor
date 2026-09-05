@@ -100,7 +100,10 @@ indistinguishable from a revoked token.
 - **In tests, provide `Service.DefaultWithoutDependencies`, not
   `Service.Default`.** `Default` bakes in `FetchHttpClient.layer`, which wins over
   any client provided from outside — a suite using `Default` silently calls the
-  real api.github.com
+  real api.github.com. The bypassed stub is still constructed, so a log line in
+  its constructor is not evidence it is in use; only what it received is.
+  `test/service-wiring.test.ts` fails on any bare `.Default` of a service that
+  declares `dependencies:`
 - One decoder per `DeliverySource`, in `src/delivery-worker.ts`. Adding a producer
   means adding a member and the map forces its decoder into existence — nothing
   downstream assumes an envelope
