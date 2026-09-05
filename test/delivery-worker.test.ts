@@ -95,10 +95,13 @@ const services = (
   options: {
     readonly reactionStatus?: number;
     readonly firstRequestDelayMs?: number;
-    readonly requests?: string[];
+    // Every GitHub request the stub sees. Required, not optional: a test that
+    // cannot count requests cannot tell a stub that took from one that was
+    // bypassed, and both leave the suite green.
+    readonly requests: string[];
     readonly maxQueueDepth?: number;
     readonly queue?: (queue: WorkQueue) => WorkQueue;
-  } = {},
+  },
 ) => {
   const ConfigLive = Layer.succeed(LictorConfig, config);
   const QueueLive = Layer.effect(WorkQueue, Effect.map(WorkQueue, options.queue ?? identity)).pipe(
@@ -107,7 +110,7 @@ const services = (
   const IdentityLive = Layer.succeed(GitHubIdentity, GitHubIdentity.make({ verified }));
   let delayed = false;
   const client = HttpClient.make((request) => {
-    options.requests?.push(request.url);
+    options.requests.push(request.url);
     const respond = Effect.succeed(
       HttpClientResponse.fromWeb(
         request,
@@ -160,6 +163,7 @@ const run = (
   options: { readonly reactionStatus?: number } = {},
 ) => {
   const reactions: string[] = [];
+  const requests: string[] = [];
   return Effect.runPromise(
     Effect.scoped(
       Effect.gen(function* () {
@@ -184,12 +188,13 @@ const run = (
           status: yield* queue.deliveryStatus('delivery-1'),
           counts: yield* queue.counts,
           reactions,
+          requests,
           audit: yield* queue.auditLog(1),
           cursor: yield* queue.notificationCursor('14567'),
         };
       }).pipe(
         Effect.provide(Logger.remove(Logger.defaultLogger)),
-        Effect.provide(services(verified, reactions, options)),
+        Effect.provide(services(verified, reactions, { ...options, requests })),
       ),
     ),
   );
@@ -201,6 +206,7 @@ describe('DeliveryWorker', () => {
   // so a worker that never renews is reclaimed out from under itself here.
   it('renews the delivery lease while qualification runs', async () => {
     const reactions: string[] = [];
+    const requests: string[] = [];
     const result = await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
@@ -223,6 +229,7 @@ describe('DeliveryWorker', () => {
           Effect.provide(
             services(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }), reactions, {
               firstRequestDelayMs: 1500,
+              requests,
             }),
           ),
         ),
@@ -232,6 +239,7 @@ describe('DeliveryWorker', () => {
     expect(result.reclaimed).toBe(0);
     expect(result.processed).toBe(true);
     expect(result.status).toBe('completed');
+    expect(requests.length).toBeGreaterThan(0);
   });
 
   // The lease is a claim on the row, so losing it has to stop the work, not
@@ -289,6 +297,7 @@ describe('DeliveryWorker', () => {
   // landing near the end of processing costs the whole drain cycle.
   it('abandons a delivery stolen just before it finished', async () => {
     const reactions: string[] = [];
+    const requests: string[] = [];
     const result = await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
@@ -313,12 +322,14 @@ describe('DeliveryWorker', () => {
           Effect.provide(
             services(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }), reactions, {
               firstRequestDelayMs: 400,
+              requests,
             }),
           ),
         ),
       ),
     );
 
+    expect(requests.length).toBeGreaterThan(0);
     expect(result.stolen).toBe(1);
     expect(result.exit._tag).toBe('Success');
     // Not completed by the worker that lost it — the sweep's requeue stands.
@@ -330,6 +341,7 @@ describe('DeliveryWorker', () => {
 
     expect(result.processed).toBe(true);
     expect(result.status).toBe('completed');
+    expect(result.requests.length).toBeGreaterThan(0);
     expect(result.counts.pending).toBe(1);
     expect(result.audit.map((entry) => entry.capability)).toEqual(['react']);
     expect(result.audit[0]?.outcome).toBe('ok');
@@ -357,6 +369,7 @@ describe('DeliveryWorker', () => {
     );
 
     expect(result.status).toBe('completed');
+    expect(result.requests.length).toBeGreaterThan(0);
     expect(result.counts.pending).toBe(1);
     expect(result.audit[0]?.outcome).toBe('react_failed');
   });
@@ -405,6 +418,7 @@ describe('DeliveryWorker', () => {
     // stub parked on a real timer would let the clock warp before the cap sleep
     // is registered. Hold on the refund: it is the last write before that sleep.
     const refunded = await Effect.runPromise(Queue.unbounded<void>());
+    const requests: string[] = [];
     const result = await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
@@ -432,6 +446,7 @@ describe('DeliveryWorker', () => {
           Effect.provide(Logger.remove(Logger.defaultLogger)),
           Effect.provide(
             services(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }), [], {
+              requests,
               maxQueueDepth: 1,
               queue: (queue) =>
                 WorkQueue.make({
@@ -452,6 +467,7 @@ describe('DeliveryWorker', () => {
       { early: 'None', done: 'Some' },
       { early: 'None', done: 'Some' },
     ]);
+    expect(requests.length).toBeGreaterThan(0);
     // Two refunded passes leave the row where a fresh claim finds attempt 1.
     expect(result.next).toMatchObject({ id: 'delivery-1', status: 'processing', attempts: 1 });
   });
