@@ -30,6 +30,46 @@ export class ProcessError extends Data.TaggedError('ProcessError')<{
 
 type Captured = { readonly text: string; readonly truncated: boolean };
 
+const sequenceWidth = (lead: number): number => {
+  if (lead < 0x80) return 1;
+  if (lead < 0xe0) return 2;
+  if (lead < 0xf0) return 3;
+  return 4;
+};
+
+/** Drops the partial character a cut sized in bytes leaves at the retained edge. */
+const repairEdge = (bytes: Buffer, keep: 'head' | 'tail'): Buffer => {
+  const continuation = (index: number) => ((bytes[index] ?? 0) & 0xc0) === 0x80;
+
+  if (keep === 'tail') {
+    let start = 0;
+    while (start < bytes.length && continuation(start)) start += 1;
+    return bytes.subarray(start);
+  }
+
+  let lead = bytes.length - 1;
+  while (lead >= 0 && continuation(lead)) lead -= 1;
+  if (lead < 0) return bytes.subarray(0, 0);
+  const width = sequenceWidth(bytes[lead] ?? 0);
+  return lead + width > bytes.length ? bytes.subarray(0, lead) : bytes;
+};
+
+const fitToBudget = (bytes: Buffer, limit: number, keep: 'head' | 'tail'): string => {
+  const cut = (source: Buffer) =>
+    source.length <= limit
+      ? source
+      : repairEdge(
+          keep === 'head' ? source.subarray(0, limit) : source.subarray(source.length - limit),
+          keep,
+        );
+
+  const text = cut(bytes).toString('utf8');
+  // Each byte that is not valid UTF-8 decodes to a 3-byte U+FFFD, so a cut
+  // sized in raw bytes can still overshoot. Re-encoding yields valid UTF-8,
+  // where one more cut is exact — never a byte-at-a-time search.
+  return Buffer.byteLength(text) <= limit ? text : cut(Buffer.from(text, 'utf8')).toString('utf8');
+};
+
 const capture = (
   stream: ReadableStream<Uint8Array>,
   limit: number,
@@ -48,25 +88,12 @@ const capture = (
     }).pipe(
       Effect.flatMap((result) => {
         if (result.done) {
-          let kept = Buffer.concat(chunks);
-          // The ring evicts whole chunks, so it can overshoot by a full chunk
-          // — up to 256 KiB from a Bun pipe — trimmed here in one slice
-          // instead of a byte per decode below. A cut inside a character
-          // orphans continuation bytes, and the single U+FFFD they decode to
-          // is small enough to pass the byte-length check below, so they are
-          // skipped before it runs.
-          if (keep === 'tail' && kept.length > limit) {
-            kept = kept.subarray(kept.length - limit);
-            let start = 0;
-            while (start < kept.length && ((kept[start] ?? 0) & 0xc0) === 0x80) start += 1;
-            kept = kept.subarray(start);
-          }
-          let text = kept.toString('utf8');
-          while (Buffer.byteLength(text) > limit && kept.length > 0) {
-            kept = keep === 'head' ? kept.subarray(0, -1) : kept.subarray(1);
-            text = kept.toString('utf8');
-          }
-          return Effect.succeed({ text, truncated });
+          // The ring evicts whole chunks, so what is held can overshoot the
+          // budget by a full chunk — up to 256 KiB from a Bun pipe.
+          return Effect.succeed({
+            text: fitToBudget(Buffer.concat(chunks), limit, keep),
+            truncated,
+          });
         }
 
         const chunk = result.value;
