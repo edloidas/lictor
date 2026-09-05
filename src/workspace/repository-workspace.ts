@@ -209,6 +209,9 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
           input: '',
           timeoutMs,
           outputLimitBytes: OUTPUT_LIMIT_BYTES,
+          // git fails fast and its prose never approaches the budget, so the
+          // head is both what it has always kept and where its refusal is.
+          stderrRetention: 'head',
           env: env ?? {
             PATH: process.env.PATH ?? '/usr/bin:/bin',
             HOME: '/var/empty',

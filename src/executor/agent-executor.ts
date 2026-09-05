@@ -110,8 +110,8 @@ const exitFailure = (
   if (diagnosis !== undefined) {
     return new ExecutorError({ message: `${status}: ${diagnosis}`, retryable: false });
   }
-  // `capture` keeps the head, so a signature emitted late in a long session is
-  // dropped first — "none matched" and "none survived" are different facts.
+  // stderr keeps the tail, so a dropped signature is one emitted before the
+  // last `outputLimitBytes` — "none matched" and "none survived" still differ.
   return new ExecutorError({
     message: result.stderrTruncated
       ? `${status}: cause undetermined, its diagnostics exceeded the ${outputLimitBytes}-byte output budget (LICTOR_EXECUTOR_OUTPUT_BYTES)`
@@ -229,6 +229,10 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                   )}\n\nReturn only JSON matching {"status":"completed|needs_input|rejected|failed","summary":"bounded summary","artifacts":["relative/path"]}.`,
                 timeoutMs: budgetMs,
                 outputLimitBytes: config.executorOutputBytes,
+                // `codex exec` writes its whole transcript here and names a
+                // permanent failure at the point it happens, so the tail is
+                // the half worth keeping.
+                stderrRetention: 'tail',
                 env: {
                   PATH: process.env.PATH ?? '/usr/bin:/bin',
                   HOME: workdir,

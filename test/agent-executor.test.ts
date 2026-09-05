@@ -417,6 +417,7 @@ describe('AgentExecutor', () => {
       '-',
     ]);
     expect(request.request?.input).toContain('$(touch /tmp/nope)');
+    expect(request.request?.stderrRetention).toBe('tail');
     expect(request.request?.cwd).toBe('/tmp/lictor-workspace');
     // Exhaustive rather than a denylist: a variable added to the spawn has to be
     // declared here before it can reach an agent running repository-authored commands.

@@ -6,6 +6,12 @@ export type ProcessRequest = {
   readonly input: string;
   readonly timeoutMs: number;
   readonly outputLimitBytes: number;
+  /**
+   * Which end of stderr survives the budget. Only the caller knows its
+   * producer: a process that reports its failure and exits puts the evidence
+   * at the end, one that refuses at startup puts it at the beginning.
+   */
+  readonly stderrRetention: 'head' | 'tail';
   readonly env?: Readonly<Record<string, string>>;
 };
 
@@ -27,9 +33,11 @@ type Captured = { readonly text: string; readonly truncated: boolean };
 const capture = (
   stream: ReadableStream<Uint8Array>,
   limit: number,
+  keep: 'head' | 'tail',
 ): Effect.Effect<Captured, ProcessError> => {
   const reader = stream.getReader();
   let bytes = 0;
+  let held = 0;
   const chunks: Uint8Array[] = [];
   let truncated = false;
 
@@ -41,17 +49,39 @@ const capture = (
       Effect.flatMap((result) => {
         if (result.done) {
           let kept = Buffer.concat(chunks);
+          // The ring evicts whole chunks, so it can overshoot by a full chunk
+          // — up to 256 KiB from a Bun pipe — trimmed here in one slice
+          // instead of a byte per decode below. A cut inside a character
+          // orphans continuation bytes, and the single U+FFFD they decode to
+          // is small enough to pass the byte-length check below, so they are
+          // skipped before it runs.
+          if (keep === 'tail' && kept.length > limit) {
+            kept = kept.subarray(kept.length - limit);
+            let start = 0;
+            while (start < kept.length && ((kept[start] ?? 0) & 0xc0) === 0x80) start += 1;
+            kept = kept.subarray(start);
+          }
           let text = kept.toString('utf8');
           while (Buffer.byteLength(text) > limit && kept.length > 0) {
-            kept = kept.subarray(0, -1);
+            kept = keep === 'head' ? kept.subarray(0, -1) : kept.subarray(1);
             text = kept.toString('utf8');
           }
           return Effect.succeed({ text, truncated });
         }
 
         const chunk = result.value;
-        const remaining = Math.max(0, limit - bytes);
-        if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
+        if (keep === 'head') {
+          const remaining = Math.max(0, limit - bytes);
+          if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
+        } else {
+          chunks.push(chunk);
+          held += chunk.byteLength;
+          // Evicts whole chunks the budget no longer needs, so what is held
+          // stays within one chunk of the limit rather than growing with the stream.
+          while (chunks.length > 1 && held - (chunks[0]?.byteLength ?? 0) >= limit) {
+            held -= chunks.shift()?.byteLength ?? 0;
+          }
+        }
         bytes += chunk.byteLength;
         if (bytes > limit) truncated = true;
         return read;
@@ -85,8 +115,9 @@ export class ProcessRunner extends Effect.Service<ProcessRunner>()('ProcessRunne
                 try: () => process.exited,
                 catch: (cause) => new ProcessError({ message: 'Process wait failed', cause }),
               }),
-              stdout: capture(process.stdout, request.outputLimitBytes),
-              stderr: capture(process.stderr, request.outputLimitBytes),
+              // stdout is parsed, so it must stay a contiguous head.
+              stdout: capture(process.stdout, request.outputLimitBytes, 'head'),
+              stderr: capture(process.stderr, request.outputLimitBytes, request.stderrRetention),
             },
             { concurrency: 'unbounded' },
           ).pipe(
