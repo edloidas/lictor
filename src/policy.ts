@@ -56,6 +56,8 @@ const PolicyDocument = Schema.Struct({
       costs: Schema.optional(Costs),
       /** How long a thread stays open to replies from untrusted participants. */
       livenessHours: Schema.optional(Schema.Number),
+      /** How long a job waits for an operator's approval before expiring. */
+      approvalExpiryHours: Schema.optional(Schema.Number),
     }),
   ),
 });
@@ -171,6 +173,16 @@ export type AutomationPolicy = {
   readonly maxJobAgeMs: number;
   /** How long a trusted trigger keeps its thread open to untrusted replies. */
   readonly livenessMs: number;
+  /**
+   * How long a job may wait for an operator's approval. Separate from
+   * `maxJobAgeMs`, which bounds work that is already runnable — a person is
+   * slower than a queue, and waiting spends no execution attempt.
+   *
+   * Enforced by the maintenance sweep, not by `approve`, so it is the point
+   * after which a hold *becomes* collectable rather than a hard cutoff on the
+   * operator: an approval landing before the sweep still takes.
+   */
+  readonly approvalExpiryMs: number;
   readonly forRepository: (repository: string) => RepositoryPolicy;
 };
 
@@ -285,6 +297,9 @@ const makePolicy = (
       ) * 60_000,
     livenessMs:
       positiveLimit(document.limits?.livenessHours, 24, 720, 'limits.livenessHours') * 3_600_000,
+    approvalExpiryMs:
+      positiveLimit(document.limits?.approvalExpiryHours, 72, 720, 'limits.approvalExpiryHours') *
+      3_600_000,
     forRepository,
   };
 };

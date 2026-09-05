@@ -205,6 +205,8 @@ const Application = Layer.merge(
               .maintenance(
                 now - policy.completedRetentionDays * 86_400_000,
                 now - policy.failedRetentionDays * 86_400_000,
+                now,
+                policy.approvalExpiryMs,
               )
               .pipe(
                 // Interrupt-only means shutdown, as in `sweepSessions`; described
