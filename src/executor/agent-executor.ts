@@ -1,8 +1,9 @@
 import { mkdirSync } from 'node:fs';
 import { lstat } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { Cause, Data, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
+import { AgentListener } from '../control/agent-listener.ts';
 import { describeCause } from '../diagnostics.ts';
 import type { WorkItem } from '../work-item.ts';
 import { type ProcessResult, ProcessRunner } from './process-runner.ts';
@@ -135,8 +136,8 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
   effect: Effect.gen(function* () {
     const config = yield* LictorConfig;
     const processes = yield* ProcessRunner;
+    const listener = yield* AgentListener;
     const mcpClientPath = join(import.meta.dir, '../github/mcp-client.ts');
-    const controlSocketPath = resolve(config.controlSocketPath);
     const codexHome =
       config.codexHome ||
       // Follows daemon state by default: `~/.lictor/codex` is the path
@@ -184,63 +185,66 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
 
       const budgetMs = Math.min(timeoutMs, config.executorTimeoutMs);
 
-      return Effect.flatMap(readSoul, (soul) =>
-        Effect.logInfo('Starting agent process').pipe(
-          Effect.annotateLogs({
-            ...(jobId === undefined ? {} : { job: jobId, attempt: attemptNumber }),
-            timeoutMs: budgetMs,
-          }),
-          Effect.zipRight(
-            processes.run({
-              command: [
-                'codex',
-                'exec',
-                '--ephemeral',
-                '--color',
-                'never',
-                '--model',
-                config.codexModel,
-                ...(jobId === undefined
-                  ? []
-                  : [
-                      '-c',
-                      'mcp_servers.lictor.command="bun"',
-                      '-c',
-                      `mcp_servers.lictor.args=${JSON.stringify([
-                        mcpClientPath,
-                        controlSocketPath,
-                        String(jobId),
-                        String(attemptNumber),
-                        workerId ?? '',
-                      ])}`,
-                    ]),
-                // --approve-for-me implies workspace-write; adding --sandbox is a
-                // clap conflict on codex >= 0.147.
-                '--approve-for-me',
-                '--cd',
-                workdir,
-                '-',
-              ],
-              cwd: workdir,
-              input: `${[soul, buildPrompt(work)]
-                .filter(Boolean)
-                .join(
-                  '\n\n',
-                )}\n\nReturn only JSON matching {"status":"completed|needs_input|rejected|failed","summary":"bounded summary","artifacts":["relative/path"]}.`,
+      const run = (mcpArgs: readonly string[]) =>
+        Effect.flatMap(readSoul, (soul) =>
+          Effect.logInfo('Starting agent process').pipe(
+            Effect.annotateLogs({
+              ...(jobId === undefined ? {} : { job: jobId, attempt: attemptNumber }),
               timeoutMs: budgetMs,
-              outputLimitBytes: config.executorOutputBytes,
-              env: {
-                PATH: process.env.PATH ?? '/usr/bin:/bin',
-                HOME: workdir,
-                LANG: process.env.LANG ?? 'C.UTF-8',
-                CODEX_HOME: codexHome,
-                // Token-free, non-interactive: git must fail fast on a credential
-                // need instead of blocking on a prompt until the executor timeout.
-                GIT_TERMINAL_PROMPT: '0',
-              },
             }),
+            Effect.zipRight(
+              processes.run({
+                command: [
+                  'codex',
+                  'exec',
+                  '--ephemeral',
+                  '--color',
+                  'never',
+                  '--model',
+                  config.codexModel,
+                  ...mcpArgs,
+                  // --approve-for-me implies workspace-write; adding --sandbox is a
+                  // clap conflict on codex >= 0.147.
+                  '--approve-for-me',
+                  '--cd',
+                  workdir,
+                  '-',
+                ],
+                cwd: workdir,
+                input: `${[soul, buildPrompt(work)]
+                  .filter(Boolean)
+                  .join(
+                    '\n\n',
+                  )}\n\nReturn only JSON matching {"status":"completed|needs_input|rejected|failed","summary":"bounded summary","artifacts":["relative/path"]}.`,
+                timeoutMs: budgetMs,
+                outputLimitBytes: config.executorOutputBytes,
+                env: {
+                  PATH: process.env.PATH ?? '/usr/bin:/bin',
+                  HOME: workdir,
+                  LANG: process.env.LANG ?? 'C.UTF-8',
+                  CODEX_HOME: codexHome,
+                  // Token-free, non-interactive: git must fail fast on a credential
+                  // need instead of blocking on a prompt until the executor timeout.
+                  GIT_TERMINAL_PROMPT: '0',
+                },
+              }),
+            ),
           ),
-        ),
+        );
+
+      return (
+        jobId === undefined || attemptNumber === undefined || workerId === undefined
+          ? run([])
+          : Effect.scoped(
+              Effect.flatMap(listener.open(jobId, attemptNumber, workerId), ({ path }) =>
+                run([
+                  '-c',
+                  'mcp_servers.lictor.command="bun"',
+                  '-c',
+                  `mcp_servers.lictor.args=${JSON.stringify([mcpClientPath, path])}`,
+                ]),
+              ),
+            )
       ).pipe(
         Effect.flatMap((result) =>
           result.exitCode === 0
@@ -291,5 +295,5 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
 
     return { enabled: config.executor !== 'disabled', execute };
   }),
-  dependencies: [LictorConfig.Default, ProcessRunner.Default],
+  dependencies: [LictorConfig.Default, ProcessRunner.Default, AgentListener.Default],
 }) {}

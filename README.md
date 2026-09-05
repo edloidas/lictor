@@ -33,6 +33,12 @@ Nothing needs to reach the machine from outside. Only the minimal `GET /health`
 liveness endpoint is public; readiness and management use an owner-only local
 Unix socket.
 
+The agent never shares that socket. Each job attempt gets its own short-lived
+socket under `~/.lictor/agent/`, serving the agent's capability calls and nothing
+else — no operator command is reachable from it, and it is removed when the
+attempt ends. The job it speaks for is fixed by the daemon when the socket is
+opened, so the agent has no way to name a different one.
+
 ## Start safely
 
 ```bash

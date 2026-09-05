@@ -2,7 +2,6 @@ import { chmodSync, mkdirSync, statfsSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Clock, Data, Effect } from 'effect';
 import { LictorConfig } from '../config.ts';
-import { CapabilityBroker } from '../github/capability-broker.ts';
 import { CredentialHealth } from '../github/credential-health.ts';
 import { Policy } from '../policy.ts';
 import { WorkQueue } from '../queue/work-queue.ts';
@@ -35,7 +34,6 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
     const config = yield* LictorConfig;
     const policy = yield* Policy;
     const queue = yield* WorkQueue;
-    const broker = yield* CapabilityBroker;
     const health = yield* CredentialHealth;
 
     const mutate = (action: 'approve' | 'cancel' | 'retry', id: number) =>
@@ -132,27 +130,6 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
             }
             return yield* queue.backup(destination);
           }
-          case 'capability.mcp': {
-            const jobId = yield* positiveId(args[0]);
-            const attemptNumber = yield* positiveId(args[1]);
-            const workerId = args[2];
-            if (workerId === undefined || workerId === '') {
-              return yield* new ControlError({
-                code: 'CONTROL_WORKER_ID_INVALID',
-                message: 'A worker id is required',
-              });
-            }
-            const mcp = yield* Effect.try({
-              try: () => JSON.parse(args[3] ?? '') as Parameters<typeof broker.handleMcp>[3],
-              catch: (cause) =>
-                new ControlError({
-                  code: 'CONTROL_CAPABILITY_REQUEST_INVALID',
-                  message: 'Invalid MCP request',
-                  cause,
-                }),
-            });
-            return yield* broker.handleMcp(jobId, attemptNumber, workerId, mcp);
-          }
           default:
             return yield* new ControlError({
               code: 'CONTROL_COMMAND_UNKNOWN',
@@ -162,13 +139,7 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
       });
     return { execute };
   }),
-  dependencies: [
-    LictorConfig.Default,
-    Policy.Default,
-    WorkQueue.Default,
-    CapabilityBroker.Default,
-    CredentialHealth.Default,
-  ],
+  dependencies: [LictorConfig.Default, Policy.Default, WorkQueue.Default, CredentialHealth.Default],
 }) {}
 
 export class ControlServer extends Effect.Service<ControlServer>()('ControlServer', {

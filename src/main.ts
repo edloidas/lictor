@@ -2,6 +2,7 @@ import { FetchHttpClient } from '@effect/platform';
 import { BunHttpServer, BunRuntime } from '@effect/platform-bun';
 import { Cause, Clock, Effect, Layer } from 'effect';
 import { LictorConfig, legacyStateConflict, port } from './config.ts';
+import { AgentListener } from './control/agent-listener.ts';
 import { ControlPlane, ControlServer } from './control/control-plane.ts';
 import { credentialExpiryWatch, supervisedMaintenanceLoop } from './daemon-tick.ts';
 import { DeliveryWorker } from './delivery-worker.ts';
@@ -24,9 +25,6 @@ import { DiskStat, RepositoryWorkspace } from './workspace/repository-workspace.
 const ConfigLive = LictorConfig.Default;
 const PolicyLive = Policy.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
 const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
-const ExecutorLive = AgentExecutor.DefaultWithoutDependencies.pipe(
-  Layer.provide(Layer.merge(ConfigLive, ProcessRunner.Default)),
-);
 const CredentialLive = GitHubCredential.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
 const ClientLive = GitHubClient.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.merge(CredentialLive, FetchHttpClient.layer)),
@@ -44,10 +42,16 @@ const BrokerLive = CapabilityBroker.DefaultWithoutDependencies.pipe(
     Layer.mergeAll(ClientLive, IdentityLive, PolicyLive, QueueLive, CredentialHealth.Default),
   ),
 );
+const AgentListenerLive = AgentListener.DefaultWithoutDependencies.pipe(
+  Layer.provide(Layer.merge(ConfigLive, BrokerLive)),
+);
+const ExecutorLive = AgentExecutor.DefaultWithoutDependencies.pipe(
+  Layer.provide(Layer.mergeAll(ConfigLive, ProcessRunner.Default, AgentListenerLive)),
+);
+// The broker is reachable only from the agent's own listener. The operator plane
+// does not depend on it, so no operator command can route into a capability.
 const ControlLive = ControlPlane.DefaultWithoutDependencies.pipe(
-  Layer.provide(
-    Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, BrokerLive, CredentialHealth.Default),
-  ),
+  Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, CredentialHealth.Default)),
 );
 const ControlServerLive = ControlServer.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.merge(ConfigLive, ControlLive)),
