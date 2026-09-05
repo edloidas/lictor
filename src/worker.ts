@@ -2,7 +2,7 @@ import { Clock, Effect, Exit, PartitionedSemaphore, Ref } from 'effect';
 import { LictorConfig } from './config.ts';
 import { AgentExecutor, ExecutorError } from './executor/agent-executor.ts';
 import { CredentialHealth } from './github/credential-health.ts';
-import { canonicalRepository, Policy } from './policy.ts';
+import { canonicalRepository, Policy, policyRefusal } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 import { RepositoryWorkspace, WorkspaceError } from './workspace/repository-workspace.ts';
 
@@ -64,21 +64,21 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         ref = `refs/pull/${job.work.subject.number}/head`;
       }
       const policyTime = yield* Clock.currentTimeMillis;
-      if (
-        !repositoryPolicy.accepted ||
-        repositoryPolicy.execution === 'denied' ||
-        (repositoryPolicy.execution === 'approval' && job.work.approvalRequired !== false) ||
-        job.attempts > repositoryPolicy.maxAttempts ||
-        // From `readyAt`, not `createdAt` — held time must not count against
-        // this gate.
-        policyTime - job.readyAt > policy.maxJobAgeMs
-      ) {
-        yield* queue.fail(job.id, job.attempts, 'POLICY_COST_LIMIT');
+      const refusal = policyRefusal({
+        repository: repositoryPolicy,
+        attempts: job.attempts,
+        readyAt: job.readyAt,
+        approvalRequired: job.work.approvalRequired,
+        maxJobAgeMs: policy.maxJobAgeMs,
+        now: policyTime,
+      });
+      if (refusal !== undefined) {
+        yield* queue.fail(job.id, job.attempts, refusal);
         yield* Effect.logWarning('Dropped queued work denied by policy').pipe(
           Effect.annotateLogs({
             job: job.id,
             attempt: job.attempts,
-            errorCode: 'POLICY_COST_LIMIT',
+            errorCode: refusal,
             durationMs: policyTime - claimedAt,
           }),
         );

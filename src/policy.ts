@@ -186,6 +186,39 @@ export type AutomationPolicy = {
   readonly forRepository: (repository: string) => RepositoryPolicy;
 };
 
+/** Stored as the job's last error and rendered verbatim by `job.show` and `job.list`. */
+export type PolicyRefusal =
+  | 'POLICY_REPOSITORY_NOT_ACCEPTED'
+  | 'POLICY_EXECUTION_DENIED'
+  | 'POLICY_APPROVAL_REQUIRED'
+  | 'POLICY_ATTEMPTS_EXHAUSTED'
+  | 'POLICY_JOB_TOO_OLD';
+
+export type PolicyGate = {
+  readonly repository: RepositoryPolicy;
+  readonly attempts: number;
+  /**
+   * When the job last became runnable, not when it was created — held time
+   * must not count against the age gate.
+   */
+  readonly readyAt: number;
+  /** Only an explicit `false` — an approval already granted — opens that gate. */
+  readonly approvalRequired: boolean | undefined;
+  readonly maxJobAgeMs: number;
+  readonly now: number;
+};
+
+/** The first gate closed against a job, or `undefined` when every gate is open. */
+export const policyRefusal = (gate: PolicyGate): PolicyRefusal | undefined => {
+  if (!gate.repository.accepted) return 'POLICY_REPOSITORY_NOT_ACCEPTED';
+  if (gate.repository.execution === 'denied') return 'POLICY_EXECUTION_DENIED';
+  if (gate.repository.execution === 'approval' && gate.approvalRequired !== false)
+    return 'POLICY_APPROVAL_REQUIRED';
+  if (gate.attempts > gate.repository.maxAttempts) return 'POLICY_ATTEMPTS_EXHAUSTED';
+  if (gate.now - gate.readyAt > gate.maxJobAgeMs) return 'POLICY_JOB_TOO_OLD';
+  return undefined;
+};
+
 const makePolicy = (
   document: PolicyDocument,
   /** The environment list, applied as default to owned repositories only. */

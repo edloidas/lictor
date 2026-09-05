@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import { Effect } from 'effect';
-import { PolicyError, parsePolicy } from '../src/policy.ts';
+import {
+  PolicyError,
+  type PolicyGate,
+  type PolicyRefusal,
+  parsePolicy,
+  policyRefusal,
+  type RepositoryPolicy,
+} from '../src/policy.ts';
 
 const parse = (source: string, senders: readonly string[] = []) =>
   Effect.runPromise(parsePolicy(source, senders));
@@ -216,5 +223,126 @@ execution = "automatic"
     expect(String(exit)).toContain('[\\"defaults\\"]');
     expect(String(exit)).toContain('[\\"execution\\"]');
     expect(String(exit)).toContain('automatic');
+  });
+});
+
+const repositoryPolicy = (overrides: Partial<RepositoryPolicy> = {}): RepositoryPolicy => ({
+  repository: 'edloidas/lictor',
+  accepted: true,
+  execution: 'automatic',
+  clone: 'denied',
+  capabilities: {
+    read: true,
+    comment: false,
+    issues: false,
+    branches: false,
+    pullRequests: false,
+    merge: false,
+    forcePush: false,
+    deleteBranches: false,
+    scripts: [],
+  },
+  trustedSenders: ['edloidas'],
+  maxAttempts: 3,
+  maxDurationMs: 30 * 60 * 1000,
+  ...overrides,
+});
+
+const gate = (overrides: Partial<PolicyGate> = {}): PolicyGate => ({
+  repository: repositoryPolicy(),
+  attempts: 1,
+  readyAt: 1_000,
+  approvalRequired: false,
+  maxJobAgeMs: 60_000,
+  now: 1_000,
+  ...overrides,
+});
+
+describe('policy refusal', () => {
+  test('refuses nothing while every gate is open', () => {
+    expect(policyRefusal(gate())).toBeUndefined();
+  });
+
+  test.each<readonly [string, PolicyGate, PolicyRefusal]>([
+    [
+      'a repository the allow and deny lists do not accept',
+      gate({ repository: repositoryPolicy({ accepted: false }) }),
+      'POLICY_REPOSITORY_NOT_ACCEPTED',
+    ],
+    [
+      'a repository whose execution is denied',
+      gate({ repository: repositoryPolicy({ execution: 'denied' }) }),
+      'POLICY_EXECUTION_DENIED',
+    ],
+    [
+      'an approval gate no operator has opened',
+      gate({ repository: repositoryPolicy({ execution: 'approval' }), approvalRequired: true }),
+      'POLICY_APPROVAL_REQUIRED',
+    ],
+    [
+      'an approval gate on work that never recorded an answer',
+      gate({
+        repository: repositoryPolicy({ execution: 'approval' }),
+        approvalRequired: undefined,
+      }),
+      'POLICY_APPROVAL_REQUIRED',
+    ],
+    ['an attempt past the repository limit', gate({ attempts: 4 }), 'POLICY_ATTEMPTS_EXHAUSTED'],
+    ['a job older than the age limit', gate({ now: 61_001 }), 'POLICY_JOB_TOO_OLD'],
+  ])('names the gate that closed on %s', (_name, closed, code) => {
+    expect(policyRefusal(closed)).toBe(code);
+  });
+
+  test('runs an approval-execution job whose approval was granted', () => {
+    expect(
+      policyRefusal(
+        gate({ repository: repositoryPolicy({ execution: 'approval' }), approvalRequired: false }),
+      ),
+    ).toBeUndefined();
+  });
+
+  test.each([
+    ['the final attempt the repository allows', gate({ attempts: 3 })],
+    ['a job aged exactly to the limit', gate({ now: 61_000 })],
+  ])('lets %s through', (_name, open) => {
+    expect(policyRefusal(open)).toBeUndefined();
+  });
+
+  // Opening the gates one at a time walks the whole order, so a reordered clause fails a row here.
+  test('reports the first closed gate when several are closed at once', () => {
+    const closed = {
+      accepted: false,
+      execution: 'denied',
+      maxAttempts: 1,
+    } satisfies Partial<RepositoryPolicy>;
+    const all = gate({
+      repository: repositoryPolicy(closed),
+      attempts: 2,
+      approvalRequired: true,
+      now: 61_001,
+    });
+
+    expect(policyRefusal(all)).toBe('POLICY_REPOSITORY_NOT_ACCEPTED');
+    expect(
+      policyRefusal({ ...all, repository: repositoryPolicy({ ...closed, accepted: true }) }),
+    ).toBe('POLICY_EXECUTION_DENIED');
+    expect(
+      policyRefusal({
+        ...all,
+        repository: repositoryPolicy({ ...closed, accepted: true, execution: 'approval' }),
+      }),
+    ).toBe('POLICY_APPROVAL_REQUIRED');
+    expect(
+      policyRefusal({
+        ...all,
+        repository: repositoryPolicy({ ...closed, accepted: true, execution: 'automatic' }),
+      }),
+    ).toBe('POLICY_ATTEMPTS_EXHAUSTED');
+    expect(
+      policyRefusal({
+        ...all,
+        repository: repositoryPolicy({ accepted: true, execution: 'automatic' }),
+      }),
+    ).toBe('POLICY_JOB_TOO_OLD');
   });
 });
