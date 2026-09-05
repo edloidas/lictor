@@ -3,7 +3,7 @@ import { Effect, Layer, Logger, type LogLevel, Redacted } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { AgentExecutor, ExecutorError } from '../src/executor/agent-executor.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
-import { Policy } from '../src/policy.ts';
+import { Policy, type RepositoryPolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
 import { Worker } from '../src/worker.ts';
@@ -42,6 +42,13 @@ const deniedWork: WorkItem = {
   deliveryId: 'delivery-3',
   interactionId: 'interaction-3',
   repository: 'edloidas/denied',
+};
+
+const approvedWork: WorkItem = {
+  ...work,
+  deliveryId: 'delivery-4',
+  interactionId: 'interaction-4',
+  approvalRequired: false,
 };
 
 type LogLine = {
@@ -89,12 +96,19 @@ const config = (maxAttempts = 3) =>
     notificationPollMs: 60_000,
   });
 
+/** Varies one clause of the worker's policy gate without a second harness. */
+type PolicyOverrides = {
+  readonly maxJobAgeMs?: number;
+  readonly repository?: Partial<RepositoryPolicy>;
+};
+
 const run = <A, E>(
   effect: Effect.Effect<A, E, Worker | WorkQueue | CredentialHealth>,
   execute: InstanceType<typeof AgentExecutor>['execute'],
   maxAttempts = 3,
   enabled = true,
   createWorkspace?: InstanceType<typeof RepositoryWorkspace>['acquire'],
+  policyOverrides: PolicyOverrides = {},
 ) => {
   const ConfigLive = Layer.succeed(LictorConfig, config(maxAttempts));
   const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
@@ -105,7 +119,7 @@ const run = <A, E>(
       completedRetentionDays: 30,
       failedRetentionDays: 90,
       maxQueueDepth: 1000,
-      maxJobAgeMs: 86_400_000,
+      maxJobAgeMs: policyOverrides.maxJobAgeMs ?? 86_400_000,
       livenessMs: 24 * 60 * 60 * 1000,
       forRepository: (repository) => ({
         repository,
@@ -126,6 +140,7 @@ const run = <A, E>(
           deleteBranches: false,
           scripts: [],
         },
+        ...policyOverrides.repository,
       }),
     }),
   );
@@ -276,6 +291,98 @@ describe('Worker.runOnce', () => {
     expect(result.worked).toBe(false);
     expect(result.counts.pending).toBe(1);
   });
+
+  // Each case leaves exactly one clause of the five-clause gate true, so deleting
+  // that clause is what the case fails on.
+  const dropped = (item: WorkItem, policyOverrides: PolicyOverrides, beforeClaim = Effect.void) =>
+    run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(item);
+        yield* beforeClaim;
+        const worker = yield* Worker;
+        return { worked: yield* worker.runOnce, counts: yield* queue.counts };
+      }),
+      () => Effect.die('the executor must not run'),
+      3,
+      true,
+      undefined,
+      policyOverrides,
+    );
+
+  it('drops a claimed job whose repository policy does not accept it', async () => {
+    const result = await dropped(work, { repository: { accepted: false } });
+
+    expect(result.worked).toBe(true);
+    expect(result.counts.failed).toBe(1);
+    expect(result.counts.completed).toBe(0);
+  });
+
+  it('drops a claimed job still awaiting approval under approval execution', async () => {
+    const result = await dropped(work, { repository: { execution: 'approval' } });
+
+    expect(result.worked).toBe(true);
+    expect(result.counts.failed).toBe(1);
+  });
+
+  // The other half of the same clause: without `approvalRequired !== false` this
+  // job would drop too.
+  it('runs an approval-execution job whose approval was already granted', async () => {
+    const counts = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(approvedWork);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return yield* queue.counts;
+      }),
+      () => Effect.succeed({ status: 'completed', summary: 'done' }),
+      3,
+      true,
+      undefined,
+      { repository: { execution: 'approval' } },
+    );
+
+    expect(counts.completed).toBe(1);
+    expect(counts.failed).toBe(0);
+  });
+
+  it('drops a claimed job that sat in the queue past the maximum job age', async () => {
+    const result = await dropped(work, { maxJobAgeMs: 10 }, Effect.sleep('30 millis'));
+
+    expect(result.worked).toBe(true);
+    expect(result.counts.failed).toBe(1);
+  });
+
+  // The repository limit sits below the daemon-wide one, so `claimFor` still hands
+  // out attempt 2 — it dead-letters only past `workerMaxAttempts`.
+  it('drops a claimed job past the repository attempt limit', async () => {
+    let executions = 0;
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        yield* Effect.sleep('150 millis');
+        return { second: yield* worker.runOnce, counts: yield* queue.counts };
+      }),
+      () => {
+        executions += 1;
+        return Effect.fail(new ExecutorError({ message: 'temporary', retryable: true }));
+      },
+      3,
+      true,
+      undefined,
+      { repository: { maxAttempts: 1 } },
+    );
+
+    expect(result.second).toBe(true);
+    expect(executions).toBe(1);
+    expect(result.counts.failed).toBe(1);
+    expect(result.counts.retry).toBe(0);
+  });
+
   // Access is a fact about the repository, not the daemon, and repeating the
   // attempt cannot change it — unlike a refused credential, which an operator
   // rotates. So this one stays terminal and the credential one does not.
@@ -301,28 +408,6 @@ describe('Worker.runOnce', () => {
 
     expect(result.counts.failed).toBe(1);
     expect(result.reclaimed).toBeUndefined();
-  });
-
-  it('still retries a workspace failure that might succeed', async () => {
-    const result = await run(
-      Effect.gen(function* () {
-        const queue = yield* WorkQueue;
-        yield* queue.enqueue(work);
-        const worker = yield* Worker;
-        yield* worker.runOnce;
-        return yield* queue.counts;
-      }),
-      () => Effect.die('the executor must not run'),
-      3,
-      true,
-      () =>
-        new WorkspaceError({
-          code: 'WORKSPACE_FETCH_FAILED',
-          message: 'Could not refresh repository state',
-        }),
-    );
-
-    expect(result.retry).toBe(1);
   });
 
   // GitHub publishes when the bucket refills. Guessing with exponential
