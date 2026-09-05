@@ -110,7 +110,13 @@ const withHome = async <A>(body: (home: string) => Promise<A>): Promise<A> => {
   }
 };
 
-const ok = () => ({ exitCode: 0, stdout: '', stderr: '', outputTruncated: false });
+const ok = () => ({
+  exitCode: 0,
+  stdout: '',
+  stderr: '',
+  stdoutTruncated: false,
+  stderrTruncated: false,
+});
 
 type Acquire = InstanceType<typeof RepositoryWorkspace>['acquire'];
 

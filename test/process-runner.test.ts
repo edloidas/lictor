@@ -21,7 +21,8 @@ describe('ProcessRunner', () => {
       exitCode: 0,
       stdout: 'abcde',
       stderr: '',
-      outputTruncated: true,
+      stdoutTruncated: true,
+      stderrTruncated: false,
     });
   });
 
@@ -40,6 +41,42 @@ describe('ProcessRunner', () => {
     );
 
     expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1);
-    expect(result.outputTruncated).toBe(true);
+    expect(result.stdoutTruncated).toBe(true);
+  });
+
+  it('does not report truncation when output exactly fills the budget', async () => {
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runner = yield* ProcessRunner;
+        return yield* runner.run({
+          command: ['bun', '-e', "process.stdout.write('abcde')"],
+          cwd: process.cwd(),
+          input: '',
+          timeoutMs: 5000,
+          outputLimitBytes: 5,
+        });
+      }).pipe(Effect.provide(ProcessRunner.Default)),
+    );
+
+    expect(result.stdout).toBe('abcde');
+    expect(result.stdoutTruncated).toBe(false);
+  });
+
+  it('reports truncation per stream', async () => {
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runner = yield* ProcessRunner;
+        return yield* runner.run({
+          command: ['bun', '-e', "process.stdout.write('ab');process.stderr.write('abcdefghij')"],
+          cwd: process.cwd(),
+          input: '',
+          timeoutMs: 5000,
+          outputLimitBytes: 5,
+        });
+      }).pipe(Effect.provide(ProcessRunner.Default)),
+    );
+
+    expect(result.stdoutTruncated).toBe(false);
+    expect(result.stderrTruncated).toBe(true);
   });
 });
