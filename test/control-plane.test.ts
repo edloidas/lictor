@@ -5,7 +5,6 @@ import { join } from 'node:path';
 import { Effect, Layer, Redacted } from 'effect';
 import { LictorConfig } from '../src/config.ts';
 import { ControlPlane, type ControlRequest, ControlServer } from '../src/control/control-plane.ts';
-import { CapabilityBroker } from '../src/github/capability-broker.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
@@ -85,16 +84,10 @@ describe('local control plane', () => {
     );
     const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
     const HealthLive = CredentialHealth.Default;
-    const BrokerLive = Layer.succeed(
-      CapabilityBroker,
-      CapabilityBroker.make({
-        callTool: () => Effect.die('unused'),
-        handleMcp: () => Effect.die('unused'),
-        listTools: [],
-      }),
-    );
+    // No broker is provided; ControlPlane no longer depends on one, so
+    // `capability.mcp` below is expected to come back unrecognized.
     const PlaneLive = ControlPlane.DefaultWithoutDependencies.pipe(
-      Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, BrokerLive, HealthLive)),
+      Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, HealthLive)),
     );
     const ServerLive = ControlServer.DefaultWithoutDependencies.pipe(
       Layer.provide(Layer.merge(ConfigLive, PlaneLive)),
@@ -113,9 +106,14 @@ describe('local control plane', () => {
               args: [String(enqueued.jobId)],
             });
             const status = yield* call(server.path, { command: 'status' });
+            const capability = yield* call(server.path, {
+              command: 'capability.mcp',
+              args: ['1', '1', 'worker-a', '{"jsonrpc":"2.0","id":1,"method":"tools/call"}'],
+            });
             return {
               approved: JSON.parse(approved),
               status: JSON.parse(status),
+              capability: JSON.parse(capability),
               claimed: yield* queue.claim,
               mode: statSync(server.path).mode & 0o777,
             };
@@ -126,6 +124,10 @@ describe('local control plane', () => {
       expect(result.status).toMatchObject({
         ok: true,
         result: { executor: 'disabled', credentialRejected: true },
+      });
+      expect(result.capability).toMatchObject({
+        ok: false,
+        error: { code: 'CONTROL_COMMAND_UNKNOWN' },
       });
       expect(result.claimed?.work.approvalRequired).toBe(false);
       expect(result.mode).toBe(0o600);

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Effect, Layer, Logger, type LogLevel, Redacted, Ref } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
+import { AgentListener } from '../src/control/agent-listener.ts';
 import { AgentExecutor, buildPrompt } from '../src/executor/agent-executor.ts';
 import { type ProcessRequest, ProcessRunner } from '../src/executor/process-runner.ts';
 import type { WorkItem } from '../src/work-item.ts';
@@ -94,6 +95,12 @@ const runWith = <A, E>(
     effect.pipe(
       Effect.provide(AgentExecutor.DefaultWithoutDependencies),
       Effect.provideService(ProcessRunner, runner),
+      // Stands in for the per-attempt socket; the executor only passes the path
+      // it returns through to the agent's MCP argv.
+      Effect.provideService(
+        AgentListener,
+        AgentListener.make({ open: () => Effect.succeed({ path: '/tmp/lictor-agent-test.sock' }) }),
+      ),
       Effect.provideService(LictorConfig, config(executor, databasePath)),
       Effect.provide(logger),
     ),

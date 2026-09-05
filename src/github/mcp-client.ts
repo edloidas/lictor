@@ -1,13 +1,7 @@
 export {};
 
-const [socketPath, jobId, attemptNumber, workerId] = process.argv.slice(2);
-if (
-  socketPath === undefined ||
-  jobId === undefined ||
-  attemptNumber === undefined ||
-  workerId === undefined
-)
-  process.exit(2);
+const [socketPath] = process.argv.slice(2);
+if (socketPath === undefined) process.exit(2);
 
 const forward = (request: unknown) =>
   new Promise<string>((resolve, reject) => {
@@ -16,9 +10,7 @@ const forward = (request: unknown) =>
       unix: socketPath,
       socket: {
         open(socket) {
-          socket.write(
-            `${JSON.stringify({ command: 'capability.mcp', args: [jobId, attemptNumber, workerId, JSON.stringify(request)] })}\n`,
-          );
+          socket.write(`${JSON.stringify({ mcp: request })}\n`);
         },
         data(_socket, data) {
           output += Buffer.from(data).toString('utf8');
