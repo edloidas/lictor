@@ -377,16 +377,16 @@ describe('Worker.runOnce', () => {
     expect(result.counts.pending).toBe(1);
   });
 
-  // Each case leaves exactly one clause of the five-clause gate true, so deleting
-  // that clause is what the case fails on.
+  // Each case closes exactly one gate, so the stored code — not the count — says which fired.
   const dropped = (item: WorkItem, policyOverrides: PolicyOverrides, beforeClaim = Effect.void) =>
     run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
-        yield* queue.enqueue(item);
+        const { jobId } = yield* queue.enqueue(item);
         yield* beforeClaim;
         const worker = yield* Worker;
-        return { worked: yield* worker.runOnce, counts: yield* queue.counts };
+        const worked = yield* worker.runOnce;
+        return { worked, counts: yield* queue.counts, job: yield* queue.job(jobId) };
       }),
       () => Effect.die('the executor must not run'),
       3,
@@ -401,6 +401,15 @@ describe('Worker.runOnce', () => {
     expect(result.worked).toBe(true);
     expect(result.counts.failed).toBe(1);
     expect(result.counts.completed).toBe(0);
+    expect(result.job?.lastError).toBe('POLICY_REPOSITORY_NOT_ACCEPTED');
+  });
+
+  it('drops a claimed job whose repository policy denies execution', async () => {
+    const result = await dropped(deniedWork, {});
+
+    expect(result.worked).toBe(true);
+    expect(result.counts.failed).toBe(1);
+    expect(result.job?.lastError).toBe('POLICY_EXECUTION_DENIED');
   });
 
   it('drops a claimed job still awaiting approval under approval execution', async () => {
@@ -408,6 +417,7 @@ describe('Worker.runOnce', () => {
 
     expect(result.worked).toBe(true);
     expect(result.counts.failed).toBe(1);
+    expect(result.job?.lastError).toBe('POLICY_APPROVAL_REQUIRED');
   });
 
   // The other half of the same clause: without `approvalRequired !== false` this
@@ -437,6 +447,7 @@ describe('Worker.runOnce', () => {
 
     expect(result.worked).toBe(true);
     expect(result.counts.failed).toBe(1);
+    expect(result.job?.lastError).toBe('POLICY_JOB_TOO_OLD');
   });
 
   // The repository limit sits below the daemon-wide one, so `claimFor` still hands
@@ -446,11 +457,12 @@ describe('Worker.runOnce', () => {
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
-        yield* queue.enqueue(work);
+        const { jobId } = yield* queue.enqueue(work);
         const worker = yield* Worker;
         yield* worker.runOnce;
         yield* Effect.sleep('150 millis');
-        return { second: yield* worker.runOnce, counts: yield* queue.counts };
+        const second = yield* worker.runOnce;
+        return { second, counts: yield* queue.counts, job: yield* queue.job(jobId) };
       }),
       () => {
         executions += 1;
@@ -466,6 +478,7 @@ describe('Worker.runOnce', () => {
     expect(executions).toBe(1);
     expect(result.counts.failed).toBe(1);
     expect(result.counts.retry).toBe(0);
+    expect(result.job?.lastError).toBe('POLICY_ATTEMPTS_EXHAUSTED');
   });
 
   // Access is a fact about the repository, not the daemon, and repeating the
@@ -722,7 +735,7 @@ describe('Worker.runOnce observability', () => {
     );
 
     const annotations = annotationsOf(logs, 'Dropped queued work denied by policy');
-    expect(annotations?.errorCode).toBe('POLICY_COST_LIMIT');
+    expect(annotations?.errorCode).toBe('POLICY_EXECUTION_DENIED');
     expect(annotations?.durationMs).toBeTypeOf('number');
     // A dropped job is failed, never completed.
     expect(counts.failed).toBe(1);
