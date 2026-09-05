@@ -38,6 +38,13 @@ describe('repository automation policy', () => {
     expect(policy.maxQueueDepth).toBe(10_000);
     expect(policy.maxJobAgeMs).toBe(24 * 60 * 60 * 1000);
     expect(policy.livenessMs).toBe(24 * 60 * 60 * 1000);
+    expect(policy.approvalExpiryMs).toBe(72 * 60 * 60 * 1000);
+  });
+
+  test('reads the approval hold deadline in hours, apart from the runnable age limit', async () => {
+    const policy = await parse('[limits]\napprovalExpiryHours = 6\nmaxJobAgeMinutes = 60');
+    expect(policy.approvalExpiryMs).toBe(6 * 60 * 60 * 1000);
+    expect(policy.maxJobAgeMs).toBe(60 * 60 * 1000);
   });
 
   test('reserves the environment sender list for owned repositories', async () => {
@@ -194,6 +201,8 @@ execution = "automatic"
     ['excessive retention', '[retention]\nfailedDays = 3651'],
     ['invalid queue limit', '[limits]\nmaxQueueDepth = 0'],
     ['invalid repository cost', '[limits.costs]\nmaxDurationMinutes = 0'],
+    ['a zero approval hold', '[limits]\napprovalExpiryHours = 0'],
+    ['an approval hold past the cap', '[limits]\napprovalExpiryHours = 721'],
   ])('rejects %s', async (_name, source) => {
     const exit = await Effect.runPromiseExit(parsePolicy(source));
     expect(exit._tag).toBe('Failure');

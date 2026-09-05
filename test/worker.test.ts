@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { Effect, Layer, Logger, type LogLevel, Redacted } from 'effect';
+import { Effect, Layer, Logger, type LogLevel, Redacted, TestClock, TestContext } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { AgentExecutor, ExecutorError } from '../src/executor/agent-executor.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
@@ -121,6 +121,7 @@ const run = <A, E>(
       maxQueueDepth: 1000,
       maxJobAgeMs: policyOverrides.maxJobAgeMs ?? 86_400_000,
       livenessMs: 24 * 60 * 60 * 1000,
+      approvalExpiryMs: 72 * 60 * 60 * 1000,
       forRepository: (repository) => ({
         repository,
         accepted: true,
@@ -187,6 +188,90 @@ describe('Worker.runOnce', () => {
 
     expect(result.worked).toBe(true);
     expect(result.counts.completed).toBe(1);
+  });
+
+  it('does not record a refusal as a completion', async () => {
+    // The defect: `rejected` fell past the failure branch into `queue.complete`
+    // and logged "Completed queued work", so an agent that declined the request
+    // was stored as having done it — and pruned on the completed window.
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return { counts: yield* queue.counts, job: yield* queue.job(jobId) };
+      }),
+      () => Effect.succeed({ status: 'rejected', summary: 'I will not do this' }),
+    );
+
+    expect(result.counts.completed).toBe(0);
+    expect(result.job?.status).toBe('failed');
+    expect(result.job?.outcome).toBe('rejected');
+  });
+
+  it('finishes a question without spending every attempt on it', async () => {
+    // The defect: `needs_input` shared the failure branch but could never take
+    // its retry arm, so it landed terminal `failed` at attempt 1 regardless of
+    // the limit — indistinguishable from an execution failure. It is still
+    // terminal (a rerun without an answer just re-asks) but now says so.
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return {
+          secondRun: yield* worker.runOnce,
+          job: yield* queue.job(jobId),
+          counts: yield* queue.counts,
+        };
+      }),
+      () => Effect.succeed({ status: 'needs_input', summary: 'which branch?' }),
+      3,
+    );
+
+    expect(result.job?.status).toBe('failed');
+    expect(result.job?.outcome).toBe('needs_input');
+    expect(result.job?.attempts).toBe(1);
+    expect(result.counts.retry).toBe(0);
+    expect(result.secondRun).toBe(false);
+  });
+
+  it('runs a job approved after the runnable age limit instead of refusing it', async () => {
+    // The job is older than `maxJobAgeMs`, but it spent that time held for
+    // approval — the gate bounds runnable work, so the wait must not count.
+    // Before `ready_at` the gate read `created_at` and refused this on the
+    // first claim after approval, into a status `approve` rejects.
+    const executed: string[] = [];
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(
+          { ...work, approvalRequired: true },
+          10_000,
+          7 * 86_400_000,
+        );
+        // Twice the age limit below, so `created_at` alone condemns the job.
+        yield* TestClock.adjust('48 hours');
+        yield* queue.approve(jobId);
+        const worker = yield* Worker;
+        const worked = yield* worker.runOnce;
+        return { worked, job: yield* queue.job(jobId) };
+      }).pipe(Effect.provide(TestContext.TestContext)),
+      (item) => {
+        executed.push(item.deliveryId);
+        return Effect.succeed({ status: 'completed', summary: 'done' });
+      },
+      3,
+      true,
+      undefined,
+      { maxJobAgeMs: 24 * 60 * 60 * 1000 },
+    );
+
+    expect(executed).toEqual([work.deliveryId]);
+    expect(result.job?.status).toBe('completed');
+    expect(result.job?.lastError).toBeUndefined();
   });
 
   it('schedules retryable failures without immediately reclaiming them', async () => {

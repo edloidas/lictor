@@ -196,6 +196,249 @@ describe('WorkQueue', () => {
     expect(result.counts.pending).toBe(1);
   });
 
+  it('never claims an approval-required job on age alone', async () => {
+    // The claim used to admit one past `maxJobAgeMs` so it could be aged out.
+    // It reached the worker's policy gate instead, which failed it into a
+    // status `approve` refuses — so expiry destroyed the approval it was
+    // waiting for. Expiry is `maintenance`'s job now.
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue({ ...work('aged'), approvalRequired: true }, 10_000, 1);
+        yield* TestClock.adjust('1 hour');
+        return { claimed: yield* queue.claim, counts: yield* queue.counts };
+      }).pipe(Effect.provide(TestContext.TestContext)),
+    );
+    expect(result.claimed).toBeUndefined();
+    expect(result.counts.pending).toBe(1);
+    expect(result.counts.failed).toBe(0);
+  });
+
+  it('expires an unapproved job to its own outcome without spending an attempt', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(
+          { ...work('expiring'), approvalRequired: true },
+          10_000,
+          1,
+        );
+        yield* TestClock.adjust('1 hour');
+        const now = yield* Clock.currentTimeMillis;
+        const swept = yield* queue.maintenance(0, 0, now);
+        return { swept, job: yield* queue.job(jobId) };
+      }).pipe(Effect.provide(TestContext.TestContext)),
+    );
+    expect(result.swept.expired).toBe(1);
+    expect(result.job?.status).toBe('failed');
+    expect(result.job?.outcome).toBe('expired');
+    expect(result.job?.attempts).toBe(0);
+  });
+
+  it('leaves a held job alone until its deadline actually passes', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(
+          { ...work('still-waiting'), approvalRequired: true },
+          10_000,
+          60 * 60 * 1000,
+        );
+        yield* TestClock.adjust('30 minutes');
+        const now = yield* Clock.currentTimeMillis;
+        const swept = yield* queue.maintenance(0, 0, now);
+        return { swept, job: yield* queue.job(jobId) };
+      }).pipe(Effect.provide(TestContext.TestContext)),
+    );
+    expect(result.swept.expired).toBe(0);
+    expect(result.job?.status).toBe('pending');
+    expect(result.job?.outcome).toBeUndefined();
+  });
+
+  it('lets an approval land after the runnable age limit has passed', async () => {
+    // The regression this pins: approving a long-held job used to hand the
+    // worker a row whose age already exceeded the limit, so the policy gate
+    // refused it on the next claim. `ready_at` restarts at the approval.
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(
+          { ...work('late-approval'), approvalRequired: true },
+          10_000,
+          // Deliberately shorter than the wait below, so the hold deadline is
+          // already behind us when the approval lands and only clearing it
+          // keeps the sweep off the row.
+          60 * 60 * 1000,
+        );
+        yield* TestClock.adjust('48 hours');
+        const approved = yield* queue.approve(jobId);
+        const now = yield* Clock.currentTimeMillis;
+        // An approved job is still `pending` until something claims it, so the
+        // sweep runs over it. Approving has to clear the hold or this expires
+        // the very approval it was waiting for.
+        const swept = yield* queue.maintenance(0, 0, now);
+        const claimed = yield* queue.claim;
+        return { approved, claimed, now, swept };
+      }).pipe(Effect.provide(TestContext.TestContext)),
+    );
+    expect(result.approved).toBe(true);
+    expect(result.swept.expired).toBe(0);
+    expect(result.claimed?.id).toBe(1);
+    // The gate reads this, and 48 hours of waiting must not count against it.
+    expect(result.claimed?.readyAt).toBe(result.now);
+    expect(result.claimed?.createdAt).toBeLessThan(result.claimed?.readyAt ?? 0);
+  });
+
+  it('returns a retried approval job to a state approval and expiry can still reach', async () => {
+    // Removing the age arm from the claim took away the escape hatch this row
+    // used to have: left at `retry` it is unclaimable (approval-required),
+    // unapprovable (`approve` wants `pending`) and unexpirable, while still
+    // counting against the queue depth.
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(
+          { ...work('retry-held'), approvalRequired: true },
+          10_000,
+          60 * 60 * 1000,
+        );
+        yield* TestClock.adjust('2 hours');
+        yield* queue.maintenance(0, 0, yield* Clock.currentTimeMillis);
+        const expired = yield* queue.job(jobId);
+        const retried = yield* queue.retry(jobId, 60 * 60 * 1000);
+        const afterRetry = yield* queue.job(jobId);
+        const approved = yield* queue.approve(jobId);
+        return { expired: expired?.outcome, retried, afterRetry, approved };
+      }).pipe(Effect.provide(TestContext.TestContext)),
+    );
+    expect(result.expired).toBe('expired');
+    expect(result.retried).toBe(true);
+    expect(result.afterRetry?.status).toBe('pending');
+    expect(result.afterRetry?.outcome).toBeUndefined();
+    // A fresh deadline, or the sweep can never collect it either.
+    expect(result.afterRetry?.holdExpiresAt).toBeGreaterThan(0);
+    expect(result.approved).toBe(true);
+  });
+
+  it('does not re-expire a held job the operator just retried', async () => {
+    // The two halves interact: retry may leave no explicit deadline, and the
+    // sweep dates a missing one from when the row became ready. Dated from
+    // creation instead, an already-expired job is past due the moment it is
+    // retried, so the next sweep undoes the operator's action.
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(
+          { ...work('retry-then-sweep'), approvalRequired: true },
+          10_000,
+          60 * 60 * 1000,
+        );
+        yield* TestClock.adjust('2 hours');
+        yield* queue.maintenance(0, 0, yield* Clock.currentTimeMillis, 60 * 60 * 1000);
+        // Deliberately the bare form — no window — which is what makes the
+        // deadline implicit.
+        yield* queue.retry(jobId);
+        const swept = yield* queue.maintenance(
+          0,
+          0,
+          yield* Clock.currentTimeMillis,
+          60 * 60 * 1000,
+        );
+        return { swept, job: yield* queue.job(jobId) };
+      }).pipe(Effect.provide(TestContext.TestContext)),
+    );
+    expect(result.swept.expired).toBe(0);
+    expect(result.job?.status).toBe('pending');
+    expect(result.job?.outcome).toBeUndefined();
+  });
+
+  it('expires a hold that predates the deadline column', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        // No expiry window at enqueue is what a pre-upgrade row looks like:
+        // approval-required and pending, with no deadline of its own.
+        const { jobId } = yield* queue.enqueue({
+          ...work('legacy-hold'),
+          approvalRequired: true,
+        });
+        const before = yield* queue.job(jobId);
+        yield* TestClock.adjust('2 hours');
+        const swept = yield* queue.maintenance(
+          0,
+          0,
+          yield* Clock.currentTimeMillis,
+          60 * 60 * 1000,
+        );
+        return { before: before?.holdExpiresAt, swept, job: yield* queue.job(jobId) };
+      }).pipe(Effect.provide(TestContext.TestContext)),
+    );
+    expect(result.before).toBeUndefined();
+    expect(result.swept.expired).toBe(1);
+    expect(result.job?.outcome).toBe('expired');
+  });
+
+  it('gives a dead-lettered job the same outcome a migrated one carries', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('exhausted'));
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          const job = yield* queue.claim;
+          yield* queue.fail(jobId, job?.attempts ?? attempt, 'boom', Date.now() - 1, 'failed');
+        }
+        yield* queue.claim;
+        return yield* queue.job(jobId);
+      }),
+    );
+    expect(result?.status).toBe('dead_letter');
+    expect(result?.outcome).toBe('failed');
+  });
+
+  it('records a distinct outcome for each way a job finishes', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const outcomes: Record<string, unknown> = {};
+        for (const [name, outcome] of [
+          ['rejected', 'rejected'],
+          ['question', 'needs_input'],
+          ['broken', 'failed'],
+        ] as const) {
+          const { jobId } = yield* queue.enqueue(work(name));
+          const job = yield* queue.claim;
+          yield* queue.fail(jobId, job?.attempts ?? 1, 'summary', undefined, outcome);
+          outcomes[name] = yield* queue.job(jobId);
+        }
+        const { jobId } = yield* queue.enqueue(work('done'));
+        const job = yield* queue.claim;
+        yield* queue.complete(jobId, job?.attempts ?? 1, '{}');
+        outcomes.done = yield* queue.job(jobId);
+        return outcomes as Record<string, { status: string; outcome?: string }>;
+      }),
+    );
+    // A refusal is terminal and is not a completion — the defect was that it
+    // reached `complete` and read as one.
+    expect(result.rejected).toMatchObject({ status: 'failed', outcome: 'rejected' });
+    expect(result.question).toMatchObject({ status: 'failed', outcome: 'needs_input' });
+    expect(result.broken).toMatchObject({ status: 'failed', outcome: 'failed' });
+    expect(result.done).toMatchObject({ status: 'completed', outcome: 'completed' });
+  });
+
+  it('leaves a retrying job without an outcome until it finishes', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('retrying'));
+        const job = yield* queue.claim;
+        yield* queue.fail(jobId, job?.attempts ?? 1, 'transient', Date.now() + 60_000, 'failed');
+        return yield* queue.job(jobId);
+      }),
+    );
+    expect(result?.status).toBe('retry');
+    expect(result?.outcome).toBeUndefined();
+  });
+
   it('rejects enqueue when the configured queue depth is exhausted', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -1208,11 +1451,65 @@ describe('WorkQueue', () => {
     },
   );
 
+  it('upgrades a version-10 database without losing its jobs', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    // Build with the current schema, then strip it back to v10 — the same
+    // fixture shape the older upgrade cases use.
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.enqueue(work('carried'));
+          const claimed = yield* queue.claim;
+          yield* queue.complete(1, claimed?.attempts ?? 1, '{}');
+          yield* queue.enqueue(work('still-pending'));
+        }).pipe(Effect.provide(queueLayer(path))),
+      ),
+    );
+    const database = new Database(path);
+    for (const column of ['outcome', 'ready_at', 'hold_expires_at']) {
+      database.exec(`ALTER TABLE jobs DROP COLUMN ${column}`);
+    }
+    database.exec('PRAGMA user_version = 10');
+    database.close();
+
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            return {
+              completed: yield* queue.job(1),
+              pending: yield* queue.job(2),
+              counts: yield* queue.counts,
+            };
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(result.counts).toMatchObject({ completed: 1, pending: 1 });
+      // Backfilled from the status it already had, not left null.
+      expect(result.completed?.outcome).toBe('completed');
+      // The gate read `created_at` before this column existed, so that is what
+      // a row predating it still means.
+      expect(result.pending?.readyAt).toBe(result.pending?.createdAt);
+
+      const after = new Database(path);
+      expect(
+        (after.query('PRAGMA user_version').get() as { user_version: number }).user_version,
+      ).toBe(11);
+      after.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('refuses a database created by a newer queue schema', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
     const database = new Database(path, { create: true });
-    database.exec('PRAGMA user_version = 11');
+    database.exec('PRAGMA user_version = 12');
     database.close();
 
     try {

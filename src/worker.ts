@@ -27,7 +27,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       // it runs, and a dead credential makes every claim burn it on a clone that
       // cannot push.
       if (yield* health.isRejected) return false;
-      const job = yield* queue.claimFor(queue.ownerId, policy.maxJobAgeMs);
+      const job = yield* queue.claimFor(queue.ownerId);
       if (job === undefined) return false;
       yield* Effect.logInfo('Claimed queued work').pipe(
         Effect.annotateLogs({ job: job.id, attempt: job.attempts }),
@@ -69,7 +69,9 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         repositoryPolicy.execution === 'denied' ||
         (repositoryPolicy.execution === 'approval' && job.work.approvalRequired !== false) ||
         job.attempts > repositoryPolicy.maxAttempts ||
-        policyTime - job.createdAt > policy.maxJobAgeMs
+        // From `readyAt`, not `createdAt` — held time must not count against
+        // this gate.
+        policyTime - job.readyAt > policy.maxJobAgeMs
       ) {
         yield* queue.fail(job.id, job.attempts, 'POLICY_COST_LIMIT');
         yield* Effect.logWarning('Dropped queued work denied by policy').pipe(
@@ -161,32 +163,36 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       }
       if (result._tag === 'Right') {
         const finishedAt = yield* Clock.currentTimeMillis;
-        if (result.right.status === 'failed' || result.right.status === 'needs_input') {
-          const retryAt =
-            result.right.status === 'failed' && job.attempts < repositoryPolicy.maxAttempts
-              ? finishedAt + config.workerRetryBaseMs * 2 ** Math.max(0, job.attempts - 1)
-              : undefined;
-          yield* queue.fail(job.id, job.attempts, result.right.summary, retryAt);
-          // `summary` is parsed out of Codex stdout and stays in the database:
-          // logging it would echo whatever the repository made the agent say.
-          yield* Effect.logWarning('Queued work did not complete').pipe(
+        if (result.right.status === 'completed') {
+          yield* queue.complete(job.id, job.attempts, JSON.stringify(result.right));
+          yield* Effect.logInfo('Completed queued work').pipe(
             Effect.annotateLogs({
               job: job.id,
               attempt: job.attempts,
               status: result.right.status,
               durationMs: finishedAt - claimedAt,
-              ...(retryAt === undefined ? {} : { retryAt }),
             }),
           );
           return true;
         }
-        yield* queue.complete(job.id, job.attempts, JSON.stringify(result.right));
-        yield* Effect.logInfo('Completed queued work').pipe(
+        // Only an execution failure earns another attempt. A refusal is the
+        // agent's decision and a question needs an answer, not a rerun — both
+        // finish here, distinguishable by outcome rather than folded into
+        // `failed`, which is what made a refusal read as a completion.
+        const retryAt =
+          result.right.status === 'failed' && job.attempts < repositoryPolicy.maxAttempts
+            ? finishedAt + config.workerRetryBaseMs * 2 ** Math.max(0, job.attempts - 1)
+            : undefined;
+        yield* queue.fail(job.id, job.attempts, result.right.summary, retryAt, result.right.status);
+        // `summary` is parsed out of Codex stdout and stays in the database:
+        // logging it would echo whatever the repository made the agent say.
+        yield* Effect.logWarning('Queued work did not complete').pipe(
           Effect.annotateLogs({
             job: job.id,
             attempt: job.attempts,
             status: result.right.status,
             durationMs: finishedAt - claimedAt,
+            ...(retryAt === undefined ? {} : { retryAt }),
           }),
         );
         return true;

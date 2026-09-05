@@ -44,7 +44,12 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
             code: 'CONTROL_JOB_NOT_FOUND',
             message: `Job ${id} was not found`,
           });
-        const changed = yield* queue[action](id);
+        // Retry re-parks a job still awaiting approval, so it needs the window
+        // to date the new hold from.
+        const changed =
+          action === 'retry'
+            ? yield* queue.retry(id, policy.approvalExpiryMs)
+            : yield* queue[action](id);
         yield* queue.recordAudit({
           jobId: id,
           repository: before.work.repository,

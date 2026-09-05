@@ -152,6 +152,7 @@ const processBySource: Record<
           ...(repositoryPolicy.execution === 'approval' ? { approvalRequired: true } : {}),
         },
         policy.maxQueueDepth,
+        policy.approvalExpiryMs,
       );
       yield* advance;
 

@@ -47,6 +47,25 @@ export type JobStatus =
   | 'running';
 
 /**
+ * Why a job stopped, kept apart from `status`, which says only what the
+ * scheduler may still do with the row. The executor reports four of these and
+ * the queue adds two; `failed` covers both an execution failure and one the
+ * worker never got to.
+ *
+ * ! `rejected` and `needs_input` are stored under `status = 'failed'`. Neither
+ * ! is a completion — an agent that refused or asked a question did not do the
+ * ! work — and `failed` is also the only terminal status `job.retry` accepts,
+ * ! so it is what leaves the operator a lever.
+ */
+export type JobOutcome =
+  | 'canceled'
+  | 'completed'
+  | 'expired'
+  | 'failed'
+  | 'needs_input'
+  | 'rejected';
+
+/**
  * Statuses past which a job never runs again. Only `liveJobIds` reads this
  * list; `maintenance` inlines the same literals in its SQL. The values agree
  * today — keep them that way when editing either.
@@ -61,6 +80,14 @@ export type QueuedJob = {
   readonly workerId?: string;
   readonly leaseExpiresAt?: number;
   readonly createdAt: number;
+  /**
+   * When the job last became runnable, not when it was created. Time spent
+   * held for approval doesn't count against the age gate; approving resets
+   * this so a long-held job isn't immediately refused by it.
+   */
+  readonly readyAt: number;
+  readonly outcome?: JobOutcome;
+  readonly holdExpiresAt?: number;
 };
 
 export type QueueCounts = Readonly<Record<JobStatus, number>>;
@@ -81,6 +108,9 @@ type JobRow = {
   readonly status: JobStatus;
   readonly attempts: number;
   readonly createdAt: number;
+  readonly readyAt?: number | null;
+  readonly outcome?: JobOutcome | null;
+  readonly holdExpiresAt?: number | null;
   readonly workerId?: string | null;
   readonly leaseExpiresAt?: number | null;
 };
@@ -129,22 +159,25 @@ const migrate = (database: Database) => {
     (database.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(
       (existing) => existing.name === column,
     );
-  // Every v10 artifact checked, not a sample: one missing piece would fail on
+  // Every v11 artifact checked, not a sample: one missing piece would fail on
   // every use — the v6 equality-guard failure, one version later. The
   // `installation_id` check is negative so a database predating its drop heals.
   if (
-    version.user_version === 10 &&
+    version.user_version === 11 &&
     deliveriesHaveSource() &&
     hasColumn('deliveries', 'lease_expires_at') &&
     hasColumn('capability_audit', 'actor') &&
     !hasColumn('capability_audit', 'installation_id') &&
+    hasColumn('jobs', 'outcome') &&
+    hasColumn('jobs', 'ready_at') &&
+    hasColumn('jobs', 'hold_expires_at') &&
     hasTable('notification_cursors') &&
     hasTable('poller_state') &&
     hasTable('subject_branches') &&
     hasTable('thread_liveness')
   )
     return;
-  if (version.user_version > 10) {
+  if (version.user_version > 11) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -266,6 +299,27 @@ const migrate = (database: Database) => {
     if (!hasColumn('deliveries', 'lease_expires_at')) {
       database.exec('ALTER TABLE deliveries ADD COLUMN lease_expires_at INTEGER');
     }
+    // Added, not folded into the status CHECK: widening that constraint means
+    // rebuilding `jobs`, and renaming it repoints the `attempts` foreign key at
+    // the old table, so the rebuild drags a second table with it.
+    if (!hasColumn('jobs', 'outcome')) {
+      database.exec('ALTER TABLE jobs ADD COLUMN outcome TEXT');
+      database.exec(
+        `UPDATE jobs SET outcome = CASE
+           WHEN status = 'completed' THEN 'completed'
+           WHEN status IN ('failed', 'dead_letter') THEN 'failed'
+           ELSE NULL END`,
+      );
+    }
+    // Backfilled from `created_at`, which is what the age gate read before
+    // this column existed.
+    if (!hasColumn('jobs', 'ready_at')) {
+      database.exec('ALTER TABLE jobs ADD COLUMN ready_at INTEGER');
+      database.exec('UPDATE jobs SET ready_at = created_at WHERE ready_at IS NULL');
+    }
+    if (!hasColumn('jobs', 'hold_expires_at')) {
+      database.exec('ALTER TABLE jobs ADD COLUMN hold_expires_at INTEGER');
+    }
     database.exec(`
       CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs(status, available_at, id);
       CREATE TABLE IF NOT EXISTS daemon_owner (
@@ -315,7 +369,7 @@ const migrate = (database: Database) => {
         expires_at INTEGER NOT NULL,
         PRIMARY KEY (repository, subject_kind, subject_number)
       );
-      PRAGMA user_version = 10;
+      PRAGMA user_version = 11;
     `);
     // ! Condemned, not drained: no decoder exists for webhook bodies anymore,
     // ! so leaving one claimable kills the delivery worker on a defect per cycle.
@@ -357,6 +411,11 @@ const decodeJob = (row: JobRow): QueuedJob => ({
   status: row.status,
   attempts: row.attempts,
   createdAt: row.createdAt,
+  // The migration backfills every existing row, so this coalesce is a floor
+  // for a row inserted without one, not a path the upgrade leaves behind.
+  readyAt: row.readyAt ?? row.createdAt,
+  ...(row.outcome == null ? {} : { outcome: row.outcome }),
+  ...(row.holdExpiresAt == null ? {} : { holdExpiresAt: row.holdExpiresAt }),
   ...(row.workerId == null ? {} : { workerId: row.workerId }),
   ...(row.leaseExpiresAt == null ? {} : { leaseExpiresAt: row.leaseExpiresAt }),
 });
@@ -691,7 +750,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           .run(lastModified);
       });
 
-    const enqueue = (work: WorkItem, maxDepth = 10_000) =>
+    const enqueue = (work: WorkItem, maxDepth = 10_000, approvalExpiryMs?: number) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         return yield* attempt('enqueue', () => {
@@ -705,14 +764,28 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             )
             .get() as { count: number };
           if (active.count >= maxDepth) throw new QueueFull({ limit: maxDepth });
+          const holdExpiresAt =
+            work.approvalRequired === true && approvalExpiryMs !== undefined
+              ? now + approvalExpiryMs
+              : null;
           const result = database
             .query(
               `INSERT INTO jobs
-                (delivery_id, interaction_id, payload, status, available_at, created_at, updated_at)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?)
+                (delivery_id, interaction_id, payload, status, available_at, created_at, updated_at,
+                 ready_at, hold_expires_at)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)
                ON CONFLICT DO NOTHING`,
             )
-            .run(work.deliveryId, work.interactionId, JSON.stringify(work), now, now, now);
+            .run(
+              work.deliveryId,
+              work.interactionId,
+              JSON.stringify(work),
+              now,
+              now,
+              now,
+              now,
+              holdExpiresAt,
+            );
           const row = database
             .query('SELECT id FROM jobs WHERE delivery_id = ? OR interaction_id = ?')
             .get(work.deliveryId, work.interactionId) as { id: number };
@@ -720,37 +793,45 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         });
       });
 
-    const claimFor = (workerId: string, maxJobAgeMs = Number.POSITIVE_INFINITY) =>
+    const claimFor = (workerId: string) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         return yield* attempt('claim', () =>
           database
             .transaction(() => {
+              // ! An approval-required job is never claimable on age alone. It
+              // ! used to be, and the claim then walked it into the worker's
+              // ! policy gate, which failed it into a status `job.approve` will
+              // ! not accept — so ageing out an unapproved job destroyed the
+              // ! operator's ability to approve it. Expiry belongs to
+              // ! `maintenance`, which finishes the row without claiming it.
+              // The malformed-payload arms stay: those rows have to be claimed
+              // to be dead-lettered.
               const row = database
                 .query(
-                  `SELECT id, payload, status, attempts, created_at AS createdAt
+                  `SELECT id, payload, status, attempts, created_at AS createdAt,
+                      ready_at AS readyAt
                FROM jobs
                WHERE status IN ('pending', 'retry', 'interrupted') AND available_at <= ?
                  AND (
                    CASE WHEN json_valid(payload)
                      THEN COALESCE(json_extract(payload, '$.approvalRequired'), 0)
                      ELSE 0 END = 0
-                   OR created_at <= ?
                    OR json_type(payload, '$.repository') IS NULL
                    OR json_type(payload, '$.subject') IS NULL
                  )
                ORDER BY available_at, id
                LIMIT 1`,
                 )
-                .get(now, Number.isFinite(maxJobAgeMs) ? now - maxJobAgeMs : -1) as JobRow | null;
+                .get(now) as JobRow | null;
               if (row === null) return undefined;
 
               const attemptNumber = row.attempts + 1;
               if (attemptNumber > config.workerMaxAttempts) {
                 database
                   .query(
-                    `UPDATE jobs SET status = 'dead_letter', failed_at = ?, updated_at = ?,
-                     last_error = 'attempt limit exhausted' WHERE id = ?`,
+                    `UPDATE jobs SET status = 'dead_letter', outcome = 'failed', failed_at = ?,
+                     updated_at = ?, last_error = 'attempt limit exhausted' WHERE id = ?`,
                   )
                   .run(now, now, row.id);
                 return undefined;
@@ -761,8 +842,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               } catch {
                 database
                   .query(
-                    `UPDATE jobs SET status = 'dead_letter', failed_at = ?, updated_at = ?,
-                     last_error = 'invalid stored payload' WHERE id = ?`,
+                    `UPDATE jobs SET status = 'dead_letter', outcome = 'failed', failed_at = ?,
+                     updated_at = ?, last_error = 'invalid stored payload' WHERE id = ?`,
                   )
                   .run(now, now, row.id);
                 return undefined;
@@ -826,7 +907,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           database.transaction(() => {
             const result = database
               .query(
-                `UPDATE jobs SET status = 'completed', completed_at = ?, updated_at = ?
+                `UPDATE jobs SET status = 'completed', outcome = 'completed',
+                   completed_at = ?, updated_at = ?
                  WHERE id = ? AND status = 'running' AND attempts = ?`,
               )
               .run(now, now, jobId, attemptNumber);
@@ -843,7 +925,13 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         );
       });
 
-    const fail = (jobId: number, attemptNumber: number, error: string, retryAt?: number) =>
+    const fail = (
+      jobId: number,
+      attemptNumber: number,
+      error: string,
+      retryAt?: number,
+      outcome: JobOutcome = 'failed',
+    ) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         const status: JobStatus = retryAt === undefined ? 'failed' : 'retry';
@@ -853,7 +941,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               .query(
                 `UPDATE jobs
                  SET status = ?, available_at = ?, claimed_at = NULL, last_error = ?,
-                     failed_at = ?, retry_at = ?, updated_at = ?
+                     failed_at = ?, retry_at = ?, updated_at = ?, outcome = ?
                  WHERE id = ? AND status = 'running' AND attempts = ?`,
               )
               .run(
@@ -863,6 +951,9 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                 retryAt === undefined ? now : null,
                 retryAt ?? null,
                 now,
+                // A row going back to `retry` has not finished, so it carries no
+                // outcome yet — the next attempt decides it.
+                retryAt === undefined ? outcome : null,
                 jobId,
                 attemptNumber,
               );
@@ -895,12 +986,14 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               .query(
                 `UPDATE jobs
                  SET status = CASE WHEN attempts >= ? THEN 'dead_letter' ELSE 'interrupted' END,
+                     outcome = CASE WHEN attempts >= ? THEN 'failed' ELSE outcome END,
                      available_at = ?, claimed_at = NULL, worker_id = NULL, lease_expires_at = NULL,
                      interrupted_at = ?, failed_at = CASE WHEN attempts >= ? THEN ? ELSE failed_at END,
                      last_error = 'worker interrupted', updated_at = ?
                  WHERE status = 'running' AND lease_expires_at < ?`,
               )
               .run(
+                config.workerMaxAttempts,
                 config.workerMaxAttempts,
                 now,
                 now,
@@ -930,9 +1023,34 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       return result;
     });
 
-    const maintenance = (completedBefore: number, failedBefore: number) =>
+    const maintenance = (
+      completedBefore: number,
+      failedBefore: number,
+      heldBefore = Date.now(),
+      approvalExpiryMs?: number,
+    ) =>
       attempt('maintain queue', () => {
         const now = Date.now();
+        // `expired` keeps this apart from a policy refusal and from an
+        // execution failure — expiry is decided here, not by the claim (see
+        // `claimFor`).
+        //
+        // A hold with no deadline of its own is due one window after it became
+        // ready. That covers rows held before the column existed — which the
+        // claim no longer ages out — and dates a re-parked retry from the retry
+        // rather than from creation, which would expire it again immediately.
+        const expired = database
+          .query(
+            `UPDATE jobs
+             SET status = 'failed', outcome = 'expired', failed_at = ?, updated_at = ?,
+                 hold_expires_at = NULL, last_error = 'approval expired'
+             WHERE status = 'pending'
+               AND CASE WHEN json_valid(payload)
+                     THEN COALESCE(json_extract(payload, '$.approvalRequired'), 0)
+                     ELSE 0 END = 1
+               AND COALESCE(hold_expires_at, ready_at + ?) < ?`,
+          )
+          .run(now, now, approvalExpiryMs ?? Number.MAX_SAFE_INTEGER, heldBefore).changes;
         database
           .query(
             `DELETE FROM capability_audit WHERE job_id IN
@@ -962,7 +1080,12 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         database.exec('PRAGMA wal_checkpoint(PASSIVE)');
         const sizeBytes =
           config.databasePath === ':memory:' ? 0 : statSync(config.databasePath).size;
-        return { completed: Number(completed), failed: Number(failed), sizeBytes };
+        return {
+          completed: Number(completed),
+          failed: Number(failed),
+          expired: Number(expired),
+          sizeBytes,
+        };
       });
 
     const recordAudit = (entry: {
@@ -1119,7 +1242,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         const rows = database
           .query(
             `SELECT id, payload, status, attempts, last_error AS lastError,
-               created_at AS createdAt, updated_at AS updatedAt
+               created_at AS createdAt, updated_at AS updatedAt,
+               ready_at AS readyAt, outcome, hold_expires_at AS holdExpiresAt
              FROM jobs ORDER BY id DESC LIMIT ?`,
           )
           .all(Math.max(1, Math.min(1000, limit))) as readonly (JobRow & {
@@ -1167,6 +1291,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           .query(
             `SELECT id, payload, status, attempts, last_error AS lastError,
                created_at AS createdAt, updated_at AS updatedAt,
+               ready_at AS readyAt, outcome, hold_expires_at AS holdExpiresAt,
                worker_id AS workerId, lease_expires_at AS leaseExpiresAt
              FROM jobs WHERE id = ?`,
           )
@@ -1187,7 +1312,11 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         } satisfies JobDetails;
       });
 
-    const mutateJob = (id: number, action: 'approve' | 'cancel' | 'retry') =>
+    const mutateJob = (
+      id: number,
+      action: 'approve' | 'cancel' | 'retry',
+      approvalExpiryMs?: number,
+    ) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         return yield* attempt(`${action} job`, () =>
@@ -1200,25 +1329,46 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             if (action === 'approve') {
               const payload = JSON.parse(row.payload) as WorkItem;
               if (payload.approvalRequired !== true || row.status !== 'pending') return false;
+              // Resets `ready_at` so a long-held job isn't immediately refused
+              // by the age gate once approved.
               return (
                 database
                   .query(
-                    "UPDATE jobs SET payload = ?, updated_at = ? WHERE id = ? AND status = 'pending'",
+                    `UPDATE jobs SET payload = ?, updated_at = ?, ready_at = ?,
+                       available_at = ?, hold_expires_at = NULL
+                     WHERE id = ? AND status = 'pending'`,
                   )
-                  .run(JSON.stringify({ ...payload, approvalRequired: false }), now, id).changes ===
-                1
+                  .run(JSON.stringify({ ...payload, approvalRequired: false }), now, now, now, id)
+                  .changes === 1
               );
             }
             if (action === 'retry') {
               if (row.status !== 'failed' && row.status !== 'dead_letter') return false;
               database.query('DELETE FROM attempts WHERE job_id = ?').run(id);
+              // ! A job still carrying `approvalRequired` goes back to `pending`
+              // ! with a fresh deadline, never to `retry`. The claim skips
+              // ! approval-required rows, and `approve` and the expiry sweep
+              // ! both read `pending` only — so a held job left in `retry` can
+              // ! never run, be approved, or expire, while still counting
+              // ! against the queue depth.
+              const held = (JSON.parse(row.payload) as WorkItem).approvalRequired === true;
               return (
                 database
                   .query(
-                    `UPDATE jobs SET status = 'retry', attempts = 0, available_at = ?, failed_at = NULL,
-                   retry_at = ?, last_error = NULL, updated_at = ? WHERE id = ?`,
+                    `UPDATE jobs SET status = ?, attempts = 0, available_at = ?, failed_at = NULL,
+                   retry_at = ?, last_error = NULL, updated_at = ?, ready_at = ?, outcome = NULL,
+                   hold_expires_at = ?
+                   WHERE id = ?`,
                   )
-                  .run(now, now, now, id).changes === 1
+                  .run(
+                    held ? 'pending' : 'retry',
+                    now,
+                    now,
+                    now,
+                    now,
+                    held && approvalExpiryMs !== undefined ? now + approvalExpiryMs : null,
+                    id,
+                  ).changes === 1
               );
             }
             if (!['pending', 'retry', 'interrupted', 'running'].includes(row.status)) return false;
@@ -1231,8 +1381,9 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             return (
               database
                 .query(
-                  `UPDATE jobs SET status = 'failed', failed_at = ?, worker_id = NULL,
-                 lease_expires_at = NULL, last_error = 'canceled by operator', updated_at = ? WHERE id = ?`,
+                  `UPDATE jobs SET status = 'failed', outcome = 'canceled', failed_at = ?,
+                 worker_id = NULL, lease_expires_at = NULL, hold_expires_at = NULL,
+                 last_error = 'canceled by operator', updated_at = ? WHERE id = ?`,
                 )
                 .run(now, now, id).changes === 1
             );
@@ -1334,7 +1485,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       job,
       liveJobIds,
       approve: (id: number) => mutateJob(id, 'approve'),
-      retry: (id: number) => mutateJob(id, 'retry'),
+      retry: (id: number, approvalExpiryMs?: number) => mutateJob(id, 'retry', approvalExpiryMs),
       cancel: (id: number) => mutateJob(id, 'cancel'),
       diagnostics,
       backup,
