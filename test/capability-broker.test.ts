@@ -24,6 +24,18 @@ const work: WorkItem = {
     url: 'https://github.com/edloidas/lictor/issues/13',
   },
 };
+
+type AdvertisedTool = {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: {
+    readonly properties: Readonly<
+      Record<string, { readonly description?: string; readonly pattern?: string }>
+    >;
+    readonly required?: readonly string[];
+  };
+};
+
 const ConfigLive = Layer.succeed(
   LictorConfig,
   LictorConfig.make({
@@ -179,6 +191,137 @@ describe('CapabilityBroker', () => {
       '[defaults.capabilities]\nread = true',
     );
     expect(result.value).toMatchObject({ result: { tools: [] } });
+  });
+
+  const advertisedTools = async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        yield* queue.claim;
+        const response = yield* broker.handleMcp(enqueued.jobId, work, {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/list',
+        });
+        if (!('result' in response) || !('tools' in response.result))
+          throw new Error('tools/list failed');
+        return response.result.tools as readonly AdvertisedTool[];
+      }),
+      '[defaults.capabilities]\nread = true\ncomment = true\nissues = true\nbranches = true\npullRequests = true\nmerge = true',
+    );
+    return result.value;
+  };
+
+  it('declares the payload every write tool sends', async () => {
+    const tools = await advertisedTools();
+    // `required` is a set in JSON Schema, so compare it as one.
+    const required = Object.fromEntries(
+      tools.map((tool) => [tool.name, [...(tool.inputSchema.required ?? [])].sort()]),
+    );
+    expect(required.create_comment).toEqual(['body', 'number']);
+    expect(required.update_issue).toEqual(['number']);
+    expect(required.create_branch).toEqual(['ref', 'sha']);
+    expect(required.update_branch).toEqual(['ref', 'sha']);
+    expect(required.create_blob).toEqual(['content']);
+    expect(required.create_tree).toEqual(['tree']);
+    expect(required.create_commit).toEqual(['message', 'parents', 'tree']);
+    expect(required.create_pull_request).toEqual(['base', 'head', 'title']);
+    expect(required.merge_pull_request).toEqual(['number']);
+  });
+
+  it('describes every property it makes required', async () => {
+    const tools = await advertisedTools();
+    for (const tool of tools) {
+      const declared = Object.keys(tool.inputSchema.properties);
+      for (const name of tool.inputSchema.required ?? []) expect(declared).toContain(name);
+    }
+  });
+
+  // Policy gates `force`; the repository may refuse a merge method.
+  it('declares the optional fields the broker and GitHub act on', async () => {
+    const tools = await advertisedTools();
+    const propertiesOf = (name: string) =>
+      Object.keys(tools.find((tool) => tool.name === name)?.inputSchema.properties ?? {});
+    expect(propertiesOf('update_branch')).toContain('force');
+    expect(propertiesOf('merge_pull_request')).toContain('merge_method');
+    expect(propertiesOf('create_blob')).toContain('encoding');
+    expect(propertiesOf('create_tree')).toContain('base_tree');
+    expect(propertiesOf('list_review_threads')).toContain('after');
+  });
+
+  // Two shapes one prefix apart, under the same property name.
+  it('states the two ref shapes apart', async () => {
+    const tools = await advertisedTools();
+    const refOf = (name: string) =>
+      tools.find((tool) => tool.name === name)?.inputSchema.properties.ref?.description ?? '';
+    expect(refOf('create_branch')).toContain('refs/heads/<name>');
+    expect(refOf('update_branch')).toContain('heads/<name>');
+    expect(refOf('update_branch')).not.toContain('refs/heads/<name>');
+  });
+
+  // The advertised pattern may be stricter than `route` — it rejects the
+  // uppercase `REFS/HEADS/` the `/i` validators tolerate — but never looser, or
+  // it hands the agent a name the broker then refuses.
+  it('advertises ref patterns no looser than the refs the broker accepts', async () => {
+    const tools = await advertisedTools();
+    const patternOf = (name: string) =>
+      new RegExp(
+        tools.find((tool) => tool.name === name)?.inputSchema.properties.ref?.pattern ?? '',
+      );
+    const brokerCreate = (v: string) =>
+      /^refs\/heads\/[a-z0-9._/-]+$/i.test(v) && !v.includes('..');
+    const brokerUpdate = (v: string) => /^heads\/[a-z0-9._/-]+$/i.test(v) && !v.includes('..');
+    const create = patternOf('create_branch');
+    const update = patternOf('update_branch');
+    for (const ref of [
+      'refs/heads/issue-118',
+      'heads/issue-118',
+      'refs/heads/CamelCase',
+      'refs/heads/feat/x_y.z-1',
+      'REFS/HEADS/shouty',
+      'refs/heads/fix#118',
+      'refs/heads/a..b',
+      'heads/a..b',
+      'refs/heads/has space',
+      'refs/heads/',
+    ]) {
+      if (create.test(ref)) expect(brokerCreate(ref)).toBe(true);
+      if (update.test(ref)) expect(brokerUpdate(ref)).toBe(true);
+    }
+    // Still pin the shapes each one is for.
+    expect(create.test('refs/heads/issue-118')).toBe(true);
+    expect(create.test('heads/issue-118')).toBe(false);
+    expect(update.test('heads/issue-118')).toBe(true);
+    expect(update.test('refs/heads/issue-118')).toBe(false);
+  });
+
+  it('advertises the page parameter only on the two routes that read it', async () => {
+    const tools = await advertisedTools();
+    const paged = tools
+      .filter((tool) => 'page' in tool.inputSchema.properties)
+      .map((tool) => tool.name)
+      .sort();
+    expect(paged).toEqual(['list_comments', 'list_review_comments']);
+  });
+
+  it('gives every tool an input shape and a description of its own', async () => {
+    const tools = await advertisedTools();
+    expect(tools).toHaveLength(15);
+    // The guard reads `input.repository` by that name and skips silently when it
+    // is absent, so a renamed key turns a refusal into an unaudited redirect.
+    for (const tool of tools)
+      expect(Object.keys(tool.inputSchema.properties)).toContain('repository');
+    const shapeless = tools
+      .filter((tool) => Object.keys(tool.inputSchema.properties).length <= 1)
+      .map((tool) => tool.name);
+    expect(shapeless).toEqual(['get_repository']);
+    for (const tool of tools) {
+      expect(tool.description.length).toBeGreaterThan(20);
+      expect(tool.description).not.toContain(tool.name);
+    }
+    expect(new Set(tools.map((tool) => tool.description)).size).toBe(tools.length);
   });
 
   it('accepts the MCP initialization handshake', async () => {

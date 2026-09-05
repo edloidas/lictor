@@ -52,6 +52,230 @@ const capabilities: Readonly<
   update_branch: 'branches',
 };
 
+const issueNumber = { type: 'integer', minimum: 1, description: 'Issue number.' } as const;
+const commentableNumber = {
+  type: 'integer',
+  minimum: 1,
+  description: 'Issue or pull request number; both are addressed as issues here.',
+} as const;
+const pullNumber = { type: 'integer', minimum: 1, description: 'Pull request number.' } as const;
+const pageNumber = {
+  type: 'integer',
+  minimum: 1,
+  description: 'Page of results, three per page. Defaults to 1.',
+} as const;
+const repositoryProperty = {
+  type: 'string',
+  description:
+    'Optional `owner/name`. It must match the repository the job was created for; any other value is denied.',
+} as const;
+
+/**
+ * The whole input object becomes the request body, so a property this table
+ * does not name is one the agent has to guess. What it advertises has to agree
+ * with what `route` enforces, `ref` patterns included.
+ */
+const toolSchemas: Readonly<
+  Record<
+    BrokerTool,
+    {
+      readonly description: string;
+      readonly properties: Readonly<Record<string, unknown>>;
+      readonly required?: readonly string[];
+    }
+  >
+> = {
+  get_repository: {
+    description: 'Read the job repository: default branch, visibility and granted permissions.',
+    properties: {},
+  },
+  get_issue: {
+    description: 'Read one issue: title, body, state, labels and assignees.',
+    properties: { number: issueNumber },
+    required: ['number'],
+  },
+  get_pull_request: {
+    description: 'Read one pull request: title, body, state, head and base refs, mergeability.',
+    properties: { number: pullNumber },
+    required: ['number'],
+  },
+  list_comments: {
+    description: 'List comments on an issue or pull request, three per page, oldest first.',
+    properties: { number: commentableNumber, page: pageNumber },
+    required: ['number'],
+  },
+  list_review_threads: {
+    description:
+      'List review threads on a pull request with their comments and resolution state, ten per page.',
+    properties: {
+      number: pullNumber,
+      after: {
+        type: 'string',
+        description:
+          'Cursor from the previous page, `pageInfo.endCursor`. Omit for the first page.',
+      },
+    },
+    required: ['number'],
+  },
+  list_review_comments: {
+    description: 'List review comments on a pull request, three per page.',
+    properties: { number: pullNumber, page: pageNumber },
+    required: ['number'],
+  },
+  create_comment: {
+    description: 'Post a comment on an issue or pull request.',
+    properties: {
+      number: commentableNumber,
+      body: { type: 'string', description: 'Comment text, GitHub-flavored markdown.' },
+    },
+    required: ['number', 'body'],
+  },
+  update_issue: {
+    description: 'Update an issue. Only the fields sent are changed.',
+    properties: {
+      number: issueNumber,
+      title: { type: 'string' },
+      body: { type: 'string' },
+      state: { type: 'string', enum: ['open', 'closed'] },
+      state_reason: { type: 'string', enum: ['completed', 'not_planned', 'reopened'] },
+      labels: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Replaces the label set; it is not additive.',
+      },
+      assignees: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Replaces the assignee set; it is not additive.',
+      },
+    },
+    required: ['number'],
+  },
+  create_branch: {
+    description: 'Create a branch pointing at an existing commit.',
+    properties: {
+      ref: {
+        type: 'string',
+        pattern: '^refs/heads/(?!.*\\.\\.)[A-Za-z0-9._/-]+$',
+        description:
+          'Full ref of the new branch, `refs/heads/<name>`. Note the `refs/` prefix — `update_branch` takes the short form instead. The name allows only letters, digits, `.`, `_`, `-` and `/`, and may not contain `..`.',
+      },
+      sha: { type: 'string', description: 'Commit SHA the new branch points at.' },
+    },
+    required: ['ref', 'sha'],
+  },
+  update_branch: {
+    description: 'Move an existing branch to another commit.',
+    properties: {
+      ref: {
+        type: 'string',
+        pattern: '^heads/(?!.*\\.\\.)[A-Za-z0-9._/-]+$',
+        description:
+          'Short ref of the branch to move, `heads/<name>`, with no `refs/` prefix — unlike `create_branch`. The name allows only letters, digits, `.`, `_`, `-` and `/`, and may not contain `..`.',
+      },
+      sha: { type: 'string', description: 'Commit SHA to move the branch to.' },
+      force: {
+        type: 'boolean',
+        description:
+          'Move the branch even when the new commit is not a descendant. Denied unless repository policy grants force pushes, and denied outright on a continuation whatever policy says.',
+      },
+    },
+    required: ['ref', 'sha'],
+  },
+  create_blob: {
+    description: 'Store file content as a blob and return its SHA, for use in a tree entry.',
+    properties: {
+      content: {
+        type: 'string',
+        description:
+          'File content, encoded as `encoding` says. The 256 KiB cap is on the whole serialized call, not on this field, so a large blob may need splitting.',
+      },
+      encoding: { type: 'string', enum: ['utf-8', 'base64'], description: 'Defaults to `utf-8`.' },
+    },
+    required: ['content'],
+  },
+  create_tree: {
+    description: 'Build a tree from entries, usually over an existing tree.',
+    properties: {
+      tree: {
+        type: 'array',
+        description:
+          'Entries to write. The whole call is capped at 256 KiB once serialized, so send bulk content through `create_blob` and reference the SHA here.',
+        items: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Path relative to the repository root.' },
+            mode: {
+              type: 'string',
+              enum: ['100644', '100755', '040000', '160000', '120000'],
+              description: 'File mode: `100644` for a regular file, `100755` for an executable.',
+            },
+            type: { type: 'string', enum: ['blob', 'tree', 'commit'] },
+            sha: {
+              type: ['string', 'null'],
+              description: 'Blob SHA from `create_blob`. Null deletes the path.',
+            },
+            content: {
+              type: 'string',
+              description: 'Inline content, as an alternative to `sha`.',
+            },
+          },
+          required: ['path', 'mode', 'type'],
+          anyOf: [{ required: ['sha'] }, { required: ['content'] }],
+        },
+      },
+      base_tree: {
+        type: 'string',
+        description: 'Tree SHA to layer the entries onto. Omit it and every unlisted path is gone.',
+      },
+    },
+    required: ['tree'],
+  },
+  create_commit: {
+    description:
+      'Create a commit object. Authorship is pinned to the account the daemon runs as; `author` and `committer` are dropped.',
+    properties: {
+      message: { type: 'string', description: 'Commit message.' },
+      tree: { type: 'string', description: 'Tree SHA from `create_tree`.' },
+      parents: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Parent commit SHAs, the branch tip first.',
+      },
+    },
+    required: ['message', 'tree', 'parents'],
+  },
+  create_pull_request: {
+    description: 'Open a pull request between two branches of the job repository.',
+    properties: {
+      title: { type: 'string' },
+      head: { type: 'string', description: 'Branch the changes are on, as a bare name.' },
+      base: { type: 'string', description: 'Branch to merge into, as a bare name.' },
+      body: { type: 'string', description: 'Description, GitHub-flavored markdown.' },
+      draft: { type: 'boolean' },
+    },
+    required: ['title', 'head', 'base'],
+  },
+  merge_pull_request: {
+    description: 'Merge a pull request.',
+    properties: {
+      number: pullNumber,
+      merge_method: {
+        type: 'string',
+        enum: ['merge', 'squash', 'rebase'],
+        description: 'Defaults to `merge`. The repository may not allow every method.',
+      },
+      commit_title: { type: 'string' },
+      commit_message: { type: 'string' },
+      sha: {
+        type: 'string',
+        description: 'Head SHA the merge expects; the merge fails if the branch has moved past it.',
+      },
+    },
+    required: ['number'],
+  },
+};
+
 const number = (input: Readonly<Record<string, unknown>>, name: string): number => {
   const value = input[name];
   if (!Number.isInteger(value) || Number(value) < 1)
@@ -445,29 +669,19 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
         });
       });
 
-    const numberedTools = new Set<BrokerTool>([
-      'get_issue',
-      'get_pull_request',
-      'list_comments',
-      'list_review_threads',
-      'list_review_comments',
-      'create_comment',
-      'merge_pull_request',
-    ]);
-    const listTools = (Object.keys(capabilities) as BrokerTool[]).map((name) => ({
-      name,
-      description: `Job-scoped GitHub capability: ${name}`,
-      inputSchema: {
-        type: 'object',
-        properties: {
-          ...(numberedTools.has(name)
-            ? { number: { type: 'integer', minimum: 1 }, page: { type: 'integer', minimum: 1 } }
-            : {}),
+    const listTools = (Object.keys(capabilities) as BrokerTool[]).map((name) => {
+      const { description, properties, required } = toolSchemas[name];
+      return {
+        name,
+        description,
+        inputSchema: {
+          type: 'object',
+          properties: { repository: repositoryProperty, ...properties },
+          ...(required === undefined ? {} : { required }),
+          additionalProperties: true,
         },
-        ...(numberedTools.has(name) ? { required: ['number'] } : {}),
-        additionalProperties: true,
-      },
-    }));
+      };
+    });
 
     // Discovery is scoped to the job's repository policy: offering a tool that
     // could only ever fail invites attempts whose denial is the feature.
