@@ -58,6 +58,8 @@ const PolicyDocument = Schema.Struct({
       livenessHours: Schema.optional(Schema.Number),
       /** How long a job waits for an operator's approval before expiring. */
       approvalExpiryHours: Schema.optional(Schema.Number),
+      /** How long a job waits for an answer to its question before expiring. */
+      answerExpiryHours: Schema.optional(Schema.Number),
     }),
   ),
 });
@@ -183,6 +185,16 @@ export type AutomationPolicy = {
    * operator: an approval landing before the sweep still takes.
    */
   readonly approvalExpiryMs: number;
+  /**
+   * How long a job parked on its own question waits for an answer. Its own
+   * window rather than `approvalExpiryMs`: an approver decides whether work may
+   * start, an answerer unblocks work already under way, and the two are not
+   * owed the same patience.
+   *
+   * Enforced by the maintenance sweep for the same reason, so an answer landing
+   * before the sweep still resumes the job.
+   */
+  readonly answerExpiryMs: number;
   readonly forRepository: (repository: string) => RepositoryPolicy;
 };
 
@@ -332,6 +344,9 @@ const makePolicy = (
       positiveLimit(document.limits?.livenessHours, 24, 720, 'limits.livenessHours') * 3_600_000,
     approvalExpiryMs:
       positiveLimit(document.limits?.approvalExpiryHours, 72, 720, 'limits.approvalExpiryHours') *
+      3_600_000,
+    answerExpiryMs:
+      positiveLimit(document.limits?.answerExpiryHours, 72, 720, 'limits.answerExpiryHours') *
       3_600_000,
     forRepository,
   };

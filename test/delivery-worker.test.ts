@@ -376,6 +376,99 @@ describe('DeliveryWorker', () => {
     expect(result.audit[0]?.outcome).toBe('react_failed');
   });
 
+  // The whole point of resolving the answer here rather than a stage later:
+  // qualification would otherwise turn the reply into a second job and advance
+  // the cursor past it, leaving the parked one waiting on a comment nothing
+  // will look at again.
+  it('resumes a parked job on the answering reply instead of queuing a second one', async () => {
+    const reactions: string[] = [];
+    const requests: string[] = [];
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const parked: WorkItem = {
+            deliveryId: 'asking-delivery',
+            interactionId: 'asking-interaction',
+            repository: 'edloidas/lictor',
+            sender: 'edloidas',
+            targets: ['adiutriel'],
+            reasons: ['mentioned'],
+            subject: {
+              kind: 'issue',
+              number: 17,
+              title: 'Keep the queue moving',
+              url: 'https://github.com/edloidas/lictor/issues/17',
+            },
+          };
+          const { jobId } = yield* queue.enqueue(parked);
+          const claimed = yield* queue.claim;
+          // Under the test clock the question is asked at the epoch, which puts
+          // it before the fixture comment rather than after it.
+          yield* queue.park({
+            jobId,
+            attemptNumber: claimed?.attempts ?? 1,
+            repository: parked.repository,
+            subjectNumber: parked.subject.number,
+            question: 'which branch?',
+            answerers: ['edloidas'],
+            expiresAt: 4_000_000_000_000,
+          });
+          // The question has to be on the thread before a reply can answer it.
+          // Under the test clock it lands at the epoch, before the fixture
+          // comment rather than after it.
+          const message = yield* queue.claimOutbox;
+          yield* queue.deliverOutbox(
+            message?.id ?? 0,
+            message?.attempts ?? 1,
+            'https://github.com/edloidas/lictor/issues/17#issuecomment-1',
+          );
+          yield* queue.receiveDelivery({
+            id: 'delivery-1',
+            event: 'notification',
+            body,
+            source: 'notification',
+          });
+          const processed = yield* (yield* DeliveryWorker).runOnce;
+          return {
+            jobId,
+            processed,
+            counts: yield* queue.counts,
+            job: yield* queue.job(jobId),
+            jobs: yield* queue.listJobs(10),
+            cursor: yield* queue.notificationCursor('14567'),
+            reactions,
+          };
+        }).pipe(
+          Effect.provide(Logger.remove(Logger.defaultLogger)),
+          Effect.provide(
+            services(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }), reactions, {
+              requests,
+            }),
+          ),
+          Effect.provide(TestContext.TestContext),
+        ),
+      ),
+    );
+
+    expect(result.processed).toBe(true);
+    // One job, not two: the reply resumed the row that asked.
+    expect(result.jobs).toHaveLength(1);
+    expect(result.job?.questionId).toBeUndefined();
+    expect(result.job?.work.answerUrl).toBe(
+      'https://github.com/edloidas/lictor/issues/17#issuecomment-99',
+    );
+    // Still the asking turn's, so resuming granted nothing the question did not
+    // already hold.
+    expect(result.job?.work.reasons).toEqual(['mentioned']);
+    expect(result.counts.pending).toBe(1);
+    expect(result.cursor).toBe(Date.parse('2026-08-21T10:00:00Z'));
+    // Recorded rather than endorsed: the eyes reaction rides a fresh insert, so
+    // answering a question is currently acknowledged only by whatever the
+    // resumed job eventually posts.
+    expect(result.reactions).toEqual([]);
+  });
+
   // A dead credential says nothing about the delivery. `failed` is terminal —
   // neither the startup reset nor the control plane recovers such a row — so
   // condemning the inbox for a daemon-side misconfiguration silently voids the

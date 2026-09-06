@@ -20,6 +20,7 @@ const headline: Readonly<Record<JobOutcome, string>> = {
   rejected: 'I did not carry this out.',
   failed: 'This did not finish.',
   expired: 'This needed approval and the approval window closed before it came.',
+  unanswered: 'I asked a question here and no answer came, so I have stopped waiting.',
   canceled: 'This was canceled.',
 };
 
