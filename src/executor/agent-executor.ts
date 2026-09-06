@@ -76,8 +76,8 @@ const warnBrokenPersona = (path: string, persona: Persona): Effect.Effect<void> 
 
 /**
  * Codex failures that never recover, keyed on its own stderr tracing. Matched,
- * never echoed — `--approve-for-me` runs shell commands in the workspace, so
- * that stream carries whatever the repository holds. Which is also why the auth
+ * never echoed — the agent runs shell commands in the workspace, so that
+ * stream carries whatever the repository holds. Which is also why the auth
  * signature needs a Codex tracing module on the line: a bare `401 Unauthorized`
  * arrives from whatever the agent ran, and matching it dead-letters a job that
  * should have retried.
@@ -222,9 +222,19 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                   '--model',
                   config.codexModel,
                   ...mcpArgs,
-                  // --approve-for-me implies workspace-write; adding --sandbox is a
-                  // clap conflict on codex >= 0.147.
-                  '--approve-for-me',
+                  // ! Approvals off, not merely a sandbox: with no human here, any
+                  // ! policy that answers auto-approves escalation, and an escalated
+                  // ! command runs outside the sandbox. Every knob is pinned here
+                  // ! because CODEX_HOME's config.toml supplies whatever is not, and
+                  // ! `--sandbox` fixes only the mode — not writable roots or network.
+                  '--sandbox',
+                  'workspace-write',
+                  '-c',
+                  'approval_policy="never"',
+                  '-c',
+                  'sandbox_workspace_write.network_access=false',
+                  '-c',
+                  'sandbox_workspace_write.writable_roots=[]',
                   '--cd',
                   workdir,
                   '-',

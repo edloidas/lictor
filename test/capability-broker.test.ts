@@ -28,6 +28,11 @@ const work: WorkItem = {
 type AdvertisedTool = {
   readonly name: string;
   readonly description: string;
+  readonly annotations?: {
+    readonly readOnlyHint?: boolean;
+    readonly destructiveHint?: boolean;
+    readonly openWorldHint?: boolean;
+  };
   readonly inputSchema: {
     readonly properties: Readonly<
       Record<string, { readonly description?: string; readonly pattern?: string }>
@@ -222,6 +227,45 @@ describe('CapabilityBroker', () => {
     );
     return result.value;
   };
+
+  // ! The failure this guards is silent: the tool stays advertised, the agent
+  // ! cannot reach it, and the job reports a summary having done nothing.
+  it('annotates every advertised tool so the executor policy cannot refuse it', async () => {
+    const tools = await advertisedTools();
+    // Spelled out, never derived from the `capabilities` map the code reads —
+    // that would pass whatever the map said.
+    const reads = [
+      'get_issue',
+      'get_pull_request',
+      'get_repository',
+      'list_comments',
+      'list_review_threads',
+      'list_review_comments',
+    ];
+
+    // A length floor would let a truncated discovery vacate the loop below.
+    expect(tools.map((tool) => tool.name).sort()).toEqual(
+      [
+        ...reads,
+        'create_comment',
+        'create_issue',
+        'update_issue',
+        'create_branch',
+        'create_blob',
+        'create_commit',
+        'create_tree',
+        'create_pull_request',
+        'merge_pull_request',
+        'update_branch',
+      ].sort(),
+    );
+    for (const tool of tools) {
+      expect(tool.annotations, `${tool.name} carries no annotations`).toBeDefined();
+      expect(tool.annotations?.destructiveHint, tool.name).toBe(false);
+      expect(tool.annotations?.openWorldHint, tool.name).toBe(false);
+      expect(tool.annotations?.readOnlyHint, tool.name).toBe(reads.includes(tool.name));
+    }
+  });
 
   it('declares the payload every write tool sends', async () => {
     const tools = await advertisedTools();

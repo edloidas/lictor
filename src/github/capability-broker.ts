@@ -686,6 +686,16 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
       return {
         name,
         description,
+        // ! The executor runs `approval_policy: never`, where Codex refuses an
+        // ! unannotated tool outright: without these it is unreachable, and the
+        // ! agent reports a summary having done nothing. The hints describe this
+        // ! surface, not GitHub's — one repository, an enumerated operation set,
+        // ! re-gated per call against the job's policy and lease.
+        annotations: {
+          readOnlyHint: capabilities[name] === 'read',
+          destructiveHint: false,
+          openWorldHint: false,
+        },
         inputSchema: {
           type: 'object',
           properties: { repository: repositoryProperty, ...properties },
