@@ -411,7 +411,14 @@ describe('AgentExecutor', () => {
       'never',
       '--model',
       'gpt-5.6-luna',
-      '--approve-for-me',
+      '--sandbox',
+      'workspace-write',
+      '-c',
+      'approval_policy="never"',
+      '-c',
+      'sandbox_workspace_write.network_access=false',
+      '-c',
+      'sandbox_workspace_write.writable_roots=[]',
       '--cd',
       '/tmp/lictor-workspace',
       '-',
@@ -460,11 +467,12 @@ describe('AgentExecutor', () => {
     );
 
     expect(calls).toEqual([{ jobId: 7, attemptNumber: 2, workerId: 'worker-1' }]);
-    const mcpArgs = observed?.command.slice(
-      observed.command.indexOf('-c'),
-      observed.command.indexOf('--approve-for-me'),
-    );
-    expect(mcpArgs).toEqual([
+    // Guarded because an absent anchor makes `start` negative: the slice is then
+    // empty and the failure says nothing about which token went missing.
+    const command = observed?.command ?? [];
+    const start = command.indexOf('mcp_servers.lictor.command="bun"') - 1;
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(command.slice(start, start + 4)).toEqual([
       '-c',
       'mcp_servers.lictor.command="bun"',
       '-c',
