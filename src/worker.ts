@@ -6,6 +6,23 @@ import { canonicalRepository, Policy, policyRefusal } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 import { RepositoryWorkspace, WorkspaceError } from './workspace/repository-workspace.ts';
 
+/**
+ * Who may answer a question this job asks, fixed when it is asked rather than
+ * resolved when a reply arrives — resolving it later would let a change of
+ * policy hand an old question to someone it was never asked of.
+ */
+const answerersFor = (
+  sender: string,
+  trustedSenders: readonly string[],
+  selfLogin: string,
+): readonly string[] => [
+  ...new Set(
+    [sender, ...trustedSenders]
+      .map((login) => login.toLowerCase())
+      .filter((login) => login !== '' && login !== selfLogin.toLowerCase()),
+  ),
+];
+
 export class Worker extends Effect.Service<Worker>()('Worker', {
   effect: Effect.gen(function* () {
     const config = yield* LictorConfig;
@@ -88,6 +105,58 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         );
         return true;
       }
+
+      // Parking spends no attempt but restores none, so a question asked with
+      // the budget already gone parks a row the next claim dead-letters on
+      // sight — the thread would read: I need an answer, answered, this did
+      // not finish. Finish now and say so instead.
+      const attemptsLeft =
+        job.attempts < Math.min(repositoryPolicy.maxAttempts, config.workerMaxAttempts);
+
+      // ! Before the workspace is acquired, so a request the record could not
+      // ! hold never reaches the agent at all. Truncated instructions read as
+      // ! whole ones, and the cut part is precisely what nothing downstream can
+      // ! weigh the absence of. Asked once: a resumed job carries an answer and
+      // ! runs on it, or this would re-ask every claim and never progress.
+      if (job.work.trigger?.clipped === true && job.work.answerUrl === undefined) {
+        const clippedAt = yield* Clock.currentTimeMillis;
+        const reason = 'Request exceeded the recordable bound; refused to act on part of it';
+        if (attemptsLeft) {
+          yield* queue.park({
+            jobId: job.id,
+            attemptNumber: job.attempts,
+            repository: job.work.repository,
+            subjectNumber: job.work.subject.number,
+            question: reason,
+            answerers: answerersFor(
+              job.work.sender,
+              repositoryPolicy.trustedSenders,
+              config.expectedLogin,
+            ),
+            expiresAt: clippedAt + policy.answerExpiryMs,
+            outcome: 'clipped',
+          });
+        } else {
+          // No attempt left to ask with. `rejected` is the honest outcome: the
+          // daemon decided not to carry this out, and the reason stays in the
+          // row rather than on the thread.
+          yield* queue.fail(job.id, job.attempts, reason, undefined, 'rejected', {
+            repository: job.work.repository,
+            subjectNumber: job.work.subject.number,
+            outcome: 'rejected',
+          });
+        }
+        yield* Effect.logWarning('Refused queued work recorded from a clipped request').pipe(
+          Effect.annotateLogs({
+            job: job.id,
+            attempt: job.attempts,
+            asked: attemptsLeft,
+            durationMs: clippedAt - claimedAt,
+          }),
+        );
+        return true;
+      }
+
       const retainWorkspace = yield* Ref.make(false);
       const execution = locks
         .withPermits(
@@ -184,24 +253,12 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
           );
           return true;
         }
-        // Parking spends no attempt but restores none, so a question asked with
-        // the budget already gone parks a row the next claim dead-letters on
-        // sight — the thread would read: I need an answer, answered, this did
-        // not finish. Finish now and say so instead.
-        const attemptsLeft =
-          job.attempts < Math.min(repositoryPolicy.maxAttempts, config.workerMaxAttempts);
         if (result.right.status === 'needs_input' && attemptsLeft) {
-          // Who may answer is fixed here rather than resolved when a reply
-          // arrives: the sender this turn came from, plus whoever the
-          // repository trusts now. Resolving it later would let a change of
-          // policy hand an old question to someone it was never asked of.
-          const answerers = [
-            ...new Set(
-              [job.work.sender, ...repositoryPolicy.trustedSenders]
-                .map((login) => login.toLowerCase())
-                .filter((login) => login !== '' && login !== config.expectedLogin.toLowerCase()),
-            ),
-          ];
+          const answerers = answerersFor(
+            job.work.sender,
+            repositoryPolicy.trustedSenders,
+            config.expectedLogin,
+          );
           yield* queue.park({
             jobId: job.id,
             attemptNumber: job.attempts,

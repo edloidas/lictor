@@ -909,3 +909,117 @@ describe('Worker.runOnce observability', () => {
     expect(counts.completed).toBe(0);
   });
 });
+
+describe('Worker.runOnce on a clipped request', () => {
+  const trigger = {
+    source: { kind: 'issue_comment', id: 200 },
+    url: 'https://github.com/edloidas/lictor/issues/17#issuecomment-200',
+    text: 'do the thing and then',
+    clipped: true,
+    poster: 'edloidas',
+    revision: '2026-08-21T10:00:00Z',
+    observedAt: 1_700_000_000_000,
+  } as const;
+
+  const clippedWork: WorkItem = { ...work, trigger };
+
+  // The whole point of the guard: the agent is never handed part of a request
+  // as though it were the whole one. `Effect.die` rather than a recorded flag —
+  // a spy that is merely asserted-not-called still passes if the assertion is
+  // the thing that breaks.
+  it('parks without ever running the agent', async () => {
+    const messages = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(clippedWork);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return yield* queue.outboxFor(jobId);
+      }),
+      () => Effect.die('the executor must not run on a clipped request'),
+    );
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.outcome).toBe('clipped');
+    // ! No note. The wording is the daemon's, and every note published carries
+    // ! an "the agent's own summary" attribution that would then be false.
+    expect(messages[0]?.note).toBeUndefined();
+  });
+
+  it('leaves the job answerable rather than finished', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(clippedWork);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return { job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
+      }),
+      () => Effect.die('the executor must not run on a clipped request'),
+    );
+
+    expect(result.job?.status).toBe('pending');
+    // The question's identity, not merely its presence: the claim skips on this
+    // column and an answer is fenced by it, so a `question_id` naming no message
+    // parks a job nothing can ever resume.
+    expect(result.job?.questionId).toBe(result.messages[0]?.messageId);
+    expect(result.job?.questionAnswerers).toEqual(['edloidas']);
+  });
+
+  // Otherwise every claim re-asks and the job never progresses, however many
+  // times the requester answers.
+  it('runs the agent once an answer has come back', async () => {
+    const answered: WorkItem = { ...clippedWork, answerUrl: 'https://github.com/a/b/issues/1#c-9' };
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(answered);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return yield* queue.job(jobId);
+      }),
+      () => Effect.succeed({ status: 'completed', summary: 'done' }),
+    );
+
+    expect(result?.outcome).toBe('completed');
+  });
+
+  // Parking spends no attempt but refunds none, so with the budget gone there
+  // is nothing left to ask with. It must still not run on the fragment.
+  it('refuses instead of asking when no attempt is left to ask with', async () => {
+    const messages = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(clippedWork);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return yield* queue.outboxFor(jobId);
+      }),
+      () => Effect.die('the executor must not run on a clipped request'),
+      1,
+    );
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.outcome).toBe('rejected');
+    expect(messages[0]?.note).toBeUndefined();
+  });
+
+  it('runs normally when the record fit', async () => {
+    const whole: WorkItem = {
+      ...clippedWork,
+      trigger: { ...trigger, clipped: false },
+    };
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(whole);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return yield* queue.job(jobId);
+      }),
+      () => Effect.succeed({ status: 'completed', summary: 'done' }),
+    );
+
+    expect(result?.outcome).toBe('completed');
+  });
+});

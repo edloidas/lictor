@@ -68,6 +68,7 @@ export type JobStatus =
  */
 export type JobOutcome =
   | 'canceled'
+  | 'clipped'
   | 'completed'
   | 'expired'
   | 'failed'
@@ -1392,22 +1393,30 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       readonly attemptNumber: number;
       readonly repository: string;
       readonly subjectNumber: number;
-      /** The agent's question, published as the message's note. */
+      /** The question. Recorded either way; published only where it is the agent's. */
       readonly question: string;
       /** Logins allowed to answer, fixed here rather than resolved on reply. */
       readonly answerers: readonly string[];
       readonly expiresAt: number;
+      /** What kind of wait this is. Anything but the default is the daemon's own. */
+      readonly outcome?: JobOutcome;
     }) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
+        const outcome = input.outcome ?? 'needs_input';
         return yield* attempt('park', () =>
           database.transaction(() => {
             const questionId = insertOutbox(
               {
                 repository: input.repository,
                 subjectNumber: input.subjectNumber,
-                outcome: 'needs_input',
-                note: input.question,
+                outcome,
+                // ! `note` stays agent-authored prose and nothing else. A
+                // ! daemon question carries its wording in the outcome's own
+                // ! headline, so it publishes without one — otherwise the
+                // ! renderer would append "the agent's own summary" to words
+                // ! the agent never wrote.
+                ...(outcome === 'needs_input' ? { note: input.question } : {}),
               },
               input.jobId,
               input.attemptNumber,

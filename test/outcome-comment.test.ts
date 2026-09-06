@@ -25,6 +25,8 @@ const message = (overrides: Partial<OutboxMessage> = {}): OutboxMessage => ({
 const openings: Readonly<Record<JobOutcome, string>> = {
   completed: 'Done.',
   needs_input: 'I need an answer before I can continue.',
+  clipped:
+    'This request is longer than I can record, and I will not act on part of one. Please restate what you need in a reply.',
   rejected: 'I did not carry this out.',
   failed: 'This did not finish.',
   expired: 'This needed approval and the approval window closed before it came.',
@@ -115,5 +117,15 @@ describe('renderOutcome', () => {
 
   it('treats a note that is only whitespace as no note', () => {
     expect(renderOutcome(message({ note: '   \n\t ' }))).toBe('Done.\n\n<!-- lictor:aa11bb22 -->');
+  });
+
+  // ! The attribution line is appended to any note, so a daemon-authored one
+  // ! would be published as the agent's words. A clipped question carries its
+  // ! wording in the headline and is written with no note at all, and this is
+  // ! what pins that: it asks a whole question and credits nobody but Lictor.
+  it('asks the clipped question without crediting it to the agent', () => {
+    expect(renderOutcome(message({ outcome: 'clipped' }))).toBe(
+      `${openings.clipped}\n\n<!-- lictor:aa11bb22 -->`,
+    );
   });
 });

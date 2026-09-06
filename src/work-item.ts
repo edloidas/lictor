@@ -38,6 +38,39 @@ export type ContextRef =
   | { readonly kind: 'review_requested'; readonly id: number; readonly number: number }
   | { readonly kind: 'body'; readonly number: number };
 
+/**
+ * The request this job was accepted on, as qualification observed it.
+ *
+ * `context` says where the trigger lives and `contextUrl` how to reach it, but
+ * both resolve to whatever the sender last edited. GitHub prose is mutable and
+ * the broker offers no fetch by id, so a job that reconstructs its own intent
+ * runs on text nobody accepted — or, once the comment is deleted, on nothing.
+ * This is the copy that stops moving.
+ */
+export type TriggerRecord = {
+  readonly source: ContextRef;
+  readonly url: string;
+  /** Bounded body. Empty for an assignment or review request, which have none. */
+  readonly text: string;
+  /**
+   * ! Set when the bound could not hold the request. The worker refuses to run
+   * ! a clipped job: truncated instructions read as complete ones, and the part
+   * ! that was cut is exactly the part nothing can judge the loss of.
+   */
+  readonly clipped: boolean;
+  /**
+   * Who wrote it, before `attributed()` decided whose trust it carries. That
+   * decision belongs to `sender`; this field is the record, and the two differ
+   * whenever an edit did not elevate.
+   */
+  readonly poster: string;
+  /** Present only where an edit was attributed to a named editor. */
+  readonly editor?: string;
+  /** The version observed: the edit time where there was one, else creation. */
+  readonly revision: string;
+  readonly observedAt: number;
+};
+
 export type WorkItem = {
   readonly deliveryId: string;
   readonly interactionId: string;
@@ -60,6 +93,7 @@ export type WorkItem = {
   };
   readonly contextUrl?: string;
   readonly context?: ContextRef;
+  readonly trigger?: TriggerRecord;
   /**
    * Where the answer to this job's earlier question was posted. The only field
    * an answer adds: everything authority is derived from stays as the asking
@@ -82,10 +116,22 @@ export const ContextRefSchema: Schema.Schema<ContextRef> = Schema.Union(
   Schema.Struct({ kind: Schema.Literal('body'), number: Schema.Number }),
 );
 
+export const TriggerRecordSchema: Schema.Schema<TriggerRecord> = Schema.Struct({
+  source: ContextRefSchema,
+  url: Schema.String,
+  text: Schema.String,
+  clipped: Schema.Boolean,
+  poster: Schema.String,
+  editor: Schema.optionalWith(Schema.String, { exact: true }),
+  revision: Schema.String,
+  observedAt: Schema.Number,
+});
+
 /**
- * ! `context` is optional, not required. The schema decodes payloads already
- * ! stored, and a job queued before this field existed would otherwise fail
- * ! `decodeJob` and be dead-lettered as an invalid payload at claim time.
+ * ! `context` and `trigger` are optional, not required. The schema decodes
+ * ! payloads already stored, and a job queued before either field existed would
+ * ! otherwise fail `decodeJob` and be dead-lettered as an invalid payload at
+ * ! claim time.
  */
 export const WorkItemSchema: Schema.Schema<WorkItem> = Schema.Struct({
   deliveryId: Schema.String,
@@ -104,5 +150,6 @@ export const WorkItemSchema: Schema.Schema<WorkItem> = Schema.Struct({
   }),
   contextUrl: Schema.optionalWith(Schema.String, { exact: true }),
   context: Schema.optionalWith(ContextRefSchema, { exact: true }),
+  trigger: Schema.optionalWith(TriggerRecordSchema, { exact: true }),
   answerUrl: Schema.optionalWith(Schema.String, { exact: true }),
 });

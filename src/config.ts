@@ -135,6 +135,16 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
       stateDir: stateDirOf(databasePath),
       policyPath: yield* statePath('LICTOR_POLICY_PATH', 'policy.toml'),
       controlSocketPath: yield* statePath('LICTOR_SOCKET_PATH', 'lictor.sock'),
+      /**
+       * Two bounds, deliberately one number: the largest delivery body the
+       * poller may store, and the largest request text a job records.
+       *
+       * ! Lowering this to bound the inbox also shortens what a job may be
+       * ! accepted on. A request over it is never shortened and run anyway: the
+       * ! job asks the thread to restate it, or is refused outright where no
+       * ! attempt remains to ask with. Set it below a length people actually
+       * ! write and ordinary work stops instead of proceeding.
+       */
       deliveryMaxBytes: yield* positiveInteger(
         'LICTOR_DELIVERY_MAX_BYTES',
         1024 * 1024,

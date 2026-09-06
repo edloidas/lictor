@@ -1,7 +1,8 @@
 import { type HttpClient, HttpClientRequest } from '@effect/platform';
-import { Data, Effect, Schema } from 'effect';
+import { Clock, Data, Effect, Schema } from 'effect';
+import { bounded, exceeds } from '../bounded.ts';
 import { GitHubClient } from '../github/client.ts';
-import type { ContextRef, WorkItem } from '../work-item.ts';
+import type { ContextRef, TriggerRecord, WorkItem } from '../work-item.ts';
 import { type NotificationThread, subjectRef, UNMENTIONABLE_REASONS } from './thread.ts';
 
 /**
@@ -50,6 +51,24 @@ type Candidate = {
   readonly body: string | undefined;
   /** GraphQL's `lastEditedAt`, verbatim, once an edit has been attributed. */
   readonly editedAt?: string;
+  /**
+   * Who made that edit. Kept apart from `author` because an edit that elevates
+   * leaves `author` on the original poster, losing the editor's login entirely.
+   */
+  readonly editor?: string;
+  /**
+   * ! Who posted it, fixed at construction and never rewritten. `author` is the
+   * ! login the text is *trusted as*, which `attributed()` moves to the editor
+   * ! on an edit that did not elevate — so it cannot also serve as the record of
+   * ! who wrote it. Nothing that decides trust may read this field.
+   */
+  readonly poster: string | undefined;
+  /**
+   * The version this body was read at. Creation time until an edit is
+   * attributed, never the REST `updated_at`, which moves on any activity at all
+   * and so cannot say which text was seen.
+   */
+  readonly revision: string;
 };
 
 type Edit = {
@@ -570,20 +589,43 @@ const attributed = (
   edit: Edit | undefined,
   trusted: ReadonlySet<string>,
 ): Candidate => {
-  if (edit?.editor === undefined || edit.lastEditedAt === undefined) return candidate;
+  if (edit?.lastEditedAt === undefined) return candidate;
   const at = parseDate(edit.lastEditedAt);
   if (at === undefined) return candidate;
+  // ! The revision follows the edit even where nobody can be named for it. REST
+  // ! hands back the *edited* body either way, so leaving the stamp at creation
+  // ! would file post-edit text under the version that preceded it — the one
+  // ! pairing this record exists to make impossible. Trust is the separate
+  // ! question below, and an unattributable edit still answers it at creation.
+  const revised: Candidate = { ...candidate, revision: edit.lastEditedAt };
+  if (edit.editor === undefined) return revised;
   const original = candidate.author;
   const elevates =
     trusted.has(normalizeLogin(edit.editor)) &&
     (original === undefined || !trusted.has(normalizeLogin(original)));
   return {
-    ...candidate,
+    ...revised,
     at,
     author: elevates ? original : edit.editor,
     editedAt: edit.lastEditedAt,
+    editor: edit.editor,
   };
 };
+
+/**
+ * The accepted request, frozen. Built from what qualification already read, so
+ * nothing downstream has to fetch prose that may since have changed.
+ */
+const recordOf = (candidate: Candidate, maxBytes: number, observedAt: number): TriggerRecord => ({
+  source: candidate.ref,
+  url: candidate.url,
+  text: bounded(candidate.body ?? '', maxBytes),
+  clipped: exceeds(candidate.body ?? '', maxBytes),
+  poster: candidate.poster ?? '',
+  ...(candidate.editor === undefined ? {} : { editor: candidate.editor }),
+  revision: candidate.revision,
+  observedAt,
+});
 
 const commentCandidate = (
   comment: Schema.Schema.Type<typeof Comment>,
@@ -595,6 +637,8 @@ const commentCandidate = (
     {
       at: Date.parse(comment.created_at),
       author: comment.user?.login,
+      poster: comment.user?.login,
+      revision: comment.created_at,
       ref: { kind, id: comment.id },
       url: comment.html_url,
       body: comment.body,
@@ -654,6 +698,13 @@ export const qualifyNotification = (input: {
    * reads as an ordinary mention and starts a job of its own.
    */
   readonly answersTaken?: readonly string[];
+  /**
+   * Byte budget for the recorded trigger text. Shares the delivery's ceiling
+   * rather than deriving one from GitHub's own body cap, which is undocumented
+   * and stated in characters — this way nothing here depends on that number
+   * being right, only on it being the smaller of the two.
+   */
+  readonly triggerMaxBytes: number;
 }): Effect.Effect<QualifiedNotification, NotificationError, GitHubClient> =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -737,6 +788,22 @@ export const qualifyNotification = (input: {
         isEdited(subject.created_at, subject.updated_at),
       );
 
+      // Held separately as well as ranked: an assignment carries no body of its
+      // own, so the subject is the bounded context that defines that task.
+      const subjectCandidate = attributed(
+        {
+          at: Date.parse(subject.created_at),
+          author: subject.user?.login,
+          poster: subject.user?.login,
+          revision: subject.created_at,
+          ref: { kind: 'body', number: ref.number },
+          url: subject.html_url,
+          body: subject.body,
+        },
+        edits.subject,
+        trusted,
+      );
+
       const candidates: Candidate[] = [
         ...conversationComments.map((comment) =>
           commentCandidate(comment, 'issue_comment', edits.nodes.get(comment.node_id), trusted),
@@ -751,6 +818,8 @@ export const qualifyNotification = (input: {
             {
               at: review.submitted_at === undefined ? Number.NaN : Date.parse(review.submitted_at),
               author: review.user?.login,
+              poster: review.user?.login,
+              revision: review.submitted_at ?? '',
               ref: { kind: 'review', id: review.id, number: ref.number },
               url: review.html_url,
               body: review.body,
@@ -759,17 +828,7 @@ export const qualifyNotification = (input: {
             trusted,
           ),
         ),
-        attributed(
-          {
-            at: Date.parse(subject.created_at),
-            author: subject.user?.login,
-            ref: { kind: 'body', number: ref.number },
-            url: subject.html_url,
-            body: subject.body,
-          },
-          edits.subject,
-          trusted,
-        ),
+        subjectCandidate,
       ];
 
       const windowed =
@@ -924,6 +983,7 @@ export const qualifyNotification = (input: {
       const hasTrustedTrigger = assignedEvent !== undefined || mentionTrigger !== undefined;
       const useContinuation = !hasTrustedTrigger && continuationTrigger !== undefined;
 
+      const observedAt = yield* Clock.currentTimeMillis;
       const common = {
         deliveryId: input.deliveryId,
         repository,
@@ -942,6 +1002,11 @@ export const qualifyNotification = (input: {
           reason === 'assign' ? assignedEvent.actor?.login : assignedEvent.review_requester?.login;
         const sender = normalizeLogin(causer ?? '');
         const contextKind = reason === 'assign' ? 'assigned' : 'review_requested';
+        const context: ContextRef = {
+          kind: contextKind,
+          id: assignedEvent.id,
+          number: ref.number,
+        };
         const work: WorkItem = {
           ...common,
           interactionId: JSON.stringify([
@@ -956,7 +1021,14 @@ export const qualifyNotification = (input: {
           sender,
           reasons: [contextKind],
           contextUrl: subject.html_url,
-          context: { kind: contextKind, id: assignedEvent.id, number: ref.number },
+          context,
+          // The trusted event names the task; the subject body is what it is
+          // about. Recording the event alone would leave nothing to act on.
+          trigger: recordOf(
+            { ...subjectCandidate, ref: context },
+            input.triggerMaxBytes,
+            observedAt,
+          ),
         };
         return { work, ...answered, lastActivityAt };
       }
@@ -985,6 +1057,7 @@ export const qualifyNotification = (input: {
         ...(continued ? { continuation: true } : {}),
         contextUrl: triggering.url,
         context: triggering.ref,
+        trigger: recordOf(triggering, input.triggerMaxBytes, observedAt),
       };
 
       return { work, ...answered, lastActivityAt };
