@@ -200,6 +200,14 @@ const metadataOf = (prompt: string) => {
     readonly sender: string;
     readonly targets: readonly string[];
     readonly subject: { readonly title: string };
+    readonly trigger?: {
+      readonly text: string;
+      readonly clipped: boolean;
+      readonly postedBy: string;
+      readonly editedBy?: string;
+      readonly revision: string;
+      readonly observedAt: number;
+    };
   };
 };
 
@@ -242,6 +250,81 @@ describe('buildPrompt', () => {
 
     // The 512th byte is the second of the 171st snowman; it goes whole or not at all.
     expect(metadataOf(prompt).subject.title).toBe('☃'.repeat(170));
+  });
+
+  it('carries the recorded request and says GitHub may no longer match it', () => {
+    const prompt = buildPrompt({
+      ...work,
+      trigger: {
+        source: { kind: 'issue_comment', id: 200 },
+        url: 'https://github.com/edloidas/lictor/issues/17#issuecomment-200',
+        text: 'ship the parser fix',
+        clipped: false,
+        poster: 'edloidas',
+        editor: 'friend',
+        revision: '2026-08-21T11:00:00Z',
+        observedAt: 1_700_000_000_000,
+      },
+    });
+    const trigger = metadataOf(prompt).trigger;
+
+    expect(trigger?.text).toBe('ship the parser fix');
+    expect(trigger?.postedBy).toBe('edloidas');
+    expect(trigger?.editedBy).toBe('friend');
+    expect(trigger?.revision).toBe('2026-08-21T11:00:00Z');
+    expect(prompt).toContain('may since have been edited or deleted');
+  });
+
+  // ! One bound decides both what is recorded and what the agent acts on. A
+  // ! second bound here would cut text that already passed the worker's clipped
+  // ! check, with nothing left to mark it partial — which is the exact failure
+  // ! the record exists to prevent, one layer further down.
+  it('passes a record that fit the bound to the agent whole', () => {
+    const text = 'y'.repeat(40_000);
+    const prompt = buildPrompt({
+      ...work,
+      trigger: {
+        source: { kind: 'issue_comment', id: 200 },
+        url: 'https://github.com/edloidas/lictor/issues/17#issuecomment-200',
+        text,
+        clipped: false,
+        poster: 'edloidas',
+        revision: '2026-08-21T10:00:00Z',
+        observedAt: 1_700_000_000_000,
+      },
+    });
+
+    expect(metadataOf(prompt).trigger?.text).toBe(text);
+  });
+
+  // The job only runs at all because someone was asked to restate the request
+  // and did. Calling the fragment authorized would point the agent back at the
+  // text the daemon refused, and told the thread it refused.
+  it('tells the agent a clipped record is a fragment, not the request', () => {
+    const prompt = buildPrompt({
+      ...work,
+      answerUrl: 'https://github.com/edloidas/lictor/issues/17#issuecomment-300',
+      trigger: {
+        source: { kind: 'issue_comment', id: 200 },
+        url: 'https://github.com/edloidas/lictor/issues/17#issuecomment-200',
+        text: 'do the thing and then',
+        clipped: true,
+        poster: 'edloidas',
+        revision: '2026-08-21T10:00:00Z',
+        observedAt: 1_700_000_000_000,
+      },
+    });
+
+    expect(metadataOf(prompt).trigger?.clipped).toBe(true);
+    expect(prompt).toContain('`trigger` is a *fragment*');
+    expect(prompt).not.toContain('the recorded text is what you were authorized to act on');
+  });
+
+  it('says nothing about a recorded request on a job queued before there were any', () => {
+    const prompt = buildPrompt(work);
+
+    expect(metadataOf(prompt).trigger).toBeUndefined();
+    expect(prompt).not.toContain('may since have been edited or deleted');
   });
 });
 

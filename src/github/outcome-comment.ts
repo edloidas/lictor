@@ -17,6 +17,10 @@ export const outcomeMarker = (messageId: string): string => `<!-- lictor:${messa
 const headline: Readonly<Record<JobOutcome, string>> = {
   completed: 'Done.',
   needs_input: 'I need an answer before I can continue.',
+  // Carries its own question, because it is asked with no note: the words are
+  // the daemon's, and every note published here is attributed to the agent.
+  clipped:
+    'This request is longer than I can record, and I will not act on part of one. Please restate what you need in a reply.',
   rejected: 'I did not carry this out.',
   failed: 'This did not finish.',
   expired: 'This needed approval and the approval window closed before it came.',

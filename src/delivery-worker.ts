@@ -114,6 +114,7 @@ const processBySource: Record<
       const { login } = yield* identity.verified;
       const queue = yield* WorkQueue;
       const policy = yield* Policy;
+      const config = yield* LictorConfig;
       // Trust is resolved per repository, not globally: trusted for one owner's
       // repositories is not trusted for every other one she can access.
       const threadPolicy = policy.forRepository(thread.repository.full_name);
@@ -142,6 +143,7 @@ const processBySource: Record<
         cursorMs,
         live,
         answersTaken,
+        triggerMaxBytes: config.deliveryMaxBytes,
         ...(parked === undefined
           ? {}
           : {

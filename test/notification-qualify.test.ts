@@ -7,6 +7,14 @@ import type { NotificationThread } from '../src/notifications/thread.ts';
 
 const policy = { selfLogin: 'adiutriel', trustedSenders: ['edloidas', 'friend'] };
 
+/** Wide enough that nothing here clips unless a case asks for it. */
+const TRIGGER_MAX = 64 * 1024;
+
+type QualifyInput = Parameters<typeof qualifyNotification>[0];
+
+const qualifyWith = (input: Omit<QualifyInput, 'triggerMaxBytes'> & { triggerMaxBytes?: number }) =>
+  qualifyNotification({ triggerMaxBytes: TRIGGER_MAX, ...input });
+
 const thread = (overrides: Partial<NotificationThread> = {}): NotificationThread => ({
   id: '14567',
   unread: true,
@@ -151,7 +159,7 @@ describe('qualifyNotification', () => {
   // scan it would discard the mention outright.
   it('scans a thread whose reason is not mention', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ reason: 'assign' }),
         policy,
@@ -167,7 +175,7 @@ describe('qualifyNotification', () => {
 
   it('skips machine traffic without spending a request, and still advances the cursor', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'notification:14567:2026-08-21T10:00:00Z',
         thread: thread({ reason: 'ci_activity' }),
         policy,
@@ -184,7 +192,7 @@ describe('qualifyNotification', () => {
 
   it('returns no work when the subject url carries no issue number', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({
           subject: {
@@ -205,7 +213,7 @@ describe('qualifyNotification', () => {
 
   it('turns a trusted mention in a comment into work', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -233,7 +241,7 @@ describe('qualifyNotification', () => {
   // edit of the same comment a second job.
   it('builds an interaction id from identities only', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -250,7 +258,7 @@ describe('qualifyNotification', () => {
 
   it('treats a body mention with no comments as the trigger', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -274,7 +282,7 @@ describe('qualifyNotification', () => {
 
   it('lets the newest mentioning comment in one window decide the sender', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -297,7 +305,7 @@ describe('qualifyNotification', () => {
   // the cursor advances, and the real request is never rescanned.
   it('ignores an untrusted mention layered over a trusted one', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -316,7 +324,7 @@ describe('qualifyNotification', () => {
 
   it('returns no work when only untrusted senders mentioned her', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -340,7 +348,7 @@ describe('qualifyNotification', () => {
     // edit is attributed only once GraphQL names who made it.
     it('attributes a mention inserted by editing to the editor', async () => {
       const result = await run(
-        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
         [
           graphql([{ id: 'IC_99', editor: { login: 'friend' }, lastEditedAt: editedAt }]),
           ...issueRoutes(issue(), [edited]),
@@ -360,7 +368,7 @@ describe('qualifyNotification', () => {
     // filter cannot be what drops it — only attribution can.
     it('does not attribute an edit to the original author', async () => {
       const result = await run(
-        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
         [
           graphql([{ id: 'IC_99', editor: { login: 'stranger' }, lastEditedAt: editedAt }]),
           ...issueRoutes(issue(), [
@@ -376,7 +384,7 @@ describe('qualifyNotification', () => {
     // write the instruction in it, so the edit must not lift it to their trust.
     it("does not lift a stranger's text to the trust of whoever edited it", async () => {
       const result = await run(
-        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
         [
           graphql([{ id: 'IC_99', editor: { login: 'edloidas' }, lastEditedAt: editedAt }]),
           ...issueRoutes(issue(), [comment({ ...edited, user: { login: 'stranger' } })]),
@@ -388,7 +396,7 @@ describe('qualifyNotification', () => {
 
     it("attributes a trusted author's text edited by another trusted user to the editor", async () => {
       const result = await run(
-        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
         [
           graphql([{ id: 'IC_99', editor: { login: 'friend' }, lastEditedAt: editedAt }]),
           ...issueRoutes(issue(), [comment({ ...edited, user: { login: 'edloidas' } })]),
@@ -402,7 +410,7 @@ describe('qualifyNotification', () => {
     // a trusted edit of it is treated like any other foreign edit and dropped.
     it('drops a trusted edit of a comment whose author is gone', async () => {
       const result = await run(
-        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
         [
           graphql([{ id: 'IC_99', editor: { login: 'edloidas' }, lastEditedAt: editedAt }]),
           ...issueRoutes(issue(), [comment({ ...edited, user: null })]),
@@ -416,7 +424,7 @@ describe('qualifyNotification', () => {
     // same way a fresh reply from them would.
     it('lets an untrusted editor continue live work', async () => {
       const result = await run(
-        qualifyNotification({
+        qualifyWith({
           deliveryId: 'delivery',
           thread: thread(),
           policy,
@@ -438,7 +446,7 @@ describe('qualifyNotification', () => {
     // author there would be exactly the misattribution the lookup prevents.
     it('ignores an edit whose editor GraphQL does not name', async () => {
       const result = await run(
-        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
         [
           graphql([{ id: 'IC_99', editor: null, lastEditedAt: editedAt }]),
           ...issueRoutes(issue(), [edited]),
@@ -450,7 +458,7 @@ describe('qualifyNotification', () => {
 
     it('spends no request on a thread where nothing was edited', async () => {
       const result = await run(
-        qualifyNotification({
+        qualifyWith({
           deliveryId: 'delivery',
           thread: thread(),
           policy,
@@ -466,7 +474,7 @@ describe('qualifyNotification', () => {
     // An enrichment failure, inside the retry budget like every other one.
     it('fails with NotificationError when the editor lookup is refused', async () => {
       const result = await run(
-        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
         [
           ['/graphql', { status: 502, body: { message: 'Bad Gateway' } }],
           ...issueRoutes(issue(), [edited]),
@@ -480,7 +488,7 @@ describe('qualifyNotification', () => {
 
     it('fails with NotificationError when GraphQL answers with errors and no data', async () => {
       const result = await run(
-        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
         [
           ['/graphql', { body: { data: null, errors: [{ message: 'Something went wrong' }] } }],
           ...issueRoutes(issue(), [edited]),
@@ -498,21 +506,18 @@ describe('qualifyNotification', () => {
       const at = async (lastEditedAt: string) =>
         qualified(
           (
-            await run(
-              qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
-              [
-                graphql([{ id: 'IC_99', editor: { login: 'edloidas' }, lastEditedAt }]),
-                ...issueRoutes(issue(), [
-                  comment({ updated_at: lastEditedAt, created_at: '2026-08-20T08:00:00Z' }),
-                ]),
-              ],
-            )
+            await run(qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }), [
+              graphql([{ id: 'IC_99', editor: { login: 'edloidas' }, lastEditedAt }]),
+              ...issueRoutes(issue(), [
+                comment({ updated_at: lastEditedAt, created_at: '2026-08-20T08:00:00Z' }),
+              ]),
+            ])
           ).exit,
         ).work?.interactionId;
       const unedited = qualified(
         (
           await run(
-            qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+            qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
             issueRoutes(issue(), [comment()]),
           )
         ).exit,
@@ -544,7 +549,7 @@ describe('qualifyNotification', () => {
     // delivery; its candidate keeps its creation.
     it('keeps a candidate at its creation when GraphQL cannot resolve its node', async () => {
       const result = await run(
-        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
         [
           [
             '/graphql',
@@ -565,7 +570,7 @@ describe('qualifyNotification', () => {
 
   it('drops her own activity structurally', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -579,7 +584,7 @@ describe('qualifyNotification', () => {
 
   it('returns no work when nothing in the window mentions her', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -595,7 +600,7 @@ describe('qualifyNotification', () => {
   // matching it would put someone else's mention into her queue.
   it('does not match a login that merely prefixes hers', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -620,7 +625,7 @@ describe('qualifyNotification', () => {
     // editor, and GraphQL is the only place that names them.
     it('attributes a body mention inserted by editing to the editor', async () => {
       const result = await run(
-        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
         [
           graphql([], { id: 'I_7', editor: { login: 'friend' }, lastEditedAt: editedAt }),
           ...issueRoutes(editedIssue, []),
@@ -635,7 +640,7 @@ describe('qualifyNotification', () => {
 
     it('does not attribute a body edit to whoever opened the issue', async () => {
       const result = await run(
-        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
         [
           graphql([], { id: 'I_7', editor: { login: 'stranger' }, lastEditedAt: editedAt }),
           ...issueRoutes(editedIssue, []),
@@ -650,7 +655,7 @@ describe('qualifyNotification', () => {
     // was opened — outside this window.
     it('keeps a body at its opening when activity moved updated_at without an edit', async () => {
       const result = await run(
-        qualifyNotification({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
+        qualifyWith({ deliveryId: 'delivery', thread: thread(), policy, cursorMs }),
         [
           graphql([], { id: 'I_7', editor: null, lastEditedAt: null }),
           ...issueRoutes(editedIssue, []),
@@ -691,10 +696,7 @@ describe('qualifyNotification', () => {
     const cursorMs = Date.parse('2026-08-21T09:00:00Z');
     const editedAt = '2026-08-21T10:00:00Z';
     const qualify = (routes: readonly (readonly [string, Reply])[]) =>
-      run(
-        qualifyNotification({ deliveryId: 'delivery', thread: pullThread, policy, cursorMs }),
-        routes,
-      );
+      run(qualifyWith({ deliveryId: 'delivery', thread: pullThread, policy, cursorMs }), routes);
 
     // REST gives a review no `updated_at`, so unlike a comment there is no local
     // signal that it was edited: every review in the window is asked about.
@@ -774,7 +776,7 @@ describe('qualifyNotification', () => {
         }),
       );
       const result = await run(
-        qualifyNotification({
+        qualifyWith({
           deliveryId: 'delivery',
           thread: pullThread,
           policy,
@@ -841,7 +843,7 @@ describe('qualifyNotification', () => {
     const newest = comment({ id: 900, updated_at: '2026-08-21T10:00:00Z' });
     const link = '<https://api.github.test/x?page=3>; rel="last"';
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -870,7 +872,7 @@ describe('qualifyNotification', () => {
     const trigger = comment({ id: 1500, updated_at: '2026-08-21T10:00:00Z' });
     const buried = comment({ id: 1, updated_at: '2026-08-21T07:00:00Z' });
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -899,7 +901,7 @@ describe('qualifyNotification', () => {
   // no anchor, which turns a malformed envelope into a full history scan.
   it('drops a thread whose activity time is unreadable', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ updated_at: 'not a date' }),
         policy,
@@ -914,7 +916,7 @@ describe('qualifyNotification', () => {
 
   it('fails with NotificationError when GitHub refuses the subject fetch', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -933,7 +935,7 @@ describe('qualifyNotification', () => {
   // it ever received into one window and overflow the page ceiling.
   it('anchors the comment scan on the cursor when there is one', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -949,7 +951,7 @@ describe('qualifyNotification', () => {
 
   it('falls back to the read mark, and sends no since when there is neither', async () => {
     const read = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ last_read_at: '2026-08-20T09:00:00Z' }),
         policy,
@@ -958,7 +960,7 @@ describe('qualifyNotification', () => {
       issueRoutes(issue(), [comment()]),
     );
     const unread = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -975,7 +977,7 @@ describe('qualifyNotification', () => {
 
   const workFor = async (body: string) => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1151,7 +1153,7 @@ describe('qualifyNotification', () => {
   it('does not render a body from a sender who is not trusted', async () => {
     const started = Bun.nanoseconds();
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1183,7 +1185,7 @@ describe('qualifyNotification', () => {
 
   it('reads review comments for a pull request and can trigger on one', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({
           subject: {
@@ -1227,7 +1229,7 @@ describe('qualifyNotification', () => {
   // and was covered by the deleted `pull_request_review` webhook handler.
   it('triggers on a mention in a submitted review body', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({
           subject: {
@@ -1277,7 +1279,7 @@ describe('qualifyNotification', () => {
 
   it('ignores a comment with no author', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1306,7 +1308,7 @@ describe('qualifyNotification', () => {
   // so the mention scan cannot see it and the actor must come from `assigned`.
   it('acts on a trusted assignment with no mention anywhere', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ reason: 'assign' }),
         policy,
@@ -1324,7 +1326,7 @@ describe('qualifyNotification', () => {
 
   it('drops an assignment from an untrusted actor', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ reason: 'assign' }),
         policy,
@@ -1338,7 +1340,7 @@ describe('qualifyNotification', () => {
 
   it('drops her own assignment structurally', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ reason: 'assign' }),
         policy,
@@ -1352,7 +1354,7 @@ describe('qualifyNotification', () => {
 
   it('ignores an assignment that predates the window', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ reason: 'assign' }),
         policy,
@@ -1366,7 +1368,7 @@ describe('qualifyNotification', () => {
 
   it('acts on a trusted review request naming her individually', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ reason: 'review_requested' }),
         policy,
@@ -1392,7 +1394,7 @@ describe('qualifyNotification', () => {
   // attribute and nobody to trust — skipped rather than guessed.
   it('skips a review request aimed at a team', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ reason: 'review_requested' }),
         policy,
@@ -1416,7 +1418,7 @@ describe('qualifyNotification', () => {
   // silence the other.
   it('keeps a review request alive when her assignment is withdrawn', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ reason: 'review_requested' }),
         policy,
@@ -1451,7 +1453,7 @@ describe('qualifyNotification', () => {
   it('cancels a same-second assignment withdrawn after it', async () => {
     const stamp = '2026-08-21T10:00:00Z';
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ reason: 'assign' }),
         policy,
@@ -1476,7 +1478,7 @@ describe('qualifyNotification', () => {
   it('keeps a same-second assignment reassigned after a withdrawal', async () => {
     const stamp = '2026-08-21T10:00:00Z';
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ reason: 'assign' }),
         policy,
@@ -1502,7 +1504,7 @@ describe('qualifyNotification', () => {
   // asked for by the time anyone could notice.
   it('drops an assignment that was rescinded after it was made', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ reason: 'assign' }),
         policy,
@@ -1526,7 +1528,7 @@ describe('qualifyNotification', () => {
   // assigner silence a trusted one with assign → unassign → assign.
   it('lets the newest trusted assignment win when an untrusted one is newer', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ reason: 'assign' }),
         policy,
@@ -1549,7 +1551,7 @@ describe('qualifyNotification', () => {
   // must not suppress a trusted assignment in the same window.
   it('prefers a trusted assignment over an untrusted mention in the window', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread({ reason: 'assign' }),
         policy,
@@ -1570,7 +1572,7 @@ describe('qualifyNotification', () => {
   // work going inside the armed window, at continuation strength.
   it('continues live work from an untrusted non-mentioning reply', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1596,7 +1598,7 @@ describe('qualifyNotification', () => {
 
   it('reads an authorized reply as the answer to the parked question', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1622,7 +1624,7 @@ describe('qualifyNotification', () => {
 
   it('leaves a reply from someone the question did not ask as ordinary context', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1649,7 +1651,7 @@ describe('qualifyNotification', () => {
     ['exactly as old as', '2026-08-21T10:00:00Z'],
   ])('does not let a reply %s the question answer it', async (_name, askedAt) => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1672,7 +1674,7 @@ describe('qualifyNotification', () => {
   // cleared, so without this record the comment reads as a fresh mention.
   it('keeps a comment already taken as an answer out of the trigger pool', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1694,7 +1696,7 @@ describe('qualifyNotification', () => {
   // would retire that issue's description as a trigger for good.
   it('never suppresses the subject body as an answer already taken', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1717,7 +1719,7 @@ describe('qualifyNotification', () => {
     // Editing the description is not replying. Reading it as an answer would
     // let one edit resume a job, from a body that may predate the question.
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1745,7 +1747,7 @@ describe('qualifyNotification', () => {
 
   it('answers with the newest authorized reply rather than the first', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1786,7 +1788,7 @@ describe('qualifyNotification', () => {
   // worse than running a second one beside it.
   it('answers with a trusted mention rather than starting a second job from it', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1803,7 +1805,7 @@ describe('qualifyNotification', () => {
 
   it('ignores an untrusted reply when the thread is not live', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1825,7 +1827,7 @@ describe('qualifyNotification', () => {
   // continuation turn.
   it('keeps a trusted mention authoritative when an untrusted reply is newer', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1852,7 +1854,7 @@ describe('qualifyNotification', () => {
 
   it('stops continuing once the subject is closed', async () => {
     const result = await run(
-      qualifyNotification({
+      qualifyWith({
         deliveryId: 'delivery',
         thread: thread(),
         policy,
@@ -1865,5 +1867,233 @@ describe('qualifyNotification', () => {
     );
 
     expect(qualified(result.exit).work).toBeUndefined();
+  });
+});
+
+describe('qualifyNotification trigger record', () => {
+  const assignment = {
+    id: 3001,
+    event: 'assigned',
+    actor: { login: 'edloidas' },
+    assignee: { login: 'adiutriel' },
+    created_at: '2026-08-21T10:00:00Z',
+  };
+
+  it('records the comment that triggered it, with who wrote it and when it was read', async () => {
+    const before = Date.now();
+    const result = await run(
+      qualifyWith({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+      }),
+      issueRoutes(issue({ body: 'no mention here' }), [
+        comment({
+          id: 200,
+          html_url: 'https://github.com/edloidas/sandbox/issues/7#issuecomment-200',
+          body: '@adiutriel ship the parser fix',
+        }),
+      ]),
+    );
+    const after = Date.now();
+
+    const trigger = qualified(result.exit).work?.trigger;
+    expect(trigger?.text).toBe('@adiutriel ship the parser fix');
+    expect(trigger?.clipped).toBe(false);
+    expect(trigger?.poster).toBe('edloidas');
+    expect(trigger?.editor).toBeUndefined();
+    expect(trigger?.source).toEqual({ kind: 'issue_comment', id: 200 });
+    expect(trigger?.url).toBe('https://github.com/edloidas/sandbox/issues/7#issuecomment-200');
+    // Creation, not `updated_at` — which moves on any activity on the thread
+    // and so cannot say which text was read.
+    expect(trigger?.revision).toBe('2026-08-21T10:00:00Z');
+    // Bracketed by the call, so a constant cannot pass: this is when the daemon
+    // read the text, not anything GitHub reported about it.
+    expect(trigger?.observedAt).toBeGreaterThanOrEqual(before);
+    expect(trigger?.observedAt).toBeLessThanOrEqual(after);
+  });
+
+  it('separates who posted the text from who it is trusted as', async () => {
+    const result = await run(
+      qualifyWith({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+      }),
+      [
+        graphql([
+          { id: 'IC_200', editor: { login: 'friend' }, lastEditedAt: '2026-08-21T11:00:00Z' },
+        ]),
+        ...issueRoutes(issue({ body: 'no mention here' }), [
+          comment({
+            id: 200,
+            user: { login: 'edloidas' },
+            body: '@adiutriel ship the parser fix',
+            updated_at: '2026-08-21T11:00:00Z',
+            created_at: '2026-08-21T10:00:00Z',
+          }),
+        ]),
+      ],
+    );
+
+    const work = qualified(result.exit).work;
+    // One trusted user tidying another's comment. The edit elevates nothing —
+    // both are trusted — so `attributed()` moves the trust to the editor and
+    // `sender` becomes them. The record is the other half of that: it still
+    // names who actually wrote the words, and stamps the version it read.
+    expect(work?.sender).toBe('friend');
+    expect(work?.trigger?.poster).toBe('edloidas');
+    expect(work?.trigger?.editor).toBe('friend');
+    expect(work?.trigger?.revision).toBe('2026-08-21T11:00:00Z');
+    // The point of storing the prose at all: it survives whatever GitHub does
+    // to the comment next. A ref alone would resolve to the edited text.
+    expect(work?.trigger?.text).toBe('@adiutriel ship the parser fix');
+  });
+
+  // ! REST returns the edited body whether or not GraphQL can name an editor —
+  // ! a deleted account resolves to `editor: null`. Leaving the stamp at
+  // ! creation would file post-edit text under the version before it, which is
+  // ! the one pairing this record exists to make impossible. Trust is the
+  // ! separate question, and it still answers at creation here.
+  it('stamps an edit GitHub can name no editor for at the time of the edit', async () => {
+    const result = await run(
+      qualifyWith({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+      }),
+      [
+        graphql([{ id: 'IC_200', editor: null, lastEditedAt: '2026-08-21T11:00:00Z' }]),
+        ...issueRoutes(issue({ body: 'no mention here' }), [
+          comment({
+            id: 200,
+            body: '@adiutriel ship the parser fix',
+            created_at: '2026-08-21T10:00:00Z',
+            updated_at: '2026-08-21T11:00:00Z',
+          }),
+        ]),
+      ],
+    );
+
+    const work = qualified(result.exit).work;
+    // Unattributable, so trust stays with the original poster.
+    expect(work?.sender).toBe('edloidas');
+    expect(work?.trigger?.editor).toBeUndefined();
+    expect(work?.trigger?.revision).toBe('2026-08-21T11:00:00Z');
+  });
+
+  it('marks a request the bound could not hold, and keeps the part that fit', async () => {
+    const body = `@adiutriel ${'x'.repeat(500)}`;
+    const result = await run(
+      qualifyWith({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        triggerMaxBytes: 64,
+      }),
+      issueRoutes(issue({ body: 'no mention here' }), [comment({ id: 200, body })]),
+    );
+
+    const trigger = qualified(result.exit).work?.trigger;
+    expect(trigger?.clipped).toBe(true);
+    expect(trigger?.text).toBe(body.slice(0, 64));
+  });
+
+  // The bound is inclusive. A request that fills it exactly was recorded whole,
+  // so refusing it would park a job nothing was ever lost from.
+  it('does not clip a request that fills the bound exactly', async () => {
+    const body = '@adiutriel '.padEnd(64, 'x');
+    const result = await run(
+      qualifyWith({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        triggerMaxBytes: 64,
+      }),
+      issueRoutes(issue({ body: 'no mention here' }), [comment({ id: 200, body })]),
+    );
+
+    const trigger = qualified(result.exit).work?.trigger;
+    expect(Buffer.byteLength(body)).toBe(64);
+    expect(trigger?.clipped).toBe(false);
+    expect(trigger?.text).toBe(body);
+  });
+
+  // `@adiutriel ` is 11 bytes and each 🎉 is four, so the bound falls either on
+  // a codepoint boundary or inside one. A cut inside one must drop the partial
+  // rather than leave U+FFFD, which would record a character nobody wrote.
+  it.each([
+    [15, '@adiutriel 🎉'],
+    [14, '@adiutriel '],
+  ])('cuts at %i bytes without leaving a replacement character', async (max, expected) => {
+    const result = await run(
+      qualifyWith({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        triggerMaxBytes: max,
+      }),
+      issueRoutes(issue({ body: 'no mention here' }), [
+        comment({ id: 200, body: '@adiutriel 🎉🎉' }),
+      ]),
+    );
+
+    const trigger = qualified(result.exit).work?.trigger;
+    expect(trigger?.clipped).toBe(true);
+    expect(trigger?.text).toBe(expected);
+    expect(trigger?.text).not.toContain('�');
+  });
+
+  // An assignment carries no comment at all, so the record is the trusted event
+  // plus the subject body that defines the task.
+  it('records the subject body for an assignment, under the event that caused it', async () => {
+    const result = await run(
+      qualifyWith({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'assign' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      [
+        ['/issues/7/events', { body: [assignment] }],
+        // Opened by someone other than the assigner, so a record that stored
+        // the assigner as `poster` cannot pass this by coincidence.
+        ...issueRoutes(
+          issue({ body: 'the parser drops trailing commas', user: { login: 'reporter' } }),
+          [],
+        ),
+      ],
+    );
+
+    const work = qualified(result.exit).work;
+    expect(work?.sender).toBe('edloidas');
+    expect(work?.trigger?.text).toBe('the parser drops trailing commas');
+    expect(work?.trigger?.clipped).toBe(false);
+    // The task's own author, who is not the assigner.
+    expect(work?.trigger?.poster).toBe('reporter');
+    expect(work?.trigger?.source).toEqual({ kind: 'assigned', id: 3001, number: 7 });
+  });
+
+  it('records an empty text for an assignment on an issue with no description', async () => {
+    const result = await run(
+      qualifyWith({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'assign' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      [['/issues/7/events', { body: [assignment] }], ...issueRoutes(issue({ body: null }), [])],
+    );
+
+    const trigger = qualified(result.exit).work?.trigger;
+    expect(trigger?.text).toBe('');
+    // Nothing was cut: there was nothing to cut.
+    expect(trigger?.clipped).toBe(false);
   });
 });

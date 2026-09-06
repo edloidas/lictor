@@ -89,7 +89,11 @@ local process polling on an interval and is not expected to absorb load.
   was only ever shown as code.
 - Protect `~/.lictor/lictor.sqlite`: it stores issue metadata, execution errors,
   and bounded agent output. It stores the notification thread envelope, which
-  carries a subject title and urls, but never comment bodies.
+  carries a subject title and urls, and — for each accepted job — the bounded
+  text of the one comment or subject body that triggered it, with who posted it,
+  who last edited it, and when it was read. That record is what makes an
+  authorization explainable after the comment is edited or deleted; it is never
+  posted back to GitHub, and no other body is kept.
 - `LICTOR_EXECUTOR=disabled` is the safe mode for validating a new token or
   allowlist. Work remains pending until execution is re-enabled — but polling
   still marks threads read, so her inbox is consumed either way.

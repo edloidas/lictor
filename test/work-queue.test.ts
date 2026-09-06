@@ -69,6 +69,47 @@ const deliverPending = Effect.gen(function* () {
   return claimed;
 });
 
+describe('WorkQueue trigger record', () => {
+  it('round-trips the accepted request through the payload', async () => {
+    const trigger = {
+      source: { kind: 'issue_comment', id: 200 },
+      url: 'https://github.com/edloidas/lictor/issues/17#issuecomment-200',
+      text: 'ship the parser fix',
+      clipped: false,
+      poster: 'edloidas',
+      editor: 'friend',
+      revision: '2026-08-21T11:00:00Z',
+      observedAt: 1_700_000_000_000,
+    } as const;
+
+    const claimed = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue({ ...work('with-trigger'), trigger });
+        return yield* queue.claim;
+      }),
+    );
+
+    expect(claimed?.work.trigger).toEqual(trigger);
+  });
+
+  // ! The reason the field is optional. A job queued before it existed must
+  // ! still claim; a required field would dead-letter the whole backlog as
+  // ! invalid payloads the first time this build ran.
+  it('claims a job queued before the record existed', async () => {
+    const claimed = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(work('no-trigger'));
+        return yield* queue.claim;
+      }),
+    );
+
+    expect(claimed?.work.trigger).toBeUndefined();
+    expect(claimed?.status).toBe('running');
+  });
+});
+
 describe('WorkQueue', () => {
   it('persists a delivery once and claims it exactly once', async () => {
     const result = await run(

@@ -83,8 +83,11 @@ const comments = [
   },
 ];
 
-const routes: readonly (readonly [string, unknown])[] = [
-  ['/issues/17/comments', comments],
+const routesFor = (commentBody?: string): readonly (readonly [string, unknown])[] => [
+  [
+    '/issues/17/comments',
+    commentBody === undefined ? comments : [{ ...comments[0], body: commentBody }],
+  ],
   ['/pulls/17/comments', []],
   ['/issues/17', issue],
 ];
@@ -101,9 +104,16 @@ const services = (
     readonly requests: string[];
     readonly maxQueueDepth?: number;
     readonly queue?: (queue: WorkQueue) => WorkQueue;
+    readonly deliveryMaxBytes?: number;
+    readonly commentBody?: string;
   },
 ) => {
-  const ConfigLive = Layer.succeed(LictorConfig, config);
+  const ConfigLive = Layer.succeed(
+    LictorConfig,
+    options.deliveryMaxBytes === undefined
+      ? config
+      : { ...config, deliveryMaxBytes: options.deliveryMaxBytes },
+  );
   const QueueLive = Layer.effect(WorkQueue, Effect.map(WorkQueue, options.queue ?? identity)).pipe(
     Layer.provide(WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive))),
   );
@@ -115,7 +125,11 @@ const services = (
       HttpClientResponse.fromWeb(
         request,
         new Response(
-          JSON.stringify(routes.find(([fragment]) => request.url.includes(fragment))?.[1] ?? {}),
+          JSON.stringify(
+            routesFor(options.commentBody).find(([fragment]) =>
+              request.url.includes(fragment),
+            )?.[1] ?? {},
+          ),
           { status: 200, headers: { 'content-type': 'application/json' } },
         ),
       ),
@@ -610,6 +624,45 @@ describe('DeliveryWorker', () => {
     const result = await run(Effect.die(new Error('enrichment fetch exploded')), 3);
 
     expect(result.status).toBe('failed');
+  });
+
+  // The recording bound reaches qualification from here and nowhere else, so a
+  // literal in its place would satisfy every test that only reads the record.
+  // Asserted through the configured value: shrink it and the same fixture
+  // comment has to come back clipped.
+  it('records the trigger against the configured delivery bound', async () => {
+    const requests: string[] = [];
+    const reactions: string[] = [];
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.receiveDelivery({
+            id: 'delivery-1',
+            event: 'notification',
+            body,
+            source: 'notification',
+          });
+          yield* (yield* DeliveryWorker).runOnce;
+          return yield* queue.listJobs(10);
+        }).pipe(
+          Effect.provide(Logger.remove(Logger.defaultLogger)),
+          Effect.provide(
+            services(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }), reactions, {
+              requests,
+              // One knob, two quantities: it also gates the stored delivery,
+              // so it has to stay above the notification envelope while
+              // falling below the comment this trigger is recorded from.
+              deliveryMaxBytes: 512,
+              commentBody: `@adiutriel ${'x'.repeat(600)}`,
+            }),
+          ),
+        ),
+      ),
+    );
+
+    expect(result[0]?.work.trigger?.clipped).toBe(true);
+    expect(Buffer.byteLength(result[0]?.work.trigger?.text ?? '')).toBe(512);
   });
 });
 
