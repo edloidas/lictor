@@ -122,6 +122,7 @@ const run = <A, E>(
       maxJobAgeMs: policyOverrides.maxJobAgeMs ?? 86_400_000,
       livenessMs: 24 * 60 * 60 * 1000,
       approvalExpiryMs: 72 * 60 * 60 * 1000,
+      answerExpiryMs: 72 * 60 * 60 * 1000,
       forRepository: (repository) => ({
         repository,
         accepted: true,
@@ -311,15 +312,14 @@ describe('Worker.runOnce', () => {
     expect(result.job?.outcome).toBe('rejected');
   });
 
-  it('finishes a question without spending every attempt on it', async () => {
-    // The defect: `needs_input` shared the failure branch but could never take
-    // its retry arm, so it landed terminal `failed` at attempt 1 regardless of
-    // the limit — indistinguishable from an execution failure. It is still
-    // terminal (a rerun without an answer just re-asks) but now says so.
+  it('parks a question instead of finishing it, and does not re-ask unprompted', async () => {
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
-        const { jobId } = yield* queue.enqueue(work);
+        // Mixed case, and a sender outside the trusted list: the answer policy
+        // is the union of the two, normalized, and a fixture where they agree
+        // cannot tell that from either half alone.
+        const { jobId } = yield* queue.enqueue({ ...work, sender: 'Stranger' });
         const worker = yield* Worker;
         yield* worker.runOnce;
         return {
@@ -330,13 +330,76 @@ describe('Worker.runOnce', () => {
       }),
       () => Effect.succeed({ status: 'needs_input', summary: 'which branch?' }),
       3,
+      true,
+      undefined,
+      // `Adiutriel` is the daemon's own login: trusted to send, never an
+      // answerer, or she answers her own questions and runs forever.
+      { repository: { trustedSenders: ['edloidas', 'friend', 'Adiutriel'] } },
     );
 
+    expect(result.job?.status).toBe('pending');
+    expect(result.job?.outcome).toBeUndefined();
+    expect(result.job?.questionId).toBeString();
+    // The turn that asked, plus the senders this repository trusts. Only a
+    // fixture where those two differ can tell a union from either half of it.
+    expect(result.job?.questionAnswerers).toEqual(['stranger', 'edloidas', 'friend']);
+    // The asking attempt is spent; waiting itself costs nothing further, and
+    // the claim must not pick the row up again while it is unanswered.
+    expect(result.job?.attempts).toBe(1);
+    expect(result.counts.failed).toBe(0);
+    expect(result.secondRun).toBe(false);
+  });
+
+  it('finishes rather than parks a question it would have no attempt left to act on', async () => {
+    // Parking spends no attempt and restores none, so asking on the last one
+    // parks a row the next claim dead-letters. The thread would read: I need an
+    // answer — answered — this did not finish.
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        yield* (yield* Worker).runOnce;
+        return { job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
+      }),
+      () => Effect.succeed({ status: 'needs_input', summary: 'which branch?' }),
+      1,
+    );
+
+    expect(result.job?.questionId).toBeUndefined();
     expect(result.job?.status).toBe('failed');
     expect(result.job?.outcome).toBe('needs_input');
-    expect(result.job?.attempts).toBe(1);
-    expect(result.counts.retry).toBe(0);
-    expect(result.secondRun).toBe(false);
+    // The question still reaches the thread — it just carries no promise that
+    // an answer will be acted on.
+    expect(result.messages.map((message) => message.outcome)).toEqual(['needs_input']);
+  });
+
+  it('rolls the question message back when the park is fenced out', async () => {
+    // The park writes the question and the message in one transaction. A write
+    // that loses its fence must take the message with it — a question posted to
+    // a thread where no job is waiting can never be answered.
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const parked = yield* Effect.either(
+          queue.park({
+            jobId,
+            attemptNumber: 7,
+            repository: work.repository,
+            subjectNumber: work.subject.number,
+            question: 'which branch?',
+            answerers: ['edloidas'],
+            expiresAt: 1_000_000,
+          }),
+        );
+        return { parked, outbox: yield* queue.outboxFor(jobId), job: yield* queue.job(jobId) };
+      }),
+      () => Effect.succeed({ status: 'completed', summary: 'done' }),
+    );
+
+    expect(result.parked._tag).toBe('Left');
+    expect(result.outbox).toHaveLength(0);
+    expect(result.job?.questionId).toBeUndefined();
   });
 
   it('runs a job approved after the runnable age limit instead of refusing it', async () => {
@@ -773,15 +836,18 @@ describe('Worker.runOnce observability', () => {
     expect(completed[0]?.annotations.durationMs).toBeGreaterThanOrEqual(25);
   });
 
-  it('reports a job the agent could not finish without asking for input', async () => {
+  it('reports a job parked on the question the agent asked', async () => {
     const { logs } = await observe(() =>
       Effect.succeed({ status: 'needs_input', summary: 'which branch?' }),
     );
 
-    const annotations = annotationsOf(logs, 'Queued work did not complete');
+    const annotations = annotationsOf(logs, 'Parked queued work pending an answer');
     expect(annotations?.status).toBe('needs_input');
-    // needs_input is never retried, so there is nothing to schedule.
-    expect(annotations).not.toHaveProperty('retryAt');
+    expect(annotations?.answerers).toBe('edloidas');
+    // The question is agent prose parsed out of Codex stdout; it stays in the
+    // database rather than going through the log.
+    expect(JSON.stringify(annotations)).not.toContain('which branch?');
+    expect(annotationsOf(logs, 'Queued work did not complete')).toBeUndefined();
   });
 
   it('reports the scheduled retry when the agent reports its own failure', async () => {

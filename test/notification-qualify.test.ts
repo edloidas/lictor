@@ -1589,6 +1589,218 @@ describe('qualifyNotification', () => {
     expect(work?.context).toEqual({ kind: 'issue_comment', id: 200 });
   });
 
+  // A job parked on its own question is waiting for one reply in particular.
+  // Recognising it here is what lets the delivery worker resume that row before
+  // the notification cursor moves past the comment.
+  const asked = { id: 'question-1', askedAt: Date.parse('2026-08-21T09:00:00Z') };
+
+  it('reads an authorized reply as the answer to the parked question', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        live: true,
+        question: { ...asked, answerers: ['stranger'] },
+      }),
+      issueRoutes(issue(), [
+        comment({ id: 200, user: { login: 'stranger' }, body: 'use the release branch' }),
+      ]),
+    );
+
+    const qualification = qualified(result.exit);
+    expect(qualification.answer).toEqual({
+      questionId: 'question-1',
+      url: 'https://github.com/edloidas/sandbox/issues/7#issuecomment-99',
+      author: 'stranger',
+    });
+    // Consumed. The same reply must not also become a continuation job doing
+    // the work the parked one is already mid-way through.
+    expect(qualification.work).toBeUndefined();
+  });
+
+  it('leaves a reply from someone the question did not ask as ordinary context', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        live: true,
+        question: { ...asked, answerers: ['someone-else'] },
+      }),
+      issueRoutes(issue(), [
+        comment({ id: 200, user: { login: 'stranger' }, body: 'use the release branch' }),
+      ]),
+    );
+
+    const qualification = qualified(result.exit);
+    expect(qualification.answer).toBeUndefined();
+    // Exactly what it would have been with no question parked at all.
+    expect(qualification.work?.reasons).toEqual(['continued']);
+    expect(qualification.work?.sender).toBe('stranger');
+  });
+
+  // The boundary, not just the direction: a reply written in the same
+  // millisecond the question was posted did not read it.
+  it.each([
+    ['older than', '2026-08-21T11:00:00Z'],
+    ['exactly as old as', '2026-08-21T10:00:00Z'],
+  ])('does not let a reply %s the question answer it', async (_name, askedAt) => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        live: true,
+        question: { ...asked, askedAt: Date.parse(askedAt), answerers: ['stranger'] },
+      }),
+      issueRoutes(issue(), [
+        comment({ id: 200, user: { login: 'stranger' }, body: 'use the release branch' }),
+      ]),
+    );
+
+    const qualification = qualified(result.exit);
+    expect(qualification.answer).toBeUndefined();
+    expect(qualification.work?.reasons).toEqual(['continued']);
+  });
+
+  // The replay case. Resuming the job and finishing the delivery are two
+  // writes; a crash between them replays the delivery with the question already
+  // cleared, so without this record the comment reads as a fresh mention.
+  it('keeps a comment already taken as an answer out of the trigger pool', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        live: true,
+        answersTaken: ['https://github.com/edloidas/sandbox/issues/7#issuecomment-99'],
+      }),
+      issueRoutes(issue(), [comment({ id: 200 })]),
+    );
+
+    const qualification = qualified(result.exit);
+    // Neither a fresh answer nor work: it was both already, one pass ago.
+    expect(qualification.answer).toBeUndefined();
+    expect(qualification.work).toBeUndefined();
+  });
+
+  // `job.answer` takes any https URL, and the obvious thing to paste is the
+  // issue's own — which is exactly the body candidate's URL. Suppressing on it
+  // would retire that issue's description as a trigger for good.
+  it('never suppresses the subject body as an answer already taken', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        answersTaken: ['https://github.com/edloidas/sandbox/issues/7'],
+      }),
+      [
+        ['/issues/7/comments', { body: [] }],
+        ['/pulls/7/comments', { body: [] }],
+        ['/issues/7', { body: issue({ body: '@adiutriel please take this' }) }],
+      ],
+    );
+
+    const qualification = qualified(result.exit);
+    expect(qualification.work?.reasons).toEqual(['mentioned']);
+    expect(qualification.work?.context).toEqual({ kind: 'body', number: 7 });
+  });
+
+  it('does not read an edited subject body as the answer', async () => {
+    // Editing the description is not replying. Reading it as an answer would
+    // let one edit resume a job, from a body that may predate the question.
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        question: { ...asked, answerers: ['edloidas'] },
+      }),
+      [
+        ['/issues/7/comments', { body: [] }],
+        ['/pulls/7/comments', { body: [] }],
+        [
+          '/issues/7',
+          {
+            body: issue({
+              body: 'use the release branch',
+              created_at: '2026-08-21T10:00:00Z',
+              updated_at: '2026-08-21T10:00:00Z',
+            }),
+          },
+        ],
+      ],
+    );
+
+    expect(qualified(result.exit).answer).toBeUndefined();
+  });
+
+  it('answers with the newest authorized reply rather than the first', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        live: true,
+        question: { ...asked, answerers: ['stranger'] },
+      }),
+      issueRoutes(issue(), [
+        comment({
+          id: 200,
+          html_url: 'https://github.com/edloidas/sandbox/issues/7#issuecomment-200',
+          user: { login: 'stranger' },
+          body: 'wait, let me check',
+          updated_at: '2026-08-21T09:30:00Z',
+        }),
+        comment({
+          id: 201,
+          html_url: 'https://github.com/edloidas/sandbox/issues/7#issuecomment-201',
+          user: { login: 'stranger' },
+          body: 'use the release branch',
+          updated_at: '2026-08-21T10:00:00Z',
+        }),
+      ]),
+    );
+
+    const qualification = qualified(result.exit);
+    expect(qualification.answer?.url).toBe(
+      'https://github.com/edloidas/sandbox/issues/7#issuecomment-201',
+    );
+    // Both replies belong to the answer, so neither is left to trigger. Only
+    // the newest becomes it; consuming the newest alone would leave the earlier
+    // one to start a second job beside the one it just resumed.
+    expect(qualification.work).toBeUndefined();
+  });
+
+  // The sharp case: a trusted mention would ordinarily start work. Answering an
+  // outstanding question wins, because resuming the job that asked is never
+  // worse than running a second one beside it.
+  it('answers with a trusted mention rather than starting a second job from it', async () => {
+    const result = await run(
+      qualifyNotification({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+        question: { ...asked, answerers: ['edloidas'] },
+      }),
+      issueRoutes(issue(), [comment({ id: 200 })]),
+    );
+
+    const qualification = qualified(result.exit);
+    expect(qualification.answer?.author).toBe('edloidas');
+    expect(qualification.work).toBeUndefined();
+  });
+
   it('ignores an untrusted reply when the thread is not live', async () => {
     const result = await run(
       qualifyNotification({

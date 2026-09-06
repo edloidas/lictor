@@ -21,9 +21,23 @@ export type QualificationPolicy = {
   readonly trustedSenders: readonly string[];
 };
 
+/** A question a job on this subject is parked on, and who may answer it. */
+export type PendingQuestion = {
+  readonly id: string;
+  readonly answerers: readonly string[];
+  /** Epoch ms the question was put to the thread; nothing older can answer it. */
+  readonly askedAt: number;
+};
+
 export type QualifiedNotification = {
   /** `undefined` when the thread did not become work. */
   readonly work: WorkItem | undefined;
+  /**
+   * The reply that answers the parked question, when one arrived. The comment
+   * it names is consumed: it never also appears as `work`, so answering cannot
+   * resume the parked job and start a second one from the same words.
+   */
+  readonly answer?: { readonly questionId: string; readonly url: string; readonly author: string };
   /** Cursor value to store once this thread is processed, epoch ms. */
   readonly lastActivityAt: number;
 };
@@ -629,6 +643,17 @@ export const qualifyNotification = (input: {
    * replies from participants this policy does not trust continue the work.
    */
   readonly live?: boolean;
+  /**
+   * The question a job on this subject is waiting on. Present means one reply
+   * in this window may be an answer rather than a trigger.
+   */
+  readonly question?: PendingQuestion;
+  /**
+   * Comment URLs already taken as answers on this subject. A replayed delivery
+   * sees no pending question, so without these the comment that answered one
+   * reads as an ordinary mention and starts a job of its own.
+   */
+  readonly answersTaken?: readonly string[];
 }): Effect.Effect<QualifiedNotification, NotificationError, GitHubClient> =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -756,6 +781,52 @@ export const qualifyNotification = (input: {
           : [{ ...candidate, author: candidate.author }],
       );
 
+      // Resolved before any trigger is: newest wins, as everywhere else here,
+      // and only a reply posted after the question counts, from a login the
+      // question recorded. A thread with no parked question skips all of it,
+      // which is why an ordinary reply keeps behaving exactly as before.
+      const question = input.question;
+      const taken = new Set(input.answersTaken ?? []);
+      const answers = (candidate: (typeof usable)[number]): boolean => {
+        if (question === undefined) return false;
+        // A subject body is not a reply: editing the description answers
+        // nothing, and reading it as an answer would let one edit resume a job.
+        if (candidate.ref.kind === 'body') return false;
+        if (candidate.at <= question.askedAt) return false;
+        const author = normalizeLogin(candidate.author);
+        return author !== selfLogin && question.answerers.includes(author);
+      };
+      const answering = usable.reduce<(typeof usable)[number] | undefined>(
+        (best, candidate) =>
+          answers(candidate) && (best === undefined || candidate.at > best.at) ? candidate : best,
+        undefined,
+      );
+      const answer =
+        question === undefined || answering === undefined
+          ? undefined
+          : {
+              questionId: question.id,
+              url: answering.url,
+              author: normalizeLogin(answering.author),
+            };
+      // ! Every reply that answers is consumed, not just the newest one that
+      // ! became the answer, and a reply consumed on an earlier pass stays
+      // ! consumed. Left in the pool they qualify as triggers, so one answerer
+      // ! writing twice would resume the parked job *and* start a second doing
+      // ! the work the first is already mid-way through. The cost is that an
+      // ! answerer who answers and then asks for something new in the same
+      // ! window gets the second read as context by the resumed job rather
+      // ! than as work of its own.
+      // ! An answer is a comment; the body never is. `job.answer` takes any
+      // ! https URL, so an operator pasting the subject's own would otherwise
+      // ! retire that issue's description as a trigger for good.
+      const alreadyAnswered = (candidate: (typeof usable)[number]): boolean =>
+        candidate.ref.kind !== 'body' && taken.has(candidate.url);
+      const open = usable.filter((candidate) => !answers(candidate) && !alreadyAnswered(candidate));
+      // Carried by every return past this point: an answer stands whether or
+      // not the same window also produced work.
+      const answered = answer === undefined ? {} : { answer };
+
       // The newest *trusted* mention triggers. Letting an untrusted one win and
       // then refusing hands every participant a mute button; self-activity is
       // excluded structurally, so a loop cannot be configured into existence.
@@ -766,7 +837,7 @@ export const qualifyNotification = (input: {
       // ! from choosing how long this thread's single runtime is busy. Bounding
       // ! the cost instead would mean predicting the parser — an escaped or
       // ! code-spanned `]` closes a bracket for one counter and not the other.
-      const addressed = usable.filter((candidate) => {
+      const addressed = open.filter((candidate) => {
         const author = normalizeLogin(candidate.author);
         return author !== selfLogin && trusted.has(author);
       });
@@ -805,7 +876,7 @@ export const qualifyNotification = (input: {
       // it regardless of the stored window; opening an issue is not replying.
       const live = input.live === true && subject.state !== 'closed';
       const continuationTrigger = live
-        ? usable.reduce<(typeof usable)[number] | undefined>((best, candidate) => {
+        ? open.reduce<(typeof usable)[number] | undefined>((best, candidate) => {
             if (candidate.ref.kind === 'body') return best;
             if (normalizeLogin(candidate.author) === selfLogin) return best;
             return best === undefined || candidate.at > best.at ? candidate : best;
@@ -823,7 +894,7 @@ export const qualifyNotification = (input: {
         const attempted = mentionPattern(selfLogin);
         const untrustedSenders = [
           ...new Set(
-            usable.flatMap((candidate) =>
+            open.flatMap((candidate) =>
               candidate.body !== undefined && attempted.test(candidate.body)
                 ? [normalizeLogin(candidate.author)]
                 : [],
@@ -840,7 +911,7 @@ export const qualifyNotification = (input: {
             'Notification did not become work: no candidate mentions the target user',
           ).pipe(Effect.annotateLogs({ threadId: input.thread.id }));
         }
-        return { work: undefined, lastActivityAt };
+        return { work: undefined, ...answered, lastActivityAt };
       }
 
       // ! A trusted trigger outranks any continuation whatever the timestamps:
@@ -887,11 +958,11 @@ export const qualifyNotification = (input: {
           contextUrl: subject.html_url,
           context: { kind: contextKind, id: assignedEvent.id, number: ref.number },
         };
-        return { work, lastActivityAt };
+        return { work, ...answered, lastActivityAt };
       }
 
       const triggering = useContinuation ? continuationTrigger : mentionTrigger;
-      if (triggering === undefined) return { work: undefined, lastActivityAt };
+      if (triggering === undefined) return { work: undefined, ...answered, lastActivityAt };
       const sender = normalizeLogin(triggering.author);
       const continued = useContinuation;
       const work: WorkItem = {
@@ -916,7 +987,7 @@ export const qualifyNotification = (input: {
         context: triggering.ref,
       };
 
-      return { work, lastActivityAt };
+      return { work, ...answered, lastActivityAt };
     }),
   ).pipe(
     Effect.mapError((cause) =>

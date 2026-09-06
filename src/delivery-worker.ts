@@ -123,13 +123,56 @@ const processBySource: Record<
         subject === undefined
           ? false
           : yield* queue.livenessFor(thread.repository.full_name, subject.kind, subject.number);
-      const { work, lastActivityAt } = yield* qualifyNotification({
+      // Read in the same pass that qualifies, so an answer is recognised before
+      // the cursor moves past it. Fetched once here rather than per candidate:
+      // qualification already holds the comments, and a second walk would cost
+      // the delivery another round trip to say the same thing.
+      const parked =
+        subject === undefined
+          ? undefined
+          : yield* queue.pendingQuestion(thread.repository.full_name, subject.kind, subject.number);
+      const answersTaken =
+        subject === undefined
+          ? []
+          : yield* queue.answersTaken(thread.repository.full_name, subject.kind, subject.number);
+      const { work, answer, lastActivityAt } = yield* qualifyNotification({
         deliveryId: stored.id,
         thread,
         policy: { selfLogin: login, trustedSenders: threadPolicy.trustedSenders },
         cursorMs,
         live,
+        answersTaken,
+        ...(parked === undefined
+          ? {}
+          : {
+              question: {
+                id: parked.questionId,
+                answerers: parked.answerers,
+                askedAt: parked.askedAt,
+              },
+            }),
       });
+
+      // Before the enqueue below and before the cursor advances. Fenced on the
+      // question id inside the queue, so a redelivered answer resumes nothing a
+      // second time.
+      if (answer !== undefined && parked !== undefined) {
+        const resumed = yield* queue.answerQuestion({
+          jobId: parked.jobId,
+          questionId: answer.questionId,
+          answerUrl: answer.url,
+        });
+        yield* Effect.logInfo(
+          resumed ? 'Resumed parked work on an answer' : 'Ignored a duplicate answer',
+        ).pipe(
+          Effect.annotateLogs({
+            job: parked.jobId,
+            delivery: stored.id,
+            repository: work?.repository ?? thread.repository.full_name,
+            answerer: answer.author,
+          }),
+        );
+      }
       // ! Advanced only after the job commits, never before: a cursor moved
       // ! past a failed `enqueue` loses the comment that caused it all.
       const advance = Number.isFinite(lastActivityAt)

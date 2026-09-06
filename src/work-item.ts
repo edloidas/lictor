@@ -60,6 +60,13 @@ export type WorkItem = {
   };
   readonly contextUrl?: string;
   readonly context?: ContextRef;
+  /**
+   * Where the answer to this job's earlier question was posted. The only field
+   * an answer adds: everything authority is derived from stays as the asking
+   * turn left it, so resuming cannot grant more than the question was asked
+   * under.
+   */
+  readonly answerUrl?: string;
 };
 
 export const ContextRefSchema: Schema.Schema<ContextRef> = Schema.Union(
@@ -97,4 +104,5 @@ export const WorkItemSchema: Schema.Schema<WorkItem> = Schema.Struct({
   }),
   contextUrl: Schema.optionalWith(Schema.String, { exact: true }),
   context: Schema.optionalWith(ContextRefSchema, { exact: true }),
+  answerUrl: Schema.optionalWith(Schema.String, { exact: true }),
 });

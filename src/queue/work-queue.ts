@@ -56,13 +56,15 @@ export type JobStatus =
 /**
  * Why a job stopped, kept apart from `status`, which says only what the
  * scheduler may still do with the row. The executor reports four of these and
- * the queue adds two; `failed` covers both an execution failure and one the
+ * the queue adds three; `failed` covers both an execution failure and one the
  * worker never got to.
  *
- * ! `rejected` and `needs_input` are stored under `status = 'failed'`. Neither
- * ! is a completion — an agent that refused or asked a question did not do the
- * ! work — and `failed` is also the only terminal status `job.retry` accepts,
- * ! so it is what leaves the operator a lever.
+ * ! `rejected` is stored under `status = 'failed'`, and so is a `needs_input`
+ * ! the queue could not park. Neither is a completion — an agent that refused
+ * ! or asked a question did not do the work — and `failed` is also the only
+ * ! terminal status `job.retry` accepts, so it is what leaves the operator a
+ * ! lever. A question that *was* parked carries no outcome until it ends:
+ * ! `unanswered` if its window closes, or whatever the resumed run reports.
  */
 export type JobOutcome =
   | 'canceled'
@@ -70,7 +72,8 @@ export type JobOutcome =
   | 'expired'
   | 'failed'
   | 'needs_input'
-  | 'rejected';
+  | 'rejected'
+  | 'unanswered';
 
 export type OutboxStatus = 'pending' | 'sending' | 'delivered' | 'blocked' | 'failed' | 'canceled';
 
@@ -131,6 +134,15 @@ export type QueuedJob = {
   readonly readyAt: number;
   readonly outcome?: JobOutcome;
   readonly holdExpiresAt?: number;
+  /**
+   * The outbox `message_id` of a question this job is waiting on, and the only
+   * thing that distinguishes a job parked for an answer from one that has
+   * simply not run yet — both are `pending`. Set means the claim skips the row
+   * and only an answer or the expiry sweep moves it.
+   */
+  readonly questionId?: string;
+  /** Logins allowed to answer that question, fixed when it was asked. */
+  readonly questionAnswerers?: readonly string[];
 };
 
 export type QueueCounts = Readonly<Record<JobStatus, number>>;
@@ -154,6 +166,8 @@ type JobRow = {
   readonly readyAt?: number | null;
   readonly outcome?: JobOutcome | null;
   readonly holdExpiresAt?: number | null;
+  readonly questionId?: string | null;
+  readonly questionAnswerers?: string | null;
   readonly workerId?: string | null;
   readonly leaseExpiresAt?: number | null;
 };
@@ -244,11 +258,11 @@ const migrate = (database: Database) => {
     (database.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(
       (existing) => existing.name === column,
     );
-  // Every v12 artifact checked, not a sample: one missing piece would fail on
+  // Every v13 artifact checked, not a sample: one missing piece would fail on
   // every use — the v6 equality-guard failure, one version later. The
   // `installation_id` check is negative so a database predating its drop heals.
   if (
-    version.user_version === 12 &&
+    version.user_version === 13 &&
     deliveriesHaveSource() &&
     hasColumn('deliveries', 'lease_expires_at') &&
     hasColumn('capability_audit', 'actor') &&
@@ -256,6 +270,8 @@ const migrate = (database: Database) => {
     hasColumn('jobs', 'outcome') &&
     hasColumn('jobs', 'ready_at') &&
     hasColumn('jobs', 'hold_expires_at') &&
+    hasColumn('jobs', 'question_id') &&
+    hasColumn('jobs', 'question_answerers') &&
     hasTable('notification_cursors') &&
     hasTable('poller_state') &&
     hasTable('subject_branches') &&
@@ -265,7 +281,7 @@ const migrate = (database: Database) => {
     hasColumn('outbox', 'lease_expires_at')
   )
     return;
-  if (version.user_version > 12) {
+  if (version.user_version > 13) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -408,6 +424,16 @@ const migrate = (database: Database) => {
     if (!hasColumn('jobs', 'hold_expires_at')) {
       database.exec('ALTER TABLE jobs ADD COLUMN hold_expires_at INTEGER');
     }
+    // Left NULL on every existing row, which leaves each of them exactly where
+    // it is. A row already terminal at `outcome = 'needs_input'` was asked
+    // before a question had an identity anything could answer, so parking it
+    // now would only produce waiting work with no way out.
+    if (!hasColumn('jobs', 'question_id')) {
+      database.exec('ALTER TABLE jobs ADD COLUMN question_id TEXT');
+    }
+    if (!hasColumn('jobs', 'question_answerers')) {
+      database.exec('ALTER TABLE jobs ADD COLUMN question_answerers TEXT');
+    }
     database.exec(`
       CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs(status, available_at, id);
       CREATE TABLE IF NOT EXISTS daemon_owner (
@@ -481,7 +507,7 @@ const migrate = (database: Database) => {
         last_error TEXT
       );
       CREATE INDEX IF NOT EXISTS outbox_claimable ON outbox(status, available_at, id);
-      PRAGMA user_version = 12;
+      PRAGMA user_version = 13;
     `);
     // ! Condemned, not drained: no decoder exists for webhook bodies anymore,
     // ! so leaving one claimable kills the delivery worker on a defect per cycle.
@@ -517,6 +543,21 @@ const attempt = <A>(operation: string, body: () => A) =>
     catch: (cause) => new QueueError({ operation, cause }),
   });
 
+/**
+ * Never throws. A throw here would dead-letter the row as an undecodable
+ * payload, which this column is not part of; an unreadable answer policy means
+ * nobody may answer, so the question expires instead of being lost.
+ */
+const decodeAnswerers = (stored: string | null | undefined): readonly string[] => {
+  if (stored == null) return [];
+  try {
+    const parsed: unknown = JSON.parse(stored);
+    return Array.isArray(parsed) ? parsed.filter((login) => typeof login === 'string') : [];
+  } catch {
+    return [];
+  }
+};
+
 const decodeJob = (row: JobRow): QueuedJob => ({
   id: row.id,
   work: Schema.decodeUnknownSync(WorkItemSchema)(JSON.parse(row.payload)),
@@ -528,6 +569,12 @@ const decodeJob = (row: JobRow): QueuedJob => ({
   readyAt: row.readyAt ?? row.createdAt,
   ...(row.outcome == null ? {} : { outcome: row.outcome }),
   ...(row.holdExpiresAt == null ? {} : { holdExpiresAt: row.holdExpiresAt }),
+  ...(row.questionId == null
+    ? {}
+    : {
+        questionId: row.questionId,
+        questionAnswerers: decodeAnswerers(row.questionAnswerers),
+      }),
   ...(row.workerId == null ? {} : { workerId: row.workerId }),
   ...(row.leaseExpiresAt == null ? {} : { leaseExpiresAt: row.leaseExpiresAt }),
 });
@@ -624,6 +671,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       attemptNumber: number,
       now: number,
     ) => {
+      const messageId = randomUUID();
       database
         .query(
           `INSERT INTO outbox (message_id, job_id, attempt, repository, subject_number,
@@ -631,7 +679,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
         )
         .run(
-          randomUUID(),
+          messageId,
           jobId,
           attemptNumber,
           delivery.repository,
@@ -642,6 +690,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           now,
           now,
         );
+      // Returned because a question is identified by the message that asks it:
+      // `outcomeMarker` stamps this id into the posted comment, so it is what a
+      // later answer names.
+      return messageId;
     };
 
     /**
@@ -1151,6 +1203,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                       ready_at AS readyAt
                FROM jobs
                WHERE status IN ('pending', 'retry', 'interrupted') AND available_at <= ?
+                 AND question_id IS NULL
                  AND (
                    CASE WHEN json_valid(payload)
                      THEN COALESCE(json_extract(payload, '$.approvalRequired'), 0)
@@ -1324,6 +1377,194 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         );
       });
 
+    /**
+     * Parks a job on the question it asked instead of finishing it. The row
+     * stays `pending`, the status the approval hold already uses; `question_id`
+     * is the whole difference between a job waiting for an answer and one that
+     * has simply not run yet, and it is what the claim skips on.
+     *
+     * ! The attempt that asked is spent and stays spent. Waiting costs no
+     * ! further attempt, but the agent ran to produce the question — refunding
+     * ! it would let one job ask without bound.
+     */
+    const park = (input: {
+      readonly jobId: number;
+      readonly attemptNumber: number;
+      readonly repository: string;
+      readonly subjectNumber: number;
+      /** The agent's question, published as the message's note. */
+      readonly question: string;
+      /** Logins allowed to answer, fixed here rather than resolved on reply. */
+      readonly answerers: readonly string[];
+      readonly expiresAt: number;
+    }) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        return yield* attempt('park', () =>
+          database.transaction(() => {
+            const questionId = insertOutbox(
+              {
+                repository: input.repository,
+                subjectNumber: input.subjectNumber,
+                outcome: 'needs_input',
+                note: input.question,
+              },
+              input.jobId,
+              input.attemptNumber,
+              now,
+            );
+            const result = database
+              .query(
+                `UPDATE jobs
+                 SET status = 'pending', outcome = NULL, question_id = ?, question_answerers = ?,
+                     hold_expires_at = ?, available_at = ?, claimed_at = NULL, worker_id = NULL,
+                     lease_expires_at = NULL, retry_at = NULL, failed_at = NULL,
+                     last_error = ?, updated_at = ?
+                 WHERE id = ? AND status = 'running' AND attempts = ?`,
+              )
+              .run(
+                questionId,
+                JSON.stringify(input.answerers),
+                input.expiresAt,
+                now,
+                input.question,
+                now,
+                input.jobId,
+                input.attemptNumber,
+              );
+            // Throwing rolls the message back with the park. A question posted
+            // to a thread nobody is waiting on can never be answered.
+            if (result.changes !== 1) {
+              throw new Error(`Job ${input.jobId} attempt ${input.attemptNumber} is stale`);
+            }
+            database
+              .query(
+                `UPDATE attempts SET status = 'failed', finished_at = ?, error = ?
+                 WHERE job_id = ? AND number = ? AND status = 'running'`,
+              )
+              .run(now, input.question, input.jobId, input.attemptNumber);
+            return questionId;
+          })(),
+        );
+      });
+
+    /**
+     * Resumes a parked job on an answer to the question it is waiting on.
+     *
+     * ! Fenced on `question_id`, which is what stops a redelivered answer
+     * ! starting a second run: the first clears it and every later one matches
+     * ! nothing. `ready_at` resets for the reason `approve` resets it — time
+     * ! spent waiting on a person must not age the job out on its next claim.
+     *
+     * Only `answerUrl` enters the payload. Leaving `sender`, `reasons` and
+     * `continuation` alone is what keeps an answer from widening the authority
+     * of the turn that asked.
+     */
+    const answerQuestion = (input: {
+      readonly jobId: number;
+      readonly questionId: string;
+      readonly answerUrl: string;
+    }) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        return yield* attempt(
+          'answer question',
+          () =>
+            database
+              .query(
+                `UPDATE jobs
+                 SET question_id = NULL, question_answerers = NULL, hold_expires_at = NULL,
+                     ready_at = ?, available_at = ?, last_error = NULL, updated_at = ?,
+                     payload = json_set(payload, '$.answerUrl', ?)
+                 WHERE id = ? AND status = 'pending' AND question_id = ? AND json_valid(payload)`,
+              )
+              .run(now, now, now, input.answerUrl, input.jobId, input.questionId).changes === 1,
+        );
+      });
+
+    /**
+     * The question a subject is waiting on, if any. Read before qualification
+     * so an answer is recognised in the pass that would otherwise advance the
+     * notification cursor past it.
+     *
+     * ! Gated on the question having been *sent*, not on the daemon having
+     * ! recorded it. Consuming a comment as an answer destroys it as work, so a
+     * ! question nobody could have seen — never claimed, or refused by a
+     * ! repository that withholds `comment` — must match nothing. A POST whose
+     * ! response was lost did reach the thread, though, and keying on
+     * ! `delivered_at` would hide it for a whole backoff and then stamp a time
+     * ! after its answer, losing that answer for good. `created_at` is the park
+     * ! instant, always at or before the post, so it can reject no real answer;
+     * ! the reverse cost is one comment written before the first send.
+     */
+    const pendingQuestion = (
+      repository: string,
+      subjectKind: 'issue' | 'pull_request',
+      subjectNumber: number,
+    ) =>
+      attempt('read pending question', () => {
+        const row = database
+          .query(
+            `SELECT j.id AS jobId, j.question_id AS questionId,
+               j.question_answerers AS answerers, o.created_at AS askedAt
+             FROM jobs j JOIN outbox o ON o.message_id = j.question_id
+             WHERE j.status = 'pending' AND j.question_id IS NOT NULL
+               AND o.attempts > 0 AND o.status <> 'blocked'
+               AND json_valid(j.payload)
+               AND lower(json_extract(j.payload, '$.repository')) = ?
+               AND json_extract(j.payload, '$.subject.kind') = ?
+               AND json_extract(j.payload, '$.subject.number') = ?
+             ORDER BY j.id DESC LIMIT 1`,
+          )
+          .get(repository.toLowerCase(), subjectKind, subjectNumber) as
+          | {
+              readonly jobId: number;
+              readonly questionId: string;
+              readonly answerers: string | null;
+              readonly askedAt: number;
+            }
+          | null
+          | undefined;
+        return row == null
+          ? undefined
+          : {
+              jobId: row.jobId,
+              questionId: row.questionId,
+              answerers: decodeAnswerers(row.answerers),
+              askedAt: row.askedAt,
+            };
+      });
+
+    /**
+     * Answers already taken on this subject, by the comment each one was.
+     *
+     * ! Resuming and marking the delivery done are two writes, and a crash
+     * ! between them replays the delivery. By then `question_id` is cleared, so
+     * ! the comment no longer reads as an answer — it reads as an ordinary
+     * ! mention with an identity no job has ever carried, and `enqueue` would
+     * ! start a second job doing what the resumed one is already doing.
+     */
+    const answersTaken = (
+      repository: string,
+      subjectKind: 'issue' | 'pull_request',
+      subjectNumber: number,
+    ) =>
+      attempt('read answers taken', () => {
+        const rows = database
+          .query(
+            `SELECT DISTINCT json_extract(payload, '$.answerUrl') AS url FROM jobs
+             WHERE json_valid(payload)
+               AND json_type(payload, '$.answerUrl') = 'text'
+               AND lower(json_extract(payload, '$.repository')) = ?
+               AND json_extract(payload, '$.subject.kind') = ?
+               AND json_extract(payload, '$.subject.number') = ?`,
+          )
+          .all(repository.toLowerCase(), subjectKind, subjectNumber) as readonly {
+          readonly url: string;
+        }[];
+        return rows.map((row) => row.url);
+      });
+
     const recoverStale = (olderThan: number) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
@@ -1401,7 +1642,12 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         // ready. That covers rows held before the column existed — which the
         // claim no longer ages out — and dates a re-parked retry from the retry
         // rather than from creation, which would expire it again immediately.
+        //
+        // `question_id IS NULL` separates this from the answer sweep below by
+        // the column rather than by argument: both park a job at `pending`, and
+        // both read `hold_expires_at` as their deadline.
         const expiredWhere = `status = 'pending'
+               AND question_id IS NULL
                AND CASE WHEN json_valid(payload)
                      THEN COALESCE(json_extract(payload, '$.approvalRequired'), 0)
                      ELSE 0 END = 1
@@ -1422,6 +1668,28 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
              WHERE ${expiredWhere}`,
             )
             .run(now, now, expiryWindow, heldBefore).changes;
+        })();
+        // The same shape one step later in the lifecycle: a question nobody
+        // answered. No window argument and no fallback, unlike the hold above:
+        // `park` is the only writer of `question_id` and always stamps a
+        // deadline with it, so there is no undated row here to date.
+        const unansweredWhere = `status = 'pending'
+               AND question_id IS NOT NULL
+               AND hold_expires_at < ?`;
+        // Its own outcome, not `expired`, because the thread renders it:
+        // `expired` is worded for an approval that never came, and this row was
+        // waiting on the person it is about to tell that.
+        const unanswered = database.transaction(() => {
+          insertOutboxFromJobs('unanswered', unansweredWhere, [heldBefore], now);
+          return database
+            .query(
+              `UPDATE jobs
+             SET status = 'failed', outcome = 'unanswered', failed_at = ?, updated_at = ?,
+                 hold_expires_at = NULL, question_id = NULL, question_answerers = NULL,
+                 last_error = 'answer expired'
+             WHERE ${unansweredWhere}`,
+            )
+            .run(now, now, heldBefore).changes;
         })();
         database
           .query(
@@ -1446,10 +1714,17 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           .run(completedBefore, failedBefore);
         // Pruned on the failed window like the jobs they describe, and only once
         // terminal: an undelivered message is an obligation, not history.
+        // ! Never the row a parked job is still waiting on, however old. It is
+        // ! that question's only record of having been asked, and `retention`
+        // ! can be set shorter than the answer window — dropping it strands the
+        // ! job at `pending` with a `question_id` nothing can look up, so every
+        // ! later reply becomes new work instead of its answer.
         database
           .query(
             `DELETE FROM outbox
-             WHERE status IN ('delivered', 'blocked', 'failed', 'canceled') AND updated_at < ?`,
+             WHERE status IN ('delivered', 'blocked', 'failed', 'canceled') AND updated_at < ?
+               AND message_id NOT IN
+                 (SELECT question_id FROM jobs WHERE question_id IS NOT NULL)`,
           )
           .run(failedBefore);
         // Pruned on the failed window, the longer of the two: a cursor dropped
@@ -1463,7 +1738,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         return {
           completed: Number(completed),
           failed: Number(failed),
-          expired: Number(expired),
+          expired: Number(expired) + Number(unanswered),
           sizeBytes,
         };
       });
@@ -1623,7 +1898,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           .query(
             `SELECT id, payload, status, attempts, last_error AS lastError,
                created_at AS createdAt, updated_at AS updatedAt,
-               ready_at AS readyAt, outcome, hold_expires_at AS holdExpiresAt
+               ready_at AS readyAt, outcome, hold_expires_at AS holdExpiresAt,
+               question_id AS questionId, question_answerers AS questionAnswerers
              FROM jobs ORDER BY id DESC LIMIT ?`,
           )
           .all(Math.max(1, Math.min(1000, limit))) as readonly (JobRow & {
@@ -1672,6 +1948,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             `SELECT id, payload, status, attempts, last_error AS lastError,
                created_at AS createdAt, updated_at AS updatedAt,
                ready_at AS readyAt, outcome, hold_expires_at AS holdExpiresAt,
+               question_id AS questionId, question_answerers AS questionAnswerers,
                worker_id AS workerId, lease_expires_at AS leaseExpiresAt
              FROM jobs WHERE id = ?`,
           )
@@ -1776,6 +2053,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                 .query(
                   `UPDATE jobs SET status = 'failed', outcome = 'canceled', failed_at = ?,
                  worker_id = NULL, lease_expires_at = NULL, hold_expires_at = NULL,
+                 question_id = NULL, question_answerers = NULL,
                  last_error = 'canceled by operator', updated_at = ? WHERE id = ?`,
                 )
                 .run(now, now, id).changes === 1
@@ -1872,6 +2150,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       heartbeatDaemon,
       complete,
       fail,
+      park,
+      answerQuestion,
+      pendingQuestion,
+      answersTaken,
       recoverStale,
       counts,
       maintenance,

@@ -243,4 +243,115 @@ describe('local control plane', () => {
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  it('answers a parked question, and refuses a job that is not waiting on one', async () => {
+    const ConfigLive = Layer.succeed(
+      LictorConfig,
+      LictorConfig.make({
+        githubToken: Redacted.make('test-token'),
+        expectedLogin: 'adiutriel',
+        trustedSenders: [],
+        autoAcceptInviters: [],
+        databasePath: ':memory:',
+        stateDir: stateDirOf(':memory:'),
+        policyPath: 'unused',
+        controlSocketPath: '/tmp/lictor-answer.sock',
+        deliveryMaxBytes: 1024,
+        executor: 'disabled',
+        codexModel: 'gpt-5.6-luna',
+        codexHome: '',
+        agentWorkdir: '.',
+        executorTimeoutMs: 1000,
+        executorOutputBytes: 1024,
+        gitTimeoutMs: 180_000,
+        workerPollMs: 10,
+        workerMaxAttempts: 3,
+        workerRetryBaseMs: 100,
+        notificationPollMs: 60_000,
+      }),
+    );
+    const PolicyLive = Layer.effect(
+      Policy,
+      parsePolicy('[defaults]\nexecution = "automatic"').pipe(Effect.map(Policy.make)),
+    );
+    const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
+    const PlaneLive = ControlPlane.DefaultWithoutDependencies.pipe(
+      Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, CredentialHealth.Default)),
+    );
+    const answerUrl = 'https://github.com/edloidas/lictor/issues/14#issuecomment-9';
+
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const plane = yield* ControlPlane;
+          const { jobId } = yield* queue.enqueue({ ...work, approvalRequired: false });
+          const notWaiting = yield* Effect.either(
+            plane.execute({ command: 'job.answer', args: [String(jobId), answerUrl] }),
+          );
+          const missing = yield* Effect.either(
+            plane.execute({ command: 'job.answer', args: [String(jobId + 99), answerUrl] }),
+          );
+          const claimed = yield* queue.claim;
+          yield* queue.park({
+            jobId,
+            attemptNumber: claimed?.attempts ?? 1,
+            repository: work.repository,
+            subjectNumber: work.subject.number,
+            question: 'which branch?',
+            // The socket is not bound by these; an operator holding it already
+            // has `approve` and `cancel` on the same row.
+            answerers: ['someone-else'],
+            expiresAt: Date.now() + 3_600_000,
+          });
+          const notAUrl = yield* Effect.either(
+            plane.execute({ command: 'job.answer', args: [String(jobId), 'ftp://elsewhere'] }),
+          );
+          // The bound is what stops an answer nobody can read being written
+          // into the payload the agent is handed.
+          const tooLong = yield* Effect.either(
+            plane.execute({
+              command: 'job.answer',
+              args: [String(jobId), `https://github.com/${'x'.repeat(2048)}`],
+            }),
+          );
+          const answered = yield* plane.execute({
+            command: 'job.answer',
+            args: [String(jobId), answerUrl],
+          });
+          return {
+            jobId,
+            notWaiting,
+            missing,
+            notAUrl,
+            tooLong,
+            answered,
+            job: yield* queue.job(jobId),
+            audit: yield* queue.auditLog(jobId),
+          };
+        }).pipe(Effect.provide(Layer.mergeAll(PlaneLive, QueueLive))),
+      ),
+    );
+
+    expect(result.notWaiting).toMatchObject({
+      _tag: 'Left',
+      left: { code: 'CONTROL_JOB_NOT_WAITING' },
+    });
+    expect(result.missing).toMatchObject({
+      _tag: 'Left',
+      left: { code: 'CONTROL_JOB_NOT_FOUND' },
+    });
+    expect(result.notAUrl).toMatchObject({
+      _tag: 'Left',
+      left: { code: 'CONTROL_ANSWER_URL_INVALID' },
+    });
+    expect(result.tooLong).toMatchObject({
+      _tag: 'Left',
+      left: { code: 'CONTROL_ANSWER_URL_INVALID' },
+    });
+    expect(result.answered).toEqual({ changed: true, jobId: result.jobId });
+    expect(result.job?.questionId).toBeUndefined();
+    expect(result.job?.work.answerUrl).toBe(answerUrl);
+    expect(result.audit).toMatchObject([{ capability: 'control.answer', outcome: 'ok' }]);
+  });
 });

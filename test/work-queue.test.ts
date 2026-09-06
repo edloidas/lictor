@@ -55,6 +55,20 @@ const work = (deliveryId: string): WorkItem => ({
   },
 });
 
+/**
+ * Posts whatever message is waiting, which for a parked job is its question.
+ * A question still in the outbox is not on the thread, and `pendingQuestion`
+ * deliberately refuses to match one — so a test that parks and then expects a
+ * reply to answer has to put the question on the thread first.
+ */
+const deliverPending = Effect.gen(function* () {
+  const queue = yield* WorkQueue;
+  const claimed = yield* queue.claimOutbox;
+  if (claimed === undefined) return undefined;
+  yield* queue.deliverOutbox(claimed.id, claimed.attempts, 'https://github.com/c/1');
+  return claimed;
+});
+
 describe('WorkQueue', () => {
   it('persists a delivery once and claims it exactly once', async () => {
     const result = await run(
@@ -376,6 +390,390 @@ describe('WorkQueue', () => {
     expect(result.before).toBeUndefined();
     expect(result.swept.expired).toBe(1);
     expect(result.job?.outcome).toBe('expired');
+  });
+
+  it('holds a parked job back from the claim and releases it on an answer', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('asked'));
+        const claimed = yield* queue.claim;
+        yield* queue.park({
+          jobId,
+          attemptNumber: claimed?.attempts ?? 1,
+          repository: 'edloidas/lictor',
+          subjectNumber: 17,
+          question: 'which branch?',
+          answerers: ['edloidas'],
+          expiresAt: Date.now() + 3_600_000,
+        });
+        const whileWaiting = yield* queue.claim;
+        const parked = yield* queue.job(jobId);
+        const resumed = yield* queue.answerQuestion({
+          jobId,
+          questionId: parked?.questionId ?? 'none',
+          answerUrl: 'https://github.com/edloidas/lictor/issues/17#issuecomment-9',
+        });
+        return {
+          jobId,
+          whileWaiting,
+          parked,
+          resumed,
+          answered: yield* queue.job(jobId),
+          claimedAfter: yield* queue.claim,
+        };
+      }),
+    );
+
+    expect(result.whileWaiting).toBeUndefined();
+    expect(result.parked?.status).toBe('pending');
+    expect(result.parked?.questionAnswerers).toEqual(['edloidas']);
+    expect(result.resumed).toBe(true);
+    expect(result.answered?.questionId).toBeUndefined();
+    expect(result.answered?.work.answerUrl).toBe(
+      'https://github.com/edloidas/lictor/issues/17#issuecomment-9',
+    );
+    // The only field an answer writes. Everything authority derives from is the
+    // asking turn's, or resuming would grant more than the question was asked
+    // under.
+    expect(result.answered?.work.sender).toBe('edloidas');
+    expect(result.answered?.work.reasons).toEqual(['assigned']);
+    expect(result.claimedAfter?.id).toBe(result.jobId);
+  });
+
+  it('cannot start a second run from a redelivered answer', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('asked-once'));
+        const claimed = yield* queue.claim;
+        yield* queue.park({
+          jobId,
+          attemptNumber: claimed?.attempts ?? 1,
+          repository: 'edloidas/lictor',
+          subjectNumber: 17,
+          question: 'which branch?',
+          answerers: ['edloidas'],
+          expiresAt: Date.now() + 3_600_000,
+        });
+        const questionId = (yield* queue.job(jobId))?.questionId ?? 'none';
+        const answer = {
+          jobId,
+          questionId,
+          answerUrl: 'https://github.com/edloidas/lictor/issues/17#issuecomment-9',
+        };
+        const first = yield* queue.answerQuestion(answer);
+        const before = yield* queue.counts;
+        const again = yield* queue.answerQuestion(answer);
+        const afterRedelivery = yield* queue.counts;
+        const resumed = yield* queue.claim;
+        // The resumed run finishes. Claiming past that is the assertion that
+        // matters: only an answer that took a second time could make the row
+        // runnable again, and `claim` against a `running` row proves nothing.
+        yield* queue.complete(jobId, resumed?.attempts ?? 2, '{}');
+        return {
+          first,
+          again,
+          before,
+          afterRedelivery,
+          finished: yield* queue.counts,
+          second: yield* queue.claim,
+        };
+      }),
+    );
+
+    expect(result.first).toBe(true);
+    expect(result.again).toBe(false);
+    // The redelivery moved nothing at all — no new row, no state change.
+    expect(result.afterRedelivery).toEqual(result.before);
+    expect(result.finished.completed).toBe(1);
+    expect(result.second).toBeUndefined();
+  });
+
+  it('expires an unanswered question as its own hold, not as an approval', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('unanswered'));
+        const claimed = yield* queue.claim;
+        yield* queue.park({
+          jobId,
+          attemptNumber: claimed?.attempts ?? 1,
+          repository: 'edloidas/lictor',
+          subjectNumber: 17,
+          question: 'which branch?',
+          answerers: ['edloidas'],
+          expiresAt: (yield* Clock.currentTimeMillis) + 60 * 60 * 1000,
+        });
+        const held = yield* queue.enqueue(
+          { ...work('unapproved'), approvalRequired: true },
+          10_000,
+          60 * 60 * 1000,
+        );
+        yield* TestClock.adjust('2 hours');
+        const swept = yield* queue.maintenance(
+          0,
+          0,
+          yield* Clock.currentTimeMillis,
+          60 * 60 * 1000,
+        );
+        return {
+          swept,
+          question: yield* queue.job(jobId),
+          approval: yield* queue.job(held.jobId),
+          messages: yield* queue.outboxFor(jobId),
+        };
+      }).pipe(Effect.provide(TestContext.TestContext)),
+    );
+
+    expect(result.swept.expired).toBe(2);
+    // Its own outcome, not the approval one, because the thread renders it: an
+    // `expired` here would tell the person who was asked that the daemon had
+    // been waiting on an approver.
+    expect(result.question?.outcome).toBe('unanswered');
+    expect(result.approval?.outcome).toBe('expired');
+    expect(result.question?.questionId).toBeUndefined();
+    // Which sweep took which row: both park at `pending` and both read
+    // `hold_expires_at`, so the reason is the only thing that tells them apart.
+    expect(result.question?.lastError).toBe('answer expired');
+    expect(result.approval?.lastError).toBe('approval expired');
+    // The question and its expiry both owe the thread a message.
+    expect(result.messages.map((message) => message.outcome)).toEqual([
+      'needs_input',
+      'unanswered',
+    ]);
+  });
+
+  it('reports the question a subject is waiting on, and nothing once it is answered', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        // Stored with the case GitHub sent, and looked up both ways below: a
+        // fixture that is lowercase on both sides proves neither fold.
+        const { jobId } = yield* queue.enqueue({
+          ...work('waiting'),
+          repository: 'EDLOIDAS/Lictor',
+        });
+        const claimed = yield* queue.claim;
+        const before = yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17);
+        yield* queue.park({
+          jobId,
+          attemptNumber: claimed?.attempts ?? 1,
+          repository: 'EDLOIDAS/Lictor',
+          subjectNumber: 17,
+          question: 'which branch?',
+          answerers: ['edloidas', 'adiutriel'],
+          expiresAt: Date.now() + 3_600_000,
+        });
+        // Undelivered, so it is not on the thread and nothing can answer it.
+        const undelivered = yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17);
+        yield* deliverPending;
+        const byLowercase = yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17);
+        const byStoredCase = yield* queue.pendingQuestion('EDLOIDAS/Lictor', 'issue', 17);
+        const elsewhere = yield* queue.pendingQuestion('edloidas/lictor', 'issue', 18);
+        const otherKind = yield* queue.pendingQuestion('edloidas/lictor', 'pull_request', 17);
+        yield* queue.answerQuestion({
+          jobId,
+          questionId: byLowercase?.questionId ?? 'none',
+          answerUrl: 'https://github.com/edloidas/lictor/issues/17#issuecomment-9',
+        });
+        return {
+          jobId,
+          before,
+          undelivered,
+          byLowercase,
+          byStoredCase,
+          elsewhere,
+          otherKind,
+          message: (yield* queue.outboxFor(jobId))[0],
+          after: yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17),
+        };
+      }),
+    );
+
+    expect(result.before).toBeUndefined();
+    expect(result.undelivered).toBeUndefined();
+    expect(result.byLowercase?.jobId).toBe(result.jobId);
+    expect(result.byStoredCase?.jobId).toBe(result.jobId);
+    expect(result.byLowercase?.answerers).toEqual(['edloidas', 'adiutriel']);
+    // The floor a reply has to beat to count as its answer, taken from the park
+    // rather than from delivery — not merely some positive number.
+    expect(result.byLowercase?.askedAt).toBe(result.message?.createdAt);
+    expect(result.byLowercase?.questionId).toBe(result.message?.messageId);
+    expect(result.elsewhere).toBeUndefined();
+    expect(result.otherKind).toBeUndefined();
+    expect(result.after).toBeUndefined();
+  });
+
+  // Three states of the question's own message, and only one of them means the
+  // thread never saw it. `delivered_at` cannot tell them apart: it records when
+  // the daemon learned the comment exists, not when it appeared.
+  it.each([
+    ['a send whose response was lost', 'retried', true],
+    ['a question refused by policy', 'blocked', false],
+    ['a question never claimed for sending', 'untouched', false],
+  ])('treats %s as answerable: %s', async (_name, disposition, answerable) => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work(`outbox-${disposition}`));
+        const claimed = yield* queue.claim;
+        yield* queue.park({
+          jobId,
+          attemptNumber: claimed?.attempts ?? 1,
+          repository: 'edloidas/lictor',
+          subjectNumber: 17,
+          question: 'which branch?',
+          answerers: ['edloidas'],
+          expiresAt: Date.now() + 3_600_000,
+        });
+        if (disposition !== 'untouched') {
+          const message = yield* queue.claimOutbox;
+          yield* disposition === 'retried'
+            ? // The POST reached GitHub; the write recording it did not.
+              queue.retryOutbox(message?.id ?? 0, message?.attempts ?? 1, 'timed out', 0)
+            : queue.finishOutbox(message?.id ?? 0, message?.attempts ?? 1, 'blocked', 'no_comment');
+        }
+        return {
+          question: yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17),
+          message: (yield* queue.outboxFor(jobId))[0],
+        };
+      }),
+    );
+
+    expect(result.question !== undefined).toBe(answerable);
+    if (answerable) {
+      // Dated from the park, never from delivery: a floor at or before the real
+      // post can reject no genuine answer, while a later one loses it for good.
+      expect(result.question?.askedAt).toBe(result.message?.createdAt);
+      expect(result.message?.deliveredAt).toBeUndefined();
+    }
+  });
+
+  it('keeps the message a parked job is waiting on out of the retention sweep', async () => {
+    // `retention.failedDays` can be shorter than the answer window. Pruning the
+    // question's record strands the job: still `pending`, still carrying a
+    // `question_id`, and answerable by nobody.
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('long-wait'));
+        const claimed = yield* queue.claim;
+        yield* queue.park({
+          jobId,
+          attemptNumber: claimed?.attempts ?? 1,
+          repository: 'edloidas/lictor',
+          subjectNumber: 17,
+          question: 'which branch?',
+          answerers: ['edloidas'],
+          expiresAt: (yield* Clock.currentTimeMillis) + 30 * 24 * 3_600_000,
+        });
+        yield* deliverPending;
+        yield* TestClock.adjust('2 days');
+        const now = yield* Clock.currentTimeMillis;
+        // Retention far shorter than the hold the job is still sitting in.
+        yield* queue.maintenance(now, now, now, 60 * 60 * 1000);
+        return {
+          question: yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17),
+          job: yield* queue.job(jobId),
+        };
+      }).pipe(Effect.provide(TestContext.TestContext)),
+    );
+
+    expect(result.job?.status).toBe('pending');
+    expect(result.question?.questionId).toBe(result.job?.questionId);
+  });
+
+  it('reports an answer already taken so a replayed delivery cannot re-use it', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('replayed'));
+        const claimed = yield* queue.claim;
+        yield* queue.park({
+          jobId,
+          attemptNumber: claimed?.attempts ?? 1,
+          repository: 'edloidas/lictor',
+          subjectNumber: 17,
+          question: 'which branch?',
+          answerers: ['edloidas'],
+          expiresAt: Date.now() + 3_600_000,
+        });
+        yield* deliverPending;
+        const before = yield* queue.answersTaken('edloidas/lictor', 'issue', 17);
+        yield* queue.answerQuestion({
+          jobId,
+          questionId: (yield* queue.job(jobId))?.questionId ?? 'none',
+          answerUrl: 'https://github.com/edloidas/lictor/issues/17#issuecomment-9',
+        });
+        return {
+          before,
+          after: yield* queue.answersTaken('edloidas/lictor', 'issue', 17),
+          elsewhere: yield* queue.answersTaken('edloidas/lictor', 'issue', 18),
+          // The question is gone by now, which is exactly why this second
+          // record has to exist: a replay would otherwise see an ordinary
+          // comment with an identity no job carries.
+          question: yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17),
+        };
+      }),
+    );
+
+    expect(result.before).toEqual([]);
+    expect(result.after).toEqual(['https://github.com/edloidas/lictor/issues/17#issuecomment-9']);
+    expect(result.elsewhere).toEqual([]);
+    expect(result.question).toBeUndefined();
+  });
+
+  it('lets an unreadable answer policy expire the question rather than kill the row', async () => {
+    // `decodeJob` throwing is how a row gets dead-lettered as an undecodable
+    // payload, and this column is not part of the payload. Nobody may answer,
+    // so the question runs out its clock — the job is not destroyed over it.
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const { jobId } = yield* queue.enqueue(work('garbled-policy'));
+          const claimed = yield* queue.claim;
+          yield* queue.park({
+            jobId,
+            attemptNumber: claimed?.attempts ?? 1,
+            repository: 'edloidas/lictor',
+            subjectNumber: 17,
+            question: 'which branch?',
+            answerers: ['edloidas'],
+            expiresAt: Date.now() + 3_600_000,
+          });
+          yield* deliverPending;
+        }).pipe(Effect.provide(queueLayer(path))),
+      ),
+    );
+    const raw = new Database(path);
+    raw.query('UPDATE jobs SET question_answerers = ? WHERE id = 1').run('{not json');
+    raw.close();
+
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            return {
+              job: yield* queue.job(1),
+              question: yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17),
+            };
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(result.job?.status).toBe('pending');
+      expect(result.job?.questionId).toBeString();
+      expect(result.job?.questionAnswerers).toEqual([]);
+      // Still found, still waiting — with nobody authorized to answer it.
+      expect(result.question?.answerers).toEqual([]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('gives a dead-lettered job the same outcome a migrated one carries', async () => {
@@ -1468,7 +1866,13 @@ describe('WorkQueue', () => {
       ),
     );
     const database = new Database(path);
-    for (const column of ['outcome', 'ready_at', 'hold_expires_at']) {
+    for (const column of [
+      'outcome',
+      'ready_at',
+      'hold_expires_at',
+      'question_id',
+      'question_answerers',
+    ]) {
       database.exec(`ALTER TABLE jobs DROP COLUMN ${column}`);
     }
     database.exec('PRAGMA user_version = 10');
@@ -1498,8 +1902,50 @@ describe('WorkQueue', () => {
       const after = new Database(path);
       expect(
         (after.query('PRAGMA user_version').get() as { user_version: number }).user_version,
-      ).toBe(12);
+      ).toBe(13);
       after.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves a job already terminal on needs_input terminal', async () => {
+    // Its question was asked before one had an identity anything could name, so
+    // parking it on the upgrade would produce waiting work with no way out.
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.enqueue(work('asked'));
+          const claimed = yield* queue.claim;
+          yield* queue.fail(1, claimed?.attempts ?? 1, 'which branch?', undefined, 'needs_input');
+        }).pipe(Effect.provide(queueLayer(path))),
+      ),
+    );
+    const database = new Database(path);
+    for (const column of ['question_id', 'question_answerers']) {
+      database.exec(`ALTER TABLE jobs DROP COLUMN ${column}`);
+    }
+    database.exec('PRAGMA user_version = 12');
+    database.close();
+
+    try {
+      const upgraded = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            return { job: yield* queue.job(1), claimed: yield* queue.claim };
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(upgraded.job?.status).toBe('failed');
+      expect(upgraded.job?.outcome).toBe('needs_input');
+      expect(upgraded.job?.questionId).toBeUndefined();
+      // Terminal means terminal: the upgrade must not make it runnable either.
+      expect(upgraded.claimed).toBeUndefined();
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -1509,7 +1955,7 @@ describe('WorkQueue', () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
     const database = new Database(path, { create: true });
-    database.exec('PRAGMA user_version = 13');
+    database.exec('PRAGMA user_version = 14');
     database.close();
 
     try {

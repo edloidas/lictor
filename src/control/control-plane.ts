@@ -17,6 +17,21 @@ export type ControlRequest = {
   readonly args?: readonly string[];
 };
 
+/**
+ * Where the answer was written, which is all the resumed agent is given —
+ * bounded and `https` only, because it is published into the job payload and
+ * read back as a link.
+ */
+const answerLocation = (value: string | undefined): Effect.Effect<string, ControlError> =>
+  value?.startsWith('https://') && value.length <= 2048
+    ? Effect.succeed(value)
+    : Effect.fail(
+        new ControlError({
+          code: 'CONTROL_ANSWER_URL_INVALID',
+          message: 'An https URL to the answer is required',
+        }),
+      );
+
 const positiveId = (value: string | undefined): Effect.Effect<number, ControlError> => {
   const id = Number(value);
   return Number.isInteger(id) && id > 0
@@ -110,6 +125,38 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
             return yield* mutate('retry', yield* positiveId(args[0]));
           case 'job.cancel':
             return yield* mutate('cancel', yield* positiveId(args[0]));
+          case 'job.answer': {
+            const jobId = yield* positiveId(args[0]);
+            const answerUrl = yield* answerLocation(args[1]);
+            const parked = yield* queue.job(jobId);
+            if (parked === undefined)
+              return yield* new ControlError({
+                code: 'CONTROL_JOB_NOT_FOUND',
+                message: `Job ${jobId} was not found`,
+              });
+            if (parked.questionId === undefined)
+              return yield* new ControlError({
+                code: 'CONTROL_JOB_NOT_WAITING',
+                message: `Job ${jobId} is not waiting on an answer`,
+              });
+            // The recorded answerers bind GitHub replies, not this socket. An
+            // operator holding it already has `approve` and `cancel` on the same
+            // row, so a list of logins here would lock them out of their own
+            // lever without withholding anything they cannot already do.
+            const changed = yield* queue.answerQuestion({
+              jobId,
+              questionId: parked.questionId,
+              answerUrl,
+            });
+            yield* queue.recordAudit({
+              jobId,
+              repository: parked.work.repository,
+              capability: 'control.answer',
+              input: JSON.stringify({ answerUrl }),
+              outcome: changed ? 'ok' : 'no_change',
+            });
+            return { changed, jobId };
+          }
           case 'repository.list': {
             const jobs = yield* queue.listJobs(1000);
             return [...new Set(jobs.map((job) => job.work.repository))].sort();
