@@ -190,6 +190,107 @@ describe('Worker.runOnce', () => {
     expect(result.counts.completed).toBe(1);
   });
 
+  it("owes the thread the agent's own words on a completion", async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return yield* queue.outboxFor(jobId);
+      }),
+      () => Effect.succeed({ status: 'completed', summary: 'Opened the pull request.' }),
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      outcome: 'completed',
+      note: 'Opened the pull request.',
+      subjectNumber: 17,
+    });
+  });
+
+  it("owes the thread the agent's own words on a question", async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return yield* queue.outboxFor(jobId);
+      }),
+      () => Effect.succeed({ status: 'needs_input', summary: 'which branch?' }),
+      3,
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      outcome: 'needs_input',
+      note: 'which branch?',
+      repository: 'edloidas/lictor',
+      subjectNumber: 17,
+    });
+  });
+
+  it('owes the thread an outcome with no note when the executor itself failed', async () => {
+    // ! The message the worker holds here is Codex's own stderr diagnosis, or
+    // ! git's. Publishing it is how a repository gets its prose onto a thread
+    // ! under the daemon's account.
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return yield* queue.outboxFor(jobId);
+      }),
+      () =>
+        Effect.fail(new ExecutorError({ message: 'Codex exited with status 1', retryable: false })),
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0]?.outcome).toBe('failed');
+    expect(result[0]?.note).toBeUndefined();
+  });
+
+  it('owes the thread nothing while a failure is still going to retry', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return { job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
+      }),
+      () => Effect.succeed({ status: 'failed', summary: 'transient' }),
+      3,
+    );
+
+    expect(result.job?.status).toBe('retry');
+    expect(result.messages).toHaveLength(0);
+  });
+
+  it('owes the thread an outcome when policy refuses the job, without the code', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(deniedWork);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return { job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
+      }),
+      () => Effect.succeed({ status: 'completed', summary: 'never runs' }),
+    );
+
+    expect(result.job?.lastError).toBe('POLICY_EXECUTION_DENIED');
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toMatchObject({
+      outcome: 'failed',
+      repository: deniedWork.repository,
+    });
+    expect(result.messages[0]?.note).toBeUndefined();
+  });
+
   it('does not record a refusal as a completion', async () => {
     // The defect: `rejected` fell past the failure branch into `queue.complete`
     // and logged "Completed queued work", so an agent that declined the request

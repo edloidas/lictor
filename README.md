@@ -11,9 +11,10 @@ A local GitHub automation daemon that gives Codex durable, policy-scoped work.
 </p>
 
 Lictor polls the GitHub notifications API, commits each thread to SQLite before
-marking it read, acknowledges accepted work with an eyes reaction, and runs it in
-a disposable clone of the repository. GitHub credentials stay in the daemon; agent
-GitHub operations pass through a job-scoped, audited capability broker.
+marking it read, acknowledges accepted work with an eyes reaction, runs it in a
+disposable clone of the repository, and posts the outcome back to the thread.
+GitHub credentials stay in the daemon; agent GitHub operations pass through a
+job-scoped, audited capability broker.
 
 ```text
 GitHub notifications <- poll -- durable inbox -> qualify -> policy -> queue
@@ -105,6 +106,15 @@ so neither value alone — and the outcome is one of `Completed queued work`,
 `Queued work did not complete`, `Queued work will retry`, or `Queued work
 failed`. No line carries Codex's stdout or stderr: what the agent reported is in
 the database.
+
+Every outcome that finishes a job also owes the thread a comment, and `Posted the
+outcome to the thread` is where that lands. The comment is rendered from a fixed
+template: the daemon writes the opening line, and the agent's own summary is
+quoted beneath it and attributed to the agent. An outcome the daemon reached on
+its own — a timeout, a crash, an expiry, a policy refusal — carries no quotation
+at all, because the only text available on those paths is a diagnostic. Where the
+repository policy withholds `comment`, the outcome is kept locally and logged as
+`Outcome cannot be posted; policy forbids commenting` instead.
 
 ## Activate repository policy
 
@@ -258,6 +268,11 @@ running. SQLite state and its WAL must be treated as one consistency boundary.
   thread produces no second job and no second reaction.
 - An eyes reaction on the triggering comment is best-effort acknowledgement, not
   a receipt: the job is committed whether or not the reaction lands.
+- The closing comment is not best-effort. It is written to an outbox in the same
+  transaction as the outcome it describes and delivered by a separate loop, so a
+  posting failure retries the comment and never reruns the agent. Each message
+  carries its own identity, which a retry matches against the thread before
+  posting a second time.
 - One daemon owns the database; worker attempts use renewable fenced leases.
 - Expired work is retried within its attempt budget, then dead-lettered.
 - Queue depth, job age, per-repository attempts, and execution duration are

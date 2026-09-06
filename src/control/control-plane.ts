@@ -88,8 +88,22 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
           }
           case 'job.list':
             return yield* queue.listJobs(Number(args[0] ?? 100));
-          case 'job.show':
-            return yield* queue.job(yield* positiveId(args[0]));
+          case 'job.show': {
+            const jobId = yield* positiveId(args[0]);
+            // The outbox is where a `blocked` delivery and its reason live. A
+            // repository that withholds `comment` never gets a thread comment,
+            // so this is the only place the operator can read what was said.
+            //
+            // ! Read first, and survive a job that will not decode. A payload
+            // ! the schema no longer accepts is dead-lettered *and* owed a
+            // ! message, and `queue.job` is the one call that fails on exactly
+            // ! those rows — reading it first made the record unreachable for
+            // ! the case it was added for.
+            const outbox = yield* queue.outboxFor(jobId);
+            const found = yield* Effect.orElseSucceed(queue.job(jobId), () => undefined);
+            if (found !== undefined) return { ...found, outbox };
+            return outbox.length === 0 ? undefined : { id: jobId, undecodable: true, outbox };
+          }
           case 'job.approve':
             return yield* mutate('approve', yield* positiveId(args[0]));
           case 'job.retry':

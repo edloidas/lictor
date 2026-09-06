@@ -1,9 +1,10 @@
+import { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
 import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Effect, Layer, Redacted } from 'effect';
-import { LictorConfig } from '../src/config.ts';
+import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { ControlPlane, type ControlRequest, ControlServer } from '../src/control/control-plane.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
@@ -110,11 +111,23 @@ describe('local control plane', () => {
               command: 'capability.mcp',
               args: ['1', '1', 'worker-a', '{"jsonrpc":"2.0","id":1,"method":"tools/call"}'],
             });
+            const claimed = yield* queue.claim;
+            yield* queue.complete(enqueued.jobId, claimed?.attempts ?? 0, '{}', {
+              repository: work.repository,
+              subjectNumber: work.subject.number,
+              outcome: 'completed',
+              note: 'Opened the pull request.',
+            });
+            const shown = yield* call(server.path, {
+              command: 'job.show',
+              args: [String(enqueued.jobId)],
+            });
             return {
               approved: JSON.parse(approved),
               status: JSON.parse(status),
               capability: JSON.parse(capability),
-              claimed: yield* queue.claim,
+              shown: JSON.parse(shown),
+              claimed,
               mode: statSync(server.path).mode & 0o777,
             };
           }).pipe(Effect.provide(Layer.mergeAll(ServerLive, QueueLive, HealthLive))),
@@ -130,7 +143,102 @@ describe('local control plane', () => {
         error: { code: 'CONTROL_COMMAND_UNKNOWN' },
       });
       expect(result.claimed?.work.approvalRequired).toBe(false);
+      // Where policy withholds `comment` the outbox row is the only record of
+      // what the agent said, so `job.show` has to carry it.
+      expect(result.shown).toMatchObject({
+        ok: true,
+        result: {
+          id: 1,
+          outcome: 'completed',
+          outbox: [{ outcome: 'completed', note: 'Opened the pull request.', status: 'pending' }],
+        },
+      });
       expect(result.mode).toBe(0o600);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('still reports a job whose payload no longer decodes', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-control-'));
+    const path = join(directory, 'queue.sqlite');
+    const ConfigLive = Layer.succeed(
+      LictorConfig,
+      LictorConfig.make({
+        githubToken: Redacted.make('pat-value'),
+        expectedLogin: 'adiutriel',
+        trustedSenders: ['edloidas'],
+        autoAcceptInviters: [],
+        databasePath: path,
+        stateDir: stateDirOf(path),
+        policyPath: 'unused',
+        controlSocketPath: join(directory, 'control.sock'),
+        deliveryMaxBytes: 1024,
+        executor: 'disabled',
+        codexModel: 'gpt-5.6-luna',
+        codexHome: '',
+        agentWorkdir: '.',
+        executorTimeoutMs: 1000,
+        executorOutputBytes: 1024,
+        gitTimeoutMs: 180_000,
+        workerPollMs: 10,
+        workerMaxAttempts: 3,
+        workerRetryBaseMs: 100,
+        notificationPollMs: 60_000,
+      }),
+    );
+    const PolicyLive = Layer.effect(
+      Policy,
+      parsePolicy('[defaults]\nexecution = "automatic"').pipe(Effect.map(Policy.make)),
+    );
+    const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
+    const PlaneLive = ControlPlane.DefaultWithoutDependencies.pipe(
+      Layer.provide(Layer.mergeAll(ConfigLive, PolicyLive, QueueLive, CredentialHealth.Default)),
+    );
+
+    try {
+      const enqueued = await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(WorkQueue, (queue) =>
+            // Not approval-required: the claim skips those, and the claim is
+            // what dead-letters an unreadable payload.
+            queue.enqueue({ ...work, approvalRequired: false }),
+          ).pipe(Effect.provide(QueueLive)),
+        ),
+      );
+
+      const raw = new Database(path);
+      const payload = JSON.parse(
+        (
+          raw.query('SELECT payload FROM jobs WHERE id = ?').get(enqueued.jobId) as {
+            payload: string;
+          }
+        ).payload,
+      ) as Record<string, unknown>;
+      raw
+        .query('UPDATE jobs SET payload = ? WHERE id = ?')
+        .run(JSON.stringify({ ...payload, reasons: 'not-an-array' }), enqueued.jobId);
+      raw.close();
+
+      const shown = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            // The claim dead-letters it and writes the message it still owes.
+            yield* queue.claim;
+            const plane = yield* ControlPlane;
+            return yield* plane.execute({ command: 'job.show', args: [String(enqueued.jobId)] });
+          }).pipe(Effect.provide(Layer.mergeAll(PlaneLive, QueueLive))),
+        ),
+      );
+
+      // `queue.job` cannot decode this row, and it is exactly the row that owes
+      // the thread a message — reporting nothing here loses the only record.
+      expect(shown).toMatchObject({
+        id: enqueued.jobId,
+        undecodable: true,
+        outbox: [{ outcome: 'failed', status: 'pending' }],
+      });
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
