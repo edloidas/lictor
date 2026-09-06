@@ -135,6 +135,8 @@ describe('notification-to-agent pipeline', () => {
           const GitHubLive = Layer.succeed(
             GitHubClient,
             GitHubClient.make({
+              createComment: () => Effect.succeed({}),
+              listComments: () => Effect.succeed([]),
               authenticated: Effect.succeed(
                 client.pipe(
                   HttpClient.mapRequest(HttpClientRequest.prependUrl('https://api.github.test')),

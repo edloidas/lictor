@@ -14,6 +14,7 @@ export const daemonTick = Effect.gen(function* () {
   const tick = yield* Clock.currentTimeMillis;
   yield* queue.recoverStale(tick);
   yield* queue.recoverStaleDeliveries(tick);
+  yield* queue.recoverStaleOutbox(tick);
 });
 
 export const maintenanceLoop = Effect.forever(

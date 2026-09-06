@@ -9,6 +9,13 @@ import { type WorkItem, WorkItemSchema } from '../work-item.ts';
 const WORKER_LEASE_MS = 60_000;
 const DAEMON_LEASE_MS = 30_000;
 const DELIVERY_LEASE_MS = 60_000;
+const OUTBOX_LEASE_MS = 60_000;
+/**
+ * Its own budget rather than `workerMaxAttempts`, which sizes an attempt that
+ * clones a repository and runs an agent. A message is one POST, and exhausting
+ * the budget is the one way a committed outcome stays unseen.
+ */
+const OUTBOX_MAX_ATTEMPTS = 10;
 
 export type InboxStatus = 'pending' | 'processing' | 'completed' | 'failed';
 
@@ -65,6 +72,42 @@ export type JobOutcome =
   | 'needs_input'
   | 'rejected';
 
+export type OutboxStatus = 'pending' | 'sending' | 'delivered' | 'blocked' | 'failed' | 'canceled';
+
+/**
+ * The public message a terminal outcome owes its GitHub thread, handed to the
+ * write that records the outcome so the two commit together.
+ *
+ * ! `note` is agent-authored prose and nothing else. Every other string the
+ * ! worker holds at a terminal write — an `ExecutorError` message, a policy
+ * ! refusal code — is a diagnostic, and this field is published verbatim.
+ */
+export type OutcomeDelivery = {
+  readonly repository: string;
+  readonly subjectNumber: number;
+  readonly outcome: JobOutcome;
+  readonly note?: string;
+};
+
+export type OutboxMessage = {
+  readonly id: number;
+  readonly messageId: string;
+  readonly jobId: number;
+  readonly attempt: number;
+  readonly repository: string;
+  readonly subjectNumber: number;
+  readonly outcome: JobOutcome;
+  readonly note?: string;
+  readonly status: OutboxStatus;
+  readonly attempts: number;
+  readonly createdAt: number;
+  /** When delivery may next be attempted; a backoff moves it forward. */
+  readonly availableAt: number;
+  readonly deliveredAt?: number;
+  readonly commentUrl?: string;
+  readonly lastError?: string;
+};
+
 /**
  * Statuses past which a job never runs again. Only `liveJobIds` reads this
  * list; `maintenance` inlines the same literals in its SQL. The values agree
@@ -115,6 +158,42 @@ type JobRow = {
   readonly leaseExpiresAt?: number | null;
 };
 
+type OutboxRow = {
+  readonly id: number;
+  readonly messageId: string;
+  readonly jobId: number;
+  readonly attempt: number;
+  readonly repository: string;
+  readonly subjectNumber: number;
+  readonly outcome: JobOutcome;
+  readonly note: string | null;
+  readonly status: OutboxStatus;
+  readonly attempts: number;
+  readonly createdAt: number;
+  readonly availableAt: number;
+  readonly deliveredAt: number | null;
+  readonly commentUrl: string | null;
+  readonly lastError: string | null;
+};
+
+const decodeOutbox = (row: OutboxRow): OutboxMessage => ({
+  id: row.id,
+  messageId: row.messageId,
+  jobId: row.jobId,
+  attempt: row.attempt,
+  repository: row.repository,
+  subjectNumber: row.subjectNumber,
+  outcome: row.outcome,
+  status: row.status,
+  attempts: row.attempts,
+  createdAt: row.createdAt,
+  availableAt: row.availableAt,
+  ...(row.note === null ? {} : { note: row.note }),
+  ...(row.deliveredAt === null ? {} : { deliveredAt: row.deliveredAt }),
+  ...(row.commentUrl === null ? {} : { commentUrl: row.commentUrl }),
+  ...(row.lastError === null ? {} : { lastError: row.lastError }),
+});
+
 /**
  * `QueueError.operation` for every delivery write fenced on `attempts`, the way
  * the job writes are fenced on `attemptNumber`. Status alone is not enough: the
@@ -130,6 +209,12 @@ export const CLAIM_FENCED_OPERATIONS = {
   finish: 'finish delivery',
   retry: 'retry delivery',
   renew: 'renew delivery lease',
+} as const;
+
+/** The same fencing, for the outbox rows the delivery of an outcome holds. */
+export const OUTBOX_FENCED_OPERATIONS = {
+  finish: 'finish outbox message',
+  retry: 'retry outbox message',
 } as const;
 
 /**
@@ -159,11 +244,11 @@ const migrate = (database: Database) => {
     (database.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(
       (existing) => existing.name === column,
     );
-  // Every v11 artifact checked, not a sample: one missing piece would fail on
+  // Every v12 artifact checked, not a sample: one missing piece would fail on
   // every use — the v6 equality-guard failure, one version later. The
   // `installation_id` check is negative so a database predating its drop heals.
   if (
-    version.user_version === 11 &&
+    version.user_version === 12 &&
     deliveriesHaveSource() &&
     hasColumn('deliveries', 'lease_expires_at') &&
     hasColumn('capability_audit', 'actor') &&
@@ -174,10 +259,13 @@ const migrate = (database: Database) => {
     hasTable('notification_cursors') &&
     hasTable('poller_state') &&
     hasTable('subject_branches') &&
-    hasTable('thread_liveness')
+    hasTable('thread_liveness') &&
+    hasTable('outbox') &&
+    hasColumn('outbox', 'message_id') &&
+    hasColumn('outbox', 'lease_expires_at')
   )
     return;
-  if (version.user_version > 11) {
+  if (version.user_version > 12) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -369,7 +457,31 @@ const migrate = (database: Database) => {
         expires_at INTEGER NOT NULL,
         PRIMARY KEY (repository, subject_kind, subject_number)
       );
-      PRAGMA user_version = 11;
+      -- One message per terminal job outcome, inserted in the transaction that
+      -- writes the outcome. No foreign key: retention prunes jobs on their own
+      -- clock, and a cascade would drop an obligation nobody has delivered yet.
+      -- The row therefore carries everything delivery needs.
+      CREATE TABLE IF NOT EXISTS outbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id TEXT NOT NULL UNIQUE,
+        job_id INTEGER NOT NULL,
+        attempt INTEGER NOT NULL,
+        repository TEXT NOT NULL,
+        subject_number INTEGER NOT NULL,
+        outcome TEXT NOT NULL,
+        note TEXT,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'sending', 'delivered', 'blocked', 'failed', 'canceled')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        available_at INTEGER NOT NULL,
+        lease_expires_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        comment_url TEXT,
+        last_error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS outbox_claimable ON outbox(status, available_at, id);
+      PRAGMA user_version = 12;
     `);
     // ! Condemned, not drained: no decoder exists for webhook bodies anymore,
     // ! so leaving one claimable kills the delivery worker on a defect per cycle.
@@ -498,6 +610,68 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         )
         .run(),
     );
+
+    /**
+     * ! Runs inside the caller's transaction, after its fence has thrown or
+     * ! passed, and stores raw fields rather than rendered text. Rendering here
+     * ! would put the renderer in the transaction that finishes the job: one
+     * ! throw and the outcome rolls back, the lease lapses, and the agent runs
+     * ! again — which is what a durable outbox exists to prevent.
+     */
+    const insertOutbox = (
+      delivery: OutcomeDelivery,
+      jobId: number,
+      attemptNumber: number,
+      now: number,
+    ) => {
+      database
+        .query(
+          `INSERT INTO outbox (message_id, job_id, attempt, repository, subject_number,
+             outcome, note, status, available_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+        )
+        .run(
+          randomUUID(),
+          jobId,
+          attemptNumber,
+          delivery.repository,
+          delivery.subjectNumber,
+          delivery.outcome,
+          delivery.note ?? null,
+          now,
+          now,
+          now,
+        );
+    };
+
+    /**
+     * Outbox rows for outcomes written in bulk over `jobs`, where the message
+     * has to come out of the stored payload. A payload that cannot supply a
+     * repository and a subject number is skipped rather than inserted: there is
+     * nowhere to post it, and the claim admits exactly such rows so it can
+     * dead-letter them.
+     */
+    const insertOutboxFromJobs = (
+      outcome: JobOutcome,
+      where: string,
+      parameters: readonly (string | number)[],
+      now: number,
+    ) =>
+      database
+        .query(
+          `INSERT INTO outbox (message_id, job_id, attempt, repository, subject_number,
+             outcome, status, available_at, created_at, updated_at)
+           SELECT lower(hex(randomblob(16))), id, attempts,
+                  json_extract(payload, '$.repository'),
+                  json_extract(payload, '$.subject.number'),
+                  ?, 'pending', ?, ?, ?
+           FROM jobs
+           WHERE (${where})
+             AND json_valid(payload)
+             AND json_type(payload, '$.repository') = 'text'
+             AND json_type(payload, '$.subject.number') = 'integer'`,
+        )
+        .run(outcome, now, now, now, ...parameters);
 
     const receiveDelivery = (delivery: ReceivedDelivery) =>
       Effect.gen(function* () {
@@ -685,6 +859,170 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           } | null,
       ).pipe(Effect.map((row) => row?.status));
 
+    const OUTBOX_COLUMNS = `id, message_id AS messageId, job_id AS jobId, attempt, repository,
+        subject_number AS subjectNumber, outcome, note, status, attempts,
+        created_at AS createdAt, available_at AS availableAt,
+        delivered_at AS deliveredAt, comment_url AS commentUrl,
+        last_error AS lastError`;
+
+    const claimOutbox = Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      return yield* attempt('claim outbox message', () =>
+        database
+          .transaction(() => {
+            const row = database
+              .query(
+                `SELECT ${OUTBOX_COLUMNS} FROM outbox
+                 WHERE status = 'pending' AND available_at <= ?
+                 ORDER BY available_at, id LIMIT 1`,
+              )
+              .get(now) as OutboxRow | null;
+            if (row === null) return undefined;
+            const attempts = row.attempts + 1;
+            database
+              .query(
+                `UPDATE outbox SET status = 'sending', attempts = ?, lease_expires_at = ?,
+                   updated_at = ?
+                 WHERE id = ? AND status = 'pending'`,
+              )
+              .run(attempts, now + OUTBOX_LEASE_MS, now, row.id);
+            return decodeOutbox({ ...row, status: 'sending', attempts });
+          })
+          .immediate(),
+      );
+    });
+
+    const deliverOutbox = (id: number, attempts: number, commentUrl?: string) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        yield* attempt(OUTBOX_FENCED_OPERATIONS.finish, () => {
+          const result = database
+            .query(
+              `UPDATE outbox SET status = 'delivered', delivered_at = ?, updated_at = ?,
+                 lease_expires_at = NULL, comment_url = ?, last_error = NULL
+               WHERE id = ? AND status = 'sending' AND attempts = ?`,
+            )
+            .run(now, now, commentUrl ?? null, id, attempts);
+          if (result.changes !== 1)
+            throw new Error(`Outbox message ${id} attempt ${attempts} is stale`);
+        });
+      });
+
+    /** Terminal without delivery: policy forbids the comment, or the budget ran out. */
+    const finishOutbox = (
+      id: number,
+      attempts: number,
+      status: 'blocked' | 'failed',
+      error: string,
+    ) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        yield* attempt(OUTBOX_FENCED_OPERATIONS.finish, () => {
+          const result = database
+            .query(
+              `UPDATE outbox SET status = ?, updated_at = ?, lease_expires_at = NULL,
+                 last_error = ?
+               WHERE id = ? AND status = 'sending' AND attempts = ?`,
+            )
+            .run(status, now, error, id, attempts);
+          if (result.changes !== 1)
+            throw new Error(`Outbox message ${id} attempt ${attempts} is stale`);
+        });
+      });
+
+    const retryOutbox = (
+      id: number,
+      attempts: number,
+      error: string,
+      availableAt: number,
+      countsAttempt = true,
+    ) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        yield* attempt(OUTBOX_FENCED_OPERATIONS.retry, () => {
+          const result = database
+            .query(
+              `UPDATE outbox SET
+                 status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
+                 attempts = ?, available_at = ?, lease_expires_at = NULL, updated_at = ?,
+                 last_error = ?
+               WHERE id = ? AND status = 'sending' AND attempts = ?`,
+            )
+            .run(
+              // Refunding the attempt keeps a dead credential from spending the
+              // whole budget while the daemon-wide breaker is latched.
+              countsAttempt ? OUTBOX_MAX_ATTEMPTS : Number.MAX_SAFE_INTEGER,
+              countsAttempt ? attempts : attempts - 1,
+              availableAt,
+              now,
+              error,
+              id,
+              attempts,
+            );
+          if (result.changes !== 1)
+            throw new Error(`Outbox message ${id} attempt ${attempts} is stale`);
+        });
+      });
+
+    /**
+     * ! Returned to `pending`, never re-sent blindly: the POST that lost its
+     * ! lease may have reached GitHub. The sender reconciles by marker before
+     * ! posting any row it claims with a spent attempt behind it.
+     */
+    const recoverStaleOutbox = (olderThan: number) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        return yield* attempt(
+          'recover stale outbox messages',
+          () =>
+            database
+              .query(
+                `UPDATE outbox SET
+                 status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
+                 lease_expires_at = NULL, available_at = ?, updated_at = ?,
+                 last_error = 'sender interrupted'
+               WHERE status = 'sending' AND lease_expires_at < ?`,
+              )
+              .run(OUTBOX_MAX_ATTEMPTS, now, now, olderThan).changes,
+        );
+      });
+
+    /**
+     * The row's state as it stands now, for a sender about to make a request it
+     * cannot take back. The fenced write afterwards catches a lost claim, but
+     * only once the comment is already on the thread.
+     *
+     * ! Reports which case it is, never a bare boolean. `canceled` means the
+     * ! operator replaced this outcome and it must never post; anything else
+     * ! means another pass owns the row and still owes it. Collapsed into one
+     * ! answer, a lease this sender keeps losing reads as an operator action
+     * ! and the message quietly stops being delivered.
+     */
+    const outboxHeld = (id: number, attempts: number) =>
+      attempt(
+        'inspect outbox message',
+        () =>
+          (database.query('SELECT status, attempts FROM outbox WHERE id = ?').get(id) as {
+            status: OutboxStatus;
+            attempts: number;
+          } | null) ?? undefined,
+      ).pipe(
+        Effect.map((row) => ({
+          held: row?.status === 'sending' && row.attempts === attempts,
+          superseded: row?.status === 'canceled',
+          status: row?.status,
+        })),
+      );
+
+    const outboxFor = (jobId: number) =>
+      attempt('list outbox messages', () =>
+        (
+          database
+            .query(`SELECT ${OUTBOX_COLUMNS} FROM outbox WHERE job_id = ? ORDER BY id`)
+            .all(jobId) as OutboxRow[]
+        ).map(decodeOutbox),
+      );
+
     /**
      * Newest activity already turned into work for one notification thread.
      *
@@ -828,6 +1166,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
 
               const attemptNumber = row.attempts + 1;
               if (attemptNumber > config.workerMaxAttempts) {
+                insertOutboxFromJobs('failed', 'id = ?', [row.id], now);
                 database
                   .query(
                     `UPDATE jobs SET status = 'dead_letter', outcome = 'failed', failed_at = ?,
@@ -840,6 +1179,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               try {
                 decoded = decodeJob({ ...row, status: 'running', attempts: attemptNumber });
               } catch {
+                // A payload that fails the schema may still carry a repository
+                // and a subject number, and that is all a message needs. The
+                // insert's own guards skip the rows where it does not.
+                insertOutboxFromJobs('failed', 'id = ?', [row.id], now);
                 database
                   .query(
                     `UPDATE jobs SET status = 'dead_letter', outcome = 'failed', failed_at = ?,
@@ -900,7 +1243,12 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       });
     });
 
-    const complete = (jobId: number, attemptNumber: number, output: string) =>
+    const complete = (
+      jobId: number,
+      attemptNumber: number,
+      output: string,
+      delivery?: OutcomeDelivery,
+    ) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         yield* attempt('complete', () =>
@@ -921,6 +1269,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                  WHERE job_id = ? AND number = ? AND status = 'running'`,
               )
               .run(now, output, jobId, attemptNumber);
+            if (delivery !== undefined) insertOutbox(delivery, jobId, attemptNumber, now);
           })(),
         );
       });
@@ -931,6 +1280,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       error: string,
       retryAt?: number,
       outcome: JobOutcome = 'failed',
+      delivery?: OutcomeDelivery,
     ) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
@@ -966,6 +1316,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                  WHERE job_id = ? AND number = ? AND status = 'running'`,
               )
               .run(now, error, jobId, attemptNumber);
+            // A row going back to `retry` has not finished, so it owes the
+            // thread nothing yet — inserting here posts once per attempt.
+            if (delivery !== undefined && retryAt === undefined)
+              insertOutbox(delivery, jobId, attemptNumber, now);
           })(),
         );
       });
@@ -982,6 +1336,14 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                    (SELECT id FROM jobs WHERE status = 'running' AND lease_expires_at < ?)`,
               )
               .run(now, olderThan);
+            // Selected before the update, while the rows still match: past it
+            // they are `dead_letter` and the predicate no longer finds them.
+            insertOutboxFromJobs(
+              'failed',
+              "status = 'running' AND lease_expires_at < ? AND attempts >= ?",
+              [olderThan, config.workerMaxAttempts],
+              now,
+            );
             return database
               .query(
                 `UPDATE jobs
@@ -1039,18 +1401,28 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         // ready. That covers rows held before the column existed — which the
         // claim no longer ages out — and dates a re-parked retry from the retry
         // rather than from creation, which would expire it again immediately.
-        const expired = database
-          .query(
-            `UPDATE jobs
-             SET status = 'failed', outcome = 'expired', failed_at = ?, updated_at = ?,
-                 hold_expires_at = NULL, last_error = 'approval expired'
-             WHERE status = 'pending'
+        const expiredWhere = `status = 'pending'
                AND CASE WHEN json_valid(payload)
                      THEN COALESCE(json_extract(payload, '$.approvalRequired'), 0)
                      ELSE 0 END = 1
-               AND COALESCE(hold_expires_at, ready_at + ?) < ?`,
-          )
-          .run(now, now, approvalExpiryMs ?? Number.MAX_SAFE_INTEGER, heldBefore).changes;
+               AND COALESCE(hold_expires_at, ready_at + ?) < ?`;
+        const expiryWindow = approvalExpiryMs ?? Number.MAX_SAFE_INTEGER;
+        // ! Held work is the one outcome nobody acts on: the requester saw the
+        // ! eyes reaction, the operator never approved, and expiry is where the
+        // ! thread would go silent forever. The insert and the update share a
+        // ! transaction the rest of this sweep does not need — past the update
+        // ! the rows no longer match the predicate the insert selects on.
+        const expired = database.transaction(() => {
+          insertOutboxFromJobs('expired', expiredWhere, [expiryWindow, heldBefore], now);
+          return database
+            .query(
+              `UPDATE jobs
+             SET status = 'failed', outcome = 'expired', failed_at = ?, updated_at = ?,
+                 hold_expires_at = NULL, last_error = 'approval expired'
+             WHERE ${expiredWhere}`,
+            )
+            .run(now, now, expiryWindow, heldBefore).changes;
+        })();
         database
           .query(
             `DELETE FROM capability_audit WHERE job_id IN
@@ -1072,6 +1444,14 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
              (status = 'failed' AND processed_at < ?)`,
           )
           .run(completedBefore, failedBefore);
+        // Pruned on the failed window like the jobs they describe, and only once
+        // terminal: an undelivered message is an obligation, not history.
+        database
+          .query(
+            `DELETE FROM outbox
+             WHERE status IN ('delivered', 'blocked', 'failed', 'canceled') AND updated_at < ?`,
+          )
+          .run(failedBefore);
         // Pruned on the failed window, the longer of the two: a cursor dropped
         // early makes the qualifier rescan and re-attribute an old comment as
         // fresh activity.
@@ -1345,6 +1725,15 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             if (action === 'retry') {
               if (row.status !== 'failed' && row.status !== 'dead_letter') return false;
               database.query('DELETE FROM attempts WHERE job_id = ?').run(id);
+              // The retried job writes its own outcome. A message describing the
+              // one it replaces must not post after it.
+              database
+                .query(
+                  `UPDATE outbox SET status = 'canceled', updated_at = ?,
+                     lease_expires_at = NULL, last_error = 'superseded by operator retry'
+                   WHERE job_id = ? AND status IN ('pending', 'sending')`,
+                )
+                .run(now, id);
               // ! A job still carrying `approvalRequired` goes back to `pending`
               // ! with a fresh deadline, never to `retry`. The claim skips
               // ! approval-required rows, and `approve` and the expiry sweep
@@ -1372,6 +1761,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               );
             }
             if (!['pending', 'retry', 'interrupted', 'running'].includes(row.status)) return false;
+            // The thread saw the eyes reaction and would otherwise never hear
+            // again. A `running` job is the sharper case: the agent may already
+            // have pushed a branch, and its own terminal write loses the fence.
+            insertOutboxFromJobs('canceled', 'id = ?', [id], now);
             database
               .query(
                 `UPDATE attempts SET status = 'interrupted', finished_at = ?, error = 'canceled by operator'
@@ -1460,6 +1853,13 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       heartbeatDelivery,
       recoverStaleDeliveries,
       deliveryStatus,
+      claimOutbox,
+      deliverOutbox,
+      finishOutbox,
+      retryOutbox,
+      recoverStaleOutbox,
+      outboxHeld,
+      outboxFor,
       notificationCursor,
       advanceNotificationCursor,
       pollerCursor,

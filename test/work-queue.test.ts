@@ -1498,7 +1498,7 @@ describe('WorkQueue', () => {
       const after = new Database(path);
       expect(
         (after.query('PRAGMA user_version').get() as { user_version: number }).user_version,
-      ).toBe(11);
+      ).toBe(12);
       after.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -1509,7 +1509,7 @@ describe('WorkQueue', () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
     const database = new Database(path, { create: true });
-    database.exec('PRAGMA user_version = 12');
+    database.exec('PRAGMA user_version = 13');
     database.close();
 
     try {
@@ -1744,5 +1744,410 @@ describe('WorkQueue', () => {
     );
 
     expect(result).toEqual({ live: true, liveCanonical: true, expired: false });
+  });
+
+  describe('outcome outbox', () => {
+    const finish = (deliveryId: string) =>
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work(deliveryId));
+        const claimed = yield* queue.claim;
+        return { queue, jobId, attempts: claimed?.attempts ?? 0 };
+      });
+
+    it('records the message in the transaction that records the outcome', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const { queue, jobId, attempts } = yield* finish('outbox-complete');
+          yield* queue.complete(jobId, attempts, '{}', {
+            repository: 'edloidas/lictor',
+            subjectNumber: 17,
+            outcome: 'completed',
+            note: 'Opened the pull request.',
+          });
+          return yield* queue.outboxFor(jobId);
+        }),
+      );
+
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({
+        outcome: 'completed',
+        note: 'Opened the pull request.',
+        repository: 'edloidas/lictor',
+        subjectNumber: 17,
+        status: 'pending',
+      });
+    });
+
+    it('gives every message an identity of its own', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const ids: string[] = [];
+          for (const name of ['outbox-id-a', 'outbox-id-b']) {
+            const { jobId } = yield* queue.enqueue(work(name));
+            const claimed = yield* queue.claim;
+            yield* queue.complete(jobId, claimed?.attempts ?? 0, '{}', {
+              repository: 'edloidas/lictor',
+              subjectNumber: 17,
+              outcome: 'completed',
+            });
+            const [message] = yield* queue.outboxFor(jobId);
+            ids.push(message?.messageId ?? '');
+          }
+          return ids;
+        }),
+      );
+
+      // A constant identity would reconcile the second message against the
+      // first comment and drop it.
+      expect(result[0]).not.toBe(result[1]);
+      expect(result[0]).toMatch(/^[0-9a-f-]{36}$/u);
+    });
+
+    it('writes no message when the outcome write is stale', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const { queue, jobId, attempts } = yield* finish('outbox-stale');
+          const exit = yield* Effect.exit(
+            queue.complete(jobId, attempts + 1, '{}', {
+              repository: 'edloidas/lictor',
+              subjectNumber: 17,
+              outcome: 'completed',
+            }),
+          );
+          return { exit, messages: yield* queue.outboxFor(jobId) };
+        }),
+      );
+
+      expect(result.exit._tag).toBe('Failure');
+      expect(result.messages).toHaveLength(0);
+    });
+
+    it('owes nothing while a failure is going back to retry', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const { queue, jobId, attempts } = yield* finish('outbox-retry');
+          const now = yield* Clock.currentTimeMillis;
+          yield* queue.fail(jobId, attempts, 'temporary', now + 60_000, 'failed', {
+            repository: 'edloidas/lictor',
+            subjectNumber: 17,
+            outcome: 'failed',
+          });
+          return yield* queue.outboxFor(jobId);
+        }),
+      );
+
+      expect(result).toHaveLength(0);
+    });
+
+    it('claims a message once, and again only after its lease lapses', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const { queue, jobId, attempts } = yield* finish('outbox-claim');
+          yield* queue.fail(jobId, attempts, 'refused', undefined, 'rejected', {
+            repository: 'edloidas/lictor',
+            subjectNumber: 17,
+            outcome: 'rejected',
+            note: 'I will not do that.',
+          });
+          const first = yield* queue.claimOutbox;
+          const contended = yield* queue.claimOutbox;
+          yield* TestClock.adjust('30 seconds');
+          const held = yield* queue.recoverStaleOutbox(yield* Clock.currentTimeMillis);
+          yield* TestClock.adjust('31 seconds');
+          const lapsed = yield* queue.recoverStaleOutbox(yield* Clock.currentTimeMillis);
+          return { first, contended, held, lapsed, second: yield* queue.claimOutbox };
+        }).pipe(Effect.provide(TestContext.TestContext)),
+      );
+
+      expect(result.first).toMatchObject({ outcome: 'rejected', status: 'sending', attempts: 1 });
+      expect(result.contended).toBeUndefined();
+      // Half a minute in, the lease still holds it.
+      expect(result.held).toBe(0);
+      expect(result.lapsed).toBe(1);
+      expect(result.second).toMatchObject({ status: 'sending', attempts: 2 });
+    });
+
+    it('refuses a terminal write from a stale claim', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const { queue, jobId, attempts } = yield* finish('outbox-fenced');
+          yield* queue.complete(jobId, attempts, '{}', {
+            repository: 'edloidas/lictor',
+            subjectNumber: 17,
+            outcome: 'completed',
+          });
+          const claimed = yield* queue.claimOutbox;
+          const stale = yield* Effect.exit(
+            queue.deliverOutbox(claimed?.id ?? 0, (claimed?.attempts ?? 0) + 1),
+          );
+          return { stale, messages: yield* queue.outboxFor(jobId) };
+        }),
+      );
+
+      expect(result.stale._tag).toBe('Failure');
+      expect(result.messages[0]?.status).toBe('sending');
+    });
+
+    it('returns an interrupted send to pending rather than failing it', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const { queue, jobId, attempts } = yield* finish('outbox-interrupted');
+          yield* queue.complete(jobId, attempts, '{}', {
+            repository: 'edloidas/lictor',
+            subjectNumber: 17,
+            outcome: 'completed',
+          });
+          yield* queue.claimOutbox;
+          yield* TestClock.adjust('61 seconds');
+          const recovered = yield* queue.recoverStaleOutbox(yield* Clock.currentTimeMillis);
+          return { recovered, messages: yield* queue.outboxFor(jobId) };
+        }).pipe(Effect.provide(TestContext.TestContext)),
+      );
+
+      expect(result.recovered).toBe(1);
+      // The attempt stays spent, so the sender knows to reconcile before posting.
+      expect(result.messages[0]).toMatchObject({ status: 'pending', attempts: 1 });
+    });
+
+    it('gives a held job that expired unapproved a message of its own', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const { jobId } = yield* queue.enqueue(
+            { ...work('outbox-expired'), approvalRequired: true },
+            10_000,
+            60 * 60 * 1000,
+          );
+          yield* TestClock.adjust('2 hours');
+          const swept = yield* queue.maintenance(
+            0,
+            0,
+            yield* Clock.currentTimeMillis,
+            60 * 60 * 1000,
+          );
+          return { swept, messages: yield* queue.outboxFor(jobId) };
+        }).pipe(Effect.provide(TestContext.TestContext)),
+      );
+
+      expect(result.swept.expired).toBe(1);
+      expect(result.messages).toHaveLength(1);
+      expect(result.messages[0]).toMatchObject({ outcome: 'expired', status: 'pending' });
+      expect(result.messages[0]?.note).toBeUndefined();
+    });
+
+    it('gives a dead-lettered job a message when its attempts run out', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const { jobId } = yield* queue.enqueue(work('outbox-dead-letter'));
+          for (let round = 0; round < 3; round += 1) {
+            const claimed = yield* queue.claim;
+            yield* queue.fail(jobId, claimed?.attempts ?? 0, 'temporary', 0, 'failed', {
+              repository: 'edloidas/lictor',
+              subjectNumber: 17,
+              outcome: 'failed',
+            });
+          }
+          // The fourth claim is the one that finds the budget spent.
+          yield* queue.claim;
+          return { job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
+        }),
+      );
+
+      expect(result.job?.status).toBe('dead_letter');
+      expect(result.messages).toHaveLength(1);
+      expect(result.messages[0]?.outcome).toBe('failed');
+    });
+
+    it('gives a job dead-lettered by lease recovery a message of its own', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const { jobId } = yield* queue.enqueue(work('outbox-recovered'));
+          // Spend the budget, then leave the last attempt running so recovery
+          // is what finishes it — a crash mid-attempt, not a reported failure.
+          for (let round = 0; round < 2; round += 1) {
+            const claimed = yield* queue.claim;
+            yield* queue.fail(jobId, claimed?.attempts ?? 0, 'temporary', 0);
+          }
+          yield* queue.claim;
+          yield* TestClock.adjust('61 seconds');
+          const recovered = yield* queue.recoverStale(yield* Clock.currentTimeMillis);
+          return {
+            recovered,
+            job: yield* queue.job(jobId),
+            messages: yield* queue.outboxFor(jobId),
+          };
+        }).pipe(Effect.provide(TestContext.TestContext)),
+      );
+
+      expect(result.recovered).toBe(1);
+      expect(result.job?.status).toBe('dead_letter');
+      expect(result.messages).toHaveLength(1);
+      expect(result.messages[0]).toMatchObject({ outcome: 'failed', status: 'pending' });
+    });
+
+    it('gives a canceled job a message of its own', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const { jobId } = yield* queue.enqueue(work('outbox-canceled'));
+          const changed = yield* queue.cancel(jobId);
+          return { changed, job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
+        }),
+      );
+
+      expect(result.changed).toBe(true);
+      expect(result.job?.outcome).toBe('canceled');
+      // The thread saw the eyes reaction; cancelling in silence is the same
+      // hole every other terminal outcome now closes.
+      expect(result.messages).toHaveLength(1);
+      expect(result.messages[0]).toMatchObject({ outcome: 'canceled', status: 'pending' });
+      expect(result.messages[0]?.note).toBeUndefined();
+    });
+
+    it('gives a job dead-lettered for an unreadable payload a message when it can be routed', async () => {
+      const directory = mkdtempSync(join(tmpdir(), 'lictor-outbox-'));
+      const path = join(directory, 'queue.sqlite');
+      try {
+        const enqueued = await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const queue = yield* WorkQueue;
+              return yield* queue.enqueue(work('outbox-undecodable'));
+            }).pipe(Effect.provide(queueLayer(path))),
+          ),
+        );
+
+        // Valid JSON, still routable, no longer a `WorkItem`. The claim has to
+        // dead-letter it, and the thread still has somewhere to hear about it.
+        const raw = new Database(path);
+        const payload = JSON.parse(
+          (
+            raw.query('SELECT payload FROM jobs WHERE id = ?').get(enqueued.jobId) as {
+              payload: string;
+            }
+          ).payload,
+        ) as Record<string, unknown>;
+        raw
+          .query('UPDATE jobs SET payload = ? WHERE id = ?')
+          .run(JSON.stringify({ ...payload, reasons: 'not-an-array' }), enqueued.jobId);
+        raw.close();
+
+        const result = await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const queue = yield* WorkQueue;
+              const claimed = yield* queue.claim;
+              return { claimed, messages: yield* queue.outboxFor(enqueued.jobId) };
+            }).pipe(Effect.provide(queueLayer(path))),
+          ),
+        );
+
+        // Read back raw: `queue.job` decodes the payload, which is the very
+        // thing this row can no longer do.
+        const after = new Database(path);
+        const row = after
+          .query('SELECT status, last_error AS lastError FROM jobs WHERE id = ?')
+          .get(enqueued.jobId) as { status: string; lastError: string };
+        after.close();
+
+        expect(result.claimed).toBeUndefined();
+        expect(row).toMatchObject({ status: 'dead_letter', lastError: 'invalid stored payload' });
+        expect(result.messages).toHaveLength(1);
+        expect(result.messages[0]?.outcome).toBe('failed');
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+
+    it('tells a lost claim apart from a superseded message', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const { queue, jobId, attempts } = yield* finish('outbox-claim-state');
+          // Finished as `rejected`, because `job.retry` only accepts a failed
+          // job and the supersede half of this test needs one.
+          yield* queue.fail(jobId, attempts, 'no', undefined, 'rejected', {
+            repository: 'edloidas/lictor',
+            subjectNumber: 17,
+            outcome: 'rejected',
+          });
+          const claimed = yield* queue.claimOutbox;
+          const holding = yield* queue.outboxHeld(claimed?.id ?? 0, claimed?.attempts ?? 0);
+          // A lapsed lease returns the row to `pending`: still owed, just not
+          // to this pass.
+          yield* queue.recoverStaleOutbox(Number.MAX_SAFE_INTEGER);
+          const lost = yield* queue.outboxHeld(claimed?.id ?? 0, claimed?.attempts ?? 0);
+          yield* queue.claimOutbox;
+          yield* queue.retry(jobId);
+          const gone = yield* queue.outboxHeld(claimed?.id ?? 0, claimed?.attempts ?? 0);
+          return { holding, lost, gone };
+        }),
+      );
+
+      expect(result.holding).toMatchObject({ held: true, superseded: false });
+      // Not superseded — a message the sender must not give up on.
+      expect(result.lost).toMatchObject({ held: false, superseded: false, status: 'pending' });
+      expect(result.gone).toMatchObject({ held: false, superseded: true, status: 'canceled' });
+    });
+
+    it('cancels an undelivered message when the operator retries the job', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const { queue, jobId, attempts } = yield* finish('outbox-superseded');
+          yield* queue.fail(jobId, attempts, 'no', undefined, 'rejected', {
+            repository: 'edloidas/lictor',
+            subjectNumber: 17,
+            outcome: 'rejected',
+            note: 'Refused.',
+          });
+          yield* queue.retry(jobId);
+          return {
+            messages: yield* queue.outboxFor(jobId),
+            claimable: yield* queue.claimOutbox,
+          };
+        }),
+      );
+
+      expect(result.messages[0]?.status).toBe('canceled');
+      expect(result.claimable).toBeUndefined();
+    });
+
+    it('prunes a delivered message but keeps one still owed', async () => {
+      const result = await run(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const first = yield* queue.enqueue(work('outbox-pruned'));
+          const firstClaim = yield* queue.claim;
+          yield* queue.complete(first.jobId, firstClaim?.attempts ?? 0, '{}', {
+            repository: 'edloidas/lictor',
+            subjectNumber: 17,
+            outcome: 'completed',
+          });
+          const delivered = yield* queue.claimOutbox;
+          yield* queue.deliverOutbox(delivered?.id ?? 0, delivered?.attempts ?? 0, 'url');
+
+          const second = yield* queue.enqueue(work('outbox-kept'));
+          const secondClaim = yield* queue.claim;
+          yield* queue.complete(second.jobId, secondClaim?.attempts ?? 0, '{}', {
+            repository: 'edloidas/lictor',
+            subjectNumber: 18,
+            outcome: 'completed',
+          });
+
+          yield* queue.maintenance(Date.now() + 1, Date.now() + 1);
+          return {
+            pruned: yield* queue.outboxFor(first.jobId),
+            kept: yield* queue.outboxFor(second.jobId),
+          };
+        }),
+      );
+
+      expect(result.pruned).toHaveLength(0);
+      // Undelivered is an obligation, not history — retention leaves it alone.
+      expect(result.kept).toHaveLength(1);
+    });
   });
 });

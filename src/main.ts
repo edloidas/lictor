@@ -15,6 +15,7 @@ import { GitHubCredential } from './github/credential.ts';
 import { CredentialHealth } from './github/credential-health.ts';
 import { GitHubIdentity } from './github/identity.ts';
 import { NotificationPoller } from './notifications/poller.ts';
+import { OutboxWorker } from './outbox-worker.ts';
 import { Policy } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 import { Server } from './server.ts';
@@ -71,6 +72,11 @@ const WorkerLive = Worker.DefaultWithoutDependencies.pipe(
 const DeliveryWorkerLive = DeliveryWorker.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.mergeAll(ConfigLive, ClientLive, IdentityLive, PolicyLive, QueueLive)),
 );
+const OutboxWorkerLive = OutboxWorker.DefaultWithoutDependencies.pipe(
+  Layer.provide(
+    Layer.mergeAll(ConfigLive, QueueLive, ClientLive, PolicyLive, CredentialHealth.Default),
+  ),
+);
 const PollerLive = NotificationPoller.DefaultWithoutDependencies.pipe(
   Layer.provide(
     Layer.mergeAll(ConfigLive, ClientLive, QueueLive, PolicyLive, CredentialHealth.Default),
@@ -89,6 +95,7 @@ const Services = Layer.mergeAll(
   ControlServerLive,
   WorkerLive,
   DeliveryWorkerLive,
+  OutboxWorkerLive,
   PollerLive,
 );
 /**
@@ -125,6 +132,7 @@ const Application = Layer.merge(
       yield* Effect.logInfo('Work queue ready').pipe(Effect.annotateLogs(counts));
       const worker = yield* Worker;
       const deliveryWorker = yield* DeliveryWorker;
+      const outboxWorker = yield* OutboxWorker;
       const poller = yield* NotificationPoller;
       const workspaces = yield* RepositoryWorkspace;
       /**
@@ -177,6 +185,10 @@ const Application = Layer.merge(
             Effect.all([
               Effect.forkScoped(supervised('worker', 'never', worker.run)),
               Effect.forkScoped(supervised('delivery worker', 'never', deliveryWorker.run)),
+              // ! Behind the same gate as the rest: this loop comments as the
+              // ! account, and posting before `GET /user` agrees on who owns the
+              // ! token writes an outcome into a stranger's thread.
+              Effect.forkScoped(supervised('outbox worker', 'never', outboxWorker.run)),
               // ! The poller marks threads read — destructive and irreversible.
               // ! Doing that before `GET /user` agrees on the credential can
               // ! silently empty the wrong account's inbox.

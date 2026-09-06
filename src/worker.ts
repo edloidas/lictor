@@ -73,7 +73,11 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         now: policyTime,
       });
       if (refusal !== undefined) {
-        yield* queue.fail(job.id, job.attempts, refusal);
+        yield* queue.fail(job.id, job.attempts, refusal, undefined, 'failed', {
+          repository: job.work.repository,
+          subjectNumber: job.work.subject.number,
+          outcome: 'failed',
+        });
         yield* Effect.logWarning('Dropped queued work denied by policy').pipe(
           Effect.annotateLogs({
             job: job.id,
@@ -164,7 +168,12 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       if (result._tag === 'Right') {
         const finishedAt = yield* Clock.currentTimeMillis;
         if (result.right.status === 'completed') {
-          yield* queue.complete(job.id, job.attempts, JSON.stringify(result.right));
+          yield* queue.complete(job.id, job.attempts, JSON.stringify(result.right), {
+            repository: job.work.repository,
+            subjectNumber: job.work.subject.number,
+            outcome: 'completed',
+            note: result.right.summary,
+          });
           yield* Effect.logInfo('Completed queued work').pipe(
             Effect.annotateLogs({
               job: job.id,
@@ -183,7 +192,19 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
           result.right.status === 'failed' && job.attempts < repositoryPolicy.maxAttempts
             ? finishedAt + config.workerRetryBaseMs * 2 ** Math.max(0, job.attempts - 1)
             : undefined;
-        yield* queue.fail(job.id, job.attempts, result.right.summary, retryAt, result.right.status);
+        yield* queue.fail(
+          job.id,
+          job.attempts,
+          result.right.summary,
+          retryAt,
+          result.right.status,
+          {
+            repository: job.work.repository,
+            subjectNumber: job.work.subject.number,
+            outcome: result.right.status,
+            note: result.right.summary,
+          },
+        );
         // `summary` is parsed out of Codex stdout and stays in the database:
         // logging it would echo whatever the repository made the agent say.
         yield* Effect.logWarning('Queued work did not complete').pipe(
@@ -205,7 +226,11 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
           (result.left.retryAfterMs ??
             config.workerRetryBaseMs * 2 ** Math.max(0, job.attempts - 1))
         : undefined;
-      yield* queue.fail(job.id, job.attempts, result.left.message, retryAt);
+      yield* queue.fail(job.id, job.attempts, result.left.message, retryAt, 'failed', {
+        repository: job.work.repository,
+        subjectNumber: job.work.subject.number,
+        outcome: 'failed',
+      });
       yield* Effect.logWarning(retry ? 'Queued work will retry' : 'Queued work failed').pipe(
         Effect.annotateLogs({
           job: job.id,

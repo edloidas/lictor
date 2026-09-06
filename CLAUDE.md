@@ -88,6 +88,20 @@ indistinguishable from a revoked token.
 - The eyes reaction is strictly best-effort and goes through `GitHubClient`, not
   `CapabilityBroker`. The broker refuses anything that is not a `running` job with
   a live lease, and a just-enqueued job is `pending`
+- **The closing comment goes through `GitHubClient` too, for a different reason:
+  the job is terminal by delivery time, so the broker refuses it again.** Do not
+  read across from the reaction beyond that — a reaction rides GitHub's per-user
+  idempotency and a comment POST has none, so a send that may repeat reconciles
+  against the thread by the message's marker first
+- **A terminal outcome owes its thread one `outbox` row, inserted in the same
+  transaction that records the outcome.** The row stores raw fields and the
+  comment is rendered at send time: rendering inside that transaction lets one
+  throw roll the outcome back, lapse the lease, and rerun an agent whose side
+  effects already landed. `fail` inserts nothing while it is scheduling a retry
+- **Only `ExecutorResult.summary` may be published.** Every other string a
+  terminal write holds — an `ExecutorError` message, a `WorkspaceError` message,
+  a policy refusal code — is a diagnostic, and the first two carry whatever the
+  repository made Codex or git say
 - A throw inside `Effect.gen` is a defect, not a failure: `catchAll` never sees
   it, so the recovery branches in the delivery worker are all bypassed and the
   loop dies. Wrap anything that throws — `JSON.parse` above all — in `Effect.try`
