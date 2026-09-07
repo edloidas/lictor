@@ -25,6 +25,7 @@ const config = (expectedLogin: string, trustedSenders: readonly string[] = []) =
       agentWorkdir: '.',
       executorTimeoutMs: 1000,
       executorOutputBytes: 1024,
+      executorResultBytes: 1024,
       gitTimeoutMs: 180_000,
       workerPollMs: 10,
       workerMaxAttempts: 3,

@@ -142,7 +142,8 @@ export class ProcessRunner extends Effect.Service<ProcessRunner>()('ProcessRunne
                 try: () => process.exited,
                 catch: (cause) => new ProcessError({ message: 'Process wait failed', cause }),
               }),
-              // stdout is parsed, so it must stay a contiguous head.
+              // Drained, not read: no caller parses stdout any more, but an
+              // unread pipe fills and blocks the child until the timeout.
               stdout: capture(process.stdout, request.outputLimitBytes, 'head'),
               stderr: capture(process.stderr, request.outputLimitBytes, request.stderrRetention),
             },

@@ -173,8 +173,23 @@ export class LictorConfig extends Effect.Service<LictorConfig>()('LictorConfig',
         30 * 60 * 1000,
         24 * 60 * 60 * 1000,
       ),
+      /**
+       * Diagnostic budget: how much of the agent's stderr is captured for
+       * classifying a failure. Not the result — that arrives in a file of its
+       * own and answers to `executorResultBytes`.
+       */
       executorOutputBytes: yield* positiveInteger(
         'LICTOR_EXECUTOR_OUTPUT_BYTES',
+        256 * 1024,
+        10 * 1024 * 1024,
+      ),
+      /**
+       * Largest agent result the executor will decode. Lowering it refuses
+       * results from runs whose side effects have already landed, and no
+       * refusal is retried — a lower ceiling loses finished work.
+       */
+      executorResultBytes: yield* positiveInteger(
+        'LICTOR_EXECUTOR_RESULT_BYTES',
         256 * 1024,
         10 * 1024 * 1024,
       ),

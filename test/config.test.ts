@@ -23,6 +23,15 @@ describe('LictorConfig', () => {
     expect((await Effect.runPromise(load(required))).executor).toBe('codex');
   });
 
+  // Every other suite passes this field explicitly, so nothing else reaches the
+  // default an operator actually runs on.
+  test('defaults the result budget to what a result had on stdout', async () => {
+    const config = await Effect.runPromise(load(required));
+
+    expect(config.executorResultBytes).toBe(262_144);
+    expect(config.executorResultBytes).toBeGreaterThanOrEqual(config.executorOutputBytes);
+  });
+
   // State must not default into the working directory. Lictor serves many
   // repositories and one of them may be lictor itself, so a relative default
   // puts the live database inside a tree the agent is editing.
@@ -94,6 +103,7 @@ describe('LictorConfig', () => {
     ['LICTOR_WORKER_MAX_ATTEMPTS', '-1'],
     ['LICTOR_EXECUTOR_TIMEOUT_MS', '86400001'],
     ['LICTOR_EXECUTOR_OUTPUT_BYTES', '1.5'],
+    ['LICTOR_EXECUTOR_RESULT_BYTES', '10485761'],
   ])('rejects invalid %s', async (name, value) => {
     const exit = await Effect.runPromiseExit(load(new Map([...required, [name, value]])));
     expect(exit._tag).toBe('Failure');
