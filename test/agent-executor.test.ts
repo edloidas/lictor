@@ -326,6 +326,66 @@ describe('buildPrompt', () => {
     expect(metadataOf(prompt).trigger).toBeUndefined();
     expect(prompt).not.toContain('may since have been edited or deleted');
   });
+
+  // The agent reached for Codex's own GitHub connector when the broker showed
+  // it no tool for the job, and reported the resulting approval block as a
+  // failure. Both halves are named here: one route, and a withheld tool is an
+  // answer rather than an obstacle.
+  it('names the broker as the only GitHub route and a denial as a scope answer', () => {
+    const prompt = buildPrompt(work);
+
+    expect(prompt).toContain('the only GitHub access you have');
+    expect(prompt).toContain('no other connector, no `gh`, no network call');
+    expect(prompt).toContain('withheld deliberately');
+    expect(prompt).toContain('`CAPABILITY_DENIED`');
+  });
+
+  // The two denial codes answer different questions. `CAPABILITY_REPOSITORY_DENIED`
+  // fires on a repository argument that is not the job's, before policy is
+  // consulted at all, so a granted tool called with a fork name or a `.git`
+  // suffix earns it — and reading that as a withheld capability abandons work
+  // the job was authorized to do over a fixable argument.
+  it('separates a withheld capability from a misaddressed repository', () => {
+    const prompt = buildPrompt(work);
+
+    expect(prompt).toContain('`CAPABILITY_REPOSITORY_DENIED` is a different answer');
+    expect(prompt).toContain('never the repository you work on');
+  });
+
+  // ! An absent tool bounds the job; a present one authorizes nothing. On a
+  // ! continuation the broker hides only the escalation capabilities, so any
+  // ! non-self reply on a live thread still sees `create_comment`, `update_issue`
+  // ! and the branch tools — and "visible means authorized" would hand a
+  // ! stranger's reply the repository's whole policy ceiling.
+  it('does not let the visible tool set stand in for authorization', () => {
+    const prompt = buildPrompt(work);
+
+    expect(prompt).toContain('authorizes nothing on its own');
+    expect(prompt).toContain('decided by this interaction alone');
+    expect(prompt).not.toContain('authorized for this job');
+  });
+
+  it('defines every status, and keeps a withheld capability out of `failed`', () => {
+    const prompt = buildPrompt(work);
+
+    expect(prompt).toContain('Part of the request falling outside your capabilities');
+    expect(prompt).toContain('Answering a question counts as carrying something out');
+    expect(prompt).toContain('Never for a capability you were not granted');
+    // ! `failed` must not promise an attempt the worker will never schedule:
+    // ! every status the agent returns is terminal, so wording that invites a
+    // ! rerun describes a daemon that no longer exists.
+    expect(prompt).toContain('This run is the last one either way');
+    expect(prompt).not.toContain('another attempt might survive');
+  });
+
+  // Nobody on the thread can widen a grant, so parking for one spends the
+  // answer window and posts `unanswered` on a question that had no answer.
+  it('keeps missing capability out of the question path', () => {
+    const prompt = buildPrompt(work);
+
+    expect(prompt).toContain('Never ask for capability');
+    expect(prompt).toContain('no reply widens what this job may do');
+  });
 });
 
 describe('AgentExecutor', () => {

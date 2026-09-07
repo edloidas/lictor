@@ -183,10 +183,12 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
                   job.workerId,
                 )
                 .pipe(
+                  // Quarantined for the post-mortem, not for a rerun: a retry
+                  // clones afresh, and this attempt is now the last one. The
+                  // pool is capped, so keeping every failure costs nothing the
+                  // sweep does not reclaim.
                   Effect.tap((result) =>
-                    result.status === 'failed' && job.attempts < repositoryPolicy.maxAttempts
-                      ? Ref.set(retainWorkspace, true)
-                      : Effect.void,
+                    result.status === 'failed' ? Ref.set(retainWorkspace, true) : Effect.void,
                   ),
                 ),
             (_workspace, exit) =>
@@ -279,19 +281,20 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
           );
           return true;
         }
-        // Only an execution failure earns another attempt; a refusal is the
-        // agent's decision, not a rerun. It finishes here, distinguishable by
-        // outcome rather than folded into `failed`, which is what made a
-        // refusal read as a completion.
-        const retryAt =
-          result.right.status === 'failed' && job.attempts < repositoryPolicy.maxAttempts
-            ? finishedAt + config.workerRetryBaseMs * 2 ** Math.max(0, job.attempts - 1)
-            : undefined;
+        // ! Every status the agent returns is terminal, `failed` included. A
+        // ! retry is earned by an observed cause — an exit code, a signature in
+        // ! stderr, a refused credential — and those all arrive on the failure
+        // ! branch below with `retryable` computed from evidence. `failed` here
+        // ! is only the agent's opinion of a run whose input the next attempt
+        // ! would reproduce byte for byte, and scheduling one costs the thread
+        // ! its answer: `queue.fail` withholds the outbox row until an attempt
+        // ! is final, so a mislabelled capability denial used to buy silence for
+        // ! the whole budget instead of the explanation the agent had in hand.
         yield* queue.fail(
           job.id,
           job.attempts,
           result.right.summary,
-          retryAt,
+          undefined,
           result.right.status,
           {
             repository: job.work.repository,
@@ -308,7 +311,6 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
             attempt: job.attempts,
             status: result.right.status,
             durationMs: finishedAt - claimedAt,
-            ...(retryAt === undefined ? {} : { retryAt }),
           }),
         );
         return true;
