@@ -1,7 +1,7 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { Cause, Data, Effect, Schema } from 'effect';
+import { Cause, Data, Effect, JSONSchema, Schema } from 'effect';
 import { bounded } from '../bounded.ts';
 import { LictorConfig } from '../config.ts';
 import { AgentListener } from '../control/agent-listener.ts';
@@ -26,6 +26,59 @@ const ExecutorResult = Schema.Struct({
   artifacts: Schema.optional(Schema.Array(Schema.String)),
 });
 export type ExecutorResult = Schema.Schema.Type<typeof ExecutorResult>;
+
+/**
+ * The result shape as `--output-schema` takes it, derived from the decoder so
+ * the advertised contract cannot drift from the accepted one. Codex sends it
+ * with `strict: true`, which is why it departs from what `JSONSchema.make`
+ * emits: no optional properties, and no `$schema`.
+ */
+const resultJsonSchema = (): string => {
+  const { type, properties, additionalProperties } = JSONSchema.make(ExecutorResult) as {
+    readonly type: string;
+    readonly properties: Record<string, unknown>;
+    readonly additionalProperties: boolean;
+  };
+  return JSON.stringify({
+    type,
+    properties,
+    required: Object.keys(properties),
+    additionalProperties,
+  });
+};
+
+/**
+ * Reads back what the agent wrote, on the same terms stdout got: a path the
+ * daemon chose is not a channel the daemon can trust, only one it can find.
+ */
+const readResult = (path: string, limitBytes: number): Effect.Effect<string, ExecutorError> =>
+  Effect.suspend(() => {
+    const file = Bun.file(path);
+    // Zero is an absent file and an empty one at once. Neither is worth telling
+    // apart: no result was produced, and a rerun of identical input says so again.
+    if (file.size === 0) {
+      return Effect.fail(
+        new ExecutorError({ message: 'Codex exited without writing a result', retryable: false }),
+      );
+    }
+    if (file.size > limitBytes) {
+      return Effect.fail(
+        new ExecutorError({
+          message: `Codex wrote a result larger than the ${limitBytes}-byte result budget (LICTOR_EXECUTOR_RESULT_BYTES)`,
+          retryable: false,
+        }),
+      );
+    }
+    return Effect.tryPromise({
+      try: () => file.text(),
+      catch: (cause) =>
+        new ExecutorError({
+          message: 'Codex result could not be read back',
+          retryable: true,
+          cause,
+        }),
+    });
+  });
 
 const personaBoundBytes = 32 * 1024;
 
@@ -194,6 +247,17 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
       // `codex login` must be run against. Overridden by LICTOR_CODEX_HOME.
       join(config.stateDir, 'codex');
     yield* Effect.sync(() => mkdirSync(codexHome, { recursive: true, mode: 0o700 }));
+    // Beside the database, not in the workspace or TMPDIR that `codex exec`
+    // reports its sandbox as writable. A smaller target, not a boundary.
+    const runsDir = join(config.stateDir, 'runs');
+    const schemaPath = join(config.stateDir, 'result-schema.json');
+    yield* Effect.sync(() => {
+      // Every run removes its own directory; one that survived belongs to a
+      // daemon that was killed outright, and no scope can clean up after that.
+      rmSync(runsDir, { recursive: true, force: true });
+      mkdirSync(runsDir, { recursive: true, mode: 0o700 });
+      writeFileSync(schemaPath, resultJsonSchema(), { mode: 0o600 });
+    });
     // Operator-authored standing instructions — the one trusted prose in the
     // prompt, so it is prepended ahead of the untrusted JSON, never inside it.
     const soulPath = join(config.stateDir, 'SOUL.md');
@@ -235,7 +299,7 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
 
       const budgetMs = Math.min(timeoutMs, config.executorTimeoutMs);
 
-      const run = (mcpArgs: readonly string[]) =>
+      const run = (mcpArgs: readonly string[], resultPath: string) =>
         Effect.flatMap(readSoul, (soul) =>
           Effect.logInfo('Starting agent process').pipe(
             Effect.annotateLogs({
@@ -266,6 +330,10 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                   'sandbox_workspace_write.network_access=false',
                   '-c',
                   'sandbox_workspace_write.writable_roots=[]',
+                  '--output-schema',
+                  schemaPath,
+                  '-o',
+                  resultPath,
                   '--cd',
                   workdir,
                   '-',
@@ -275,7 +343,7 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                   .filter(Boolean)
                   .join(
                     '\n\n',
-                  )}\n\nReturn only JSON matching {"status":"completed|needs_input|rejected|failed","summary":"bounded summary","artifacts":["relative/path"]}.`,
+                  )}\n\nReturn only the result object described by the output schema you were given. Keep \`summary\` under 4000 bytes; it is the only field published, and a longer one is cut.`,
                 timeoutMs: budgetMs,
                 outputLimitBytes: config.executorOutputBytes,
                 // `codex exec` writes its whole transcript here and names a
@@ -296,47 +364,58 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
           ),
         );
 
-      return (
-        jobId === undefined || attemptNumber === undefined || workerId === undefined
-          ? run([])
-          : Effect.scoped(
-              Effect.flatMap(listener.open(jobId, attemptNumber, workerId), ({ path }) =>
-                run([
-                  '-c',
-                  'mcp_servers.lictor.command="bun"',
-                  '-c',
-                  `mcp_servers.lictor.args=${JSON.stringify([mcpClientPath, path])}`,
-                ]),
-              ),
-            )
-      ).pipe(
-        Effect.flatMap((result) => {
-          if (result.exitCode !== 0) {
-            return Effect.fail(exitFailure(result, codexHome, config.executorOutputBytes));
-          }
-          // A retry re-runs byte-identical input, so only sampling separates it
-          // from this attempt — not worth another run at the executor budget.
-          if (result.stdoutTruncated) {
-            return Effect.fail(
-              new ExecutorError({
-                message: `Codex wrote more than the ${config.executorOutputBytes}-byte output budget (LICTOR_EXECUTOR_OUTPUT_BYTES) and its result was cut off`,
-                retryable: false,
+      return Effect.acquireUseRelease(
+        // ! `Effect.try`, never `Effect.sync`: a defect passes through the
+        // ! mapError below and the worker's `Effect.either` to the supervisor,
+        // ! which stops the daemon over one job.
+        Effect.try({
+          try: () => mkdtempSync(join(runsDir, 'run-')),
+          catch: (cause) =>
+            new ExecutorError({
+              message: 'Could not create a directory for the agent result',
+              retryable: true,
+              cause,
+            }),
+        }),
+        (runDir) => {
+          const resultPath = join(runDir, 'result.json');
+          return (
+            jobId === undefined || attemptNumber === undefined || workerId === undefined
+              ? run([], resultPath)
+              : Effect.scoped(
+                  Effect.flatMap(listener.open(jobId, attemptNumber, workerId), ({ path }) =>
+                    run(
+                      [
+                        '-c',
+                        'mcp_servers.lictor.command="bun"',
+                        '-c',
+                        `mcp_servers.lictor.args=${JSON.stringify([mcpClientPath, path])}`,
+                      ],
+                      resultPath,
+                    ),
+                  ),
+                )
+          ).pipe(
+            Effect.flatMap((result) =>
+              result.exitCode !== 0
+                ? Effect.fail(exitFailure(result, codexHome, config.executorOutputBytes))
+                : readResult(resultPath, config.executorResultBytes),
+            ),
+            Effect.flatMap((text) =>
+              Effect.try({
+                try: () => JSON.parse(text) as unknown,
+                catch: (cause) =>
+                  new ExecutorError({
+                    message: 'Codex returned a malformed result',
+                    retryable: false,
+                    cause,
+                  }),
               }),
-            );
-          }
-          return Effect.try({
-            try: () => JSON.parse(result.stdout) as unknown,
-            catch: (cause) =>
-              new ExecutorError({
-                message: 'Codex returned a malformed result',
-                retryable: false,
-                cause,
-              }),
-          }).pipe(
+            ),
             Effect.flatMap(Schema.decodeUnknown(ExecutorResult)),
-            // ! ParseError renders the rejected value — Codex stdout — into its
-            // ! message, which the worker's outcome log then carries verbatim.
-            // ! Fixed diagnosis instead, never the ParseError's own message.
+            // ! ParseError renders the rejected value — what Codex wrote — into
+            // ! its message, which the worker's outcome log then carries
+            // ! verbatim. Fixed diagnosis instead, never the ParseError's own.
             Effect.catchTag('ParseError', () =>
               Effect.fail(
                 new ExecutorError({
@@ -355,7 +434,19 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                   }),
             })),
           );
-        }),
+        },
+        // ! Logged, never failed: the agent has run by here, so letting a
+        // ! cleanup error replace the outcome dead-letters — or reruns — work
+        // ! whose side effects already landed.
+        (runDir) =>
+          Effect.try(() => rmSync(runDir, { recursive: true, force: true })).pipe(
+            Effect.catchAll((cause) =>
+              Effect.logWarning('Run directory could not be removed').pipe(
+                Effect.annotateLogs({ path: runDir, error: describeCause(Cause.fail(cause)) }),
+              ),
+            ),
+          ),
+      ).pipe(
         Effect.mapError((cause) =>
           cause instanceof ExecutorError
             ? cause

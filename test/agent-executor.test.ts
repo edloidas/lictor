@@ -1,12 +1,25 @@
 import { afterAll, describe, expect, it } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { Effect, Layer, Logger, type LogLevel, Redacted, Ref } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { AgentListener } from '../src/control/agent-listener.ts';
 import { AgentExecutor, buildPrompt } from '../src/executor/agent-executor.ts';
-import { type ProcessRequest, ProcessRunner } from '../src/executor/process-runner.ts';
+import {
+  type ProcessRequest,
+  type ProcessResult,
+  ProcessRunner,
+} from '../src/executor/process-runner.ts';
 import type { WorkItem } from '../src/work-item.ts';
 
 const work: WorkItem = {
@@ -59,6 +72,9 @@ const config = (executor: 'codex' | 'disabled', databasePath: string) =>
     agentWorkdir: '/tmp/lictor-workspace',
     executorTimeoutMs: 5000,
     executorOutputBytes: 4096,
+    // Deliberately unequal: the bounds the decoder applies to a result are
+    // larger than the diagnostic budget, and one number could not show that.
+    executorResultBytes: 65_536,
     gitTimeoutMs: 180_000,
     workerPollMs: 10,
     workerMaxAttempts: 3,
@@ -91,16 +107,41 @@ const sequence = (lines: readonly LogLine[]) =>
 const annotationsOf = (lines: readonly LogLine[], message: string) =>
   lines.find((line) => line.message === message)?.annotations;
 
-const completingRunner = ProcessRunner.make({
-  run: () =>
-    Effect.succeed({
-      exitCode: 0,
-      stdout: '{"status":"completed","summary":"completed"}',
-      stderr: '',
-      stdoutTruncated: false,
-      stderrTruncated: false,
-    }),
+/**
+ * The path Codex was told to write its result to. Read from argv rather than
+ * agreed with the executor, so a stub cannot pass while the flag is missing.
+ */
+const resultPathOf = (command: readonly string[]): string => {
+  const flag = command.indexOf('-o');
+  expect(flag).toBeGreaterThanOrEqual(0);
+  const path = command[flag + 1];
+  expect(path).toBeString();
+  return path as string;
+};
+
+const exited = (overrides: Partial<ProcessResult> = {}): ProcessResult => ({
+  exitCode: 0,
+  stdout: '',
+  stderr: '',
+  stdoutTruncated: false,
+  stderrTruncated: false,
+  ...overrides,
 });
+
+/** A Codex that writes `result` where it was told to, then exits cleanly. */
+const writingRunner = (result: string, observe: (request: ProcessRequest) => void = () => {}) =>
+  ProcessRunner.make({
+    run: (request) =>
+      Effect.sync(() => {
+        observe(request);
+        writeFileSync(resultPathOf(request.command), result);
+        return exited();
+      }),
+  });
+
+const completedResult = '{"status":"completed","summary":"completed"}';
+
+const completingRunner = writingRunner(completedResult);
 
 type OpenCall = {
   readonly jobId: number;
@@ -148,18 +189,8 @@ const captureInput = (
   let observed: ProcessRequest | undefined;
   return runWith(
     Effect.flatMap(AgentExecutor, (agent) => agent.execute(work)),
-    ProcessRunner.make({
-      run: (request) =>
-        Effect.sync(() => {
-          observed = request;
-          return {
-            exitCode: 0,
-            stdout: '{"status":"completed","summary":"completed"}',
-            stderr: '',
-            stdoutTruncated: false,
-            stderrTruncated: false,
-          };
-        }),
+    writingRunner(completedResult, (request) => {
+      observed = request;
     }),
     executor,
     databasePath,
@@ -172,14 +203,7 @@ const failWith = (stderr: string, databasePath = tempStatePath(), stderrTruncate
   runWith(
     Effect.flatMap(AgentExecutor, (agent) => Effect.flip(agent.execute(work))),
     ProcessRunner.make({
-      run: () =>
-        Effect.succeed({
-          exitCode: 1,
-          stdout: '',
-          stderr,
-          stdoutTruncated: false,
-          stderrTruncated,
-        }),
+      run: () => Effect.succeed(exited({ exitCode: 1, stderr, stderrTruncated })),
     }),
     'codex',
     databasePath,
@@ -522,15 +546,18 @@ describe('AgentExecutor', () => {
         const runner = ProcessRunner.make({
           run: (input) =>
             Ref.set(observed, input).pipe(
-              Effect.as({
-                exitCode: 0,
-                // The excess field is what proves the decode ran: it is stripped
-                // only by the schema, so echoing stdout back would carry it.
-                stdout: '{"status":"completed","summary":"completed","exitCode":"root:x:0:0"}',
-                stderr: '',
-                stdoutTruncated: false,
-                stderrTruncated: false,
-              }),
+              Effect.zipRight(
+                Effect.sync(() => {
+                  // The excess field is what proves the decode ran: it is
+                  // stripped only by the schema, so handing the file's contents
+                  // straight back would carry it.
+                  writeFileSync(
+                    resultPathOf(input.command),
+                    '{"status":"completed","summary":"completed","exitCode":"root:x:0:0"}',
+                  );
+                  return exited();
+                }),
+              ),
             ),
         });
         const output = yield* Effect.promise(() =>
@@ -546,6 +573,7 @@ describe('AgentExecutor', () => {
     );
 
     expect(request.output).toEqual({ status: 'completed', summary: 'completed' });
+    const resultPath = resultPathOf(request.request?.command ?? []);
     expect(request.request?.command).toEqual([
       'codex',
       'exec',
@@ -562,10 +590,17 @@ describe('AgentExecutor', () => {
       'sandbox_workspace_write.network_access=false',
       '-c',
       'sandbox_workspace_write.writable_roots=[]',
+      '--output-schema',
+      join(stateDirOf(statePath), 'result-schema.json'),
+      '-o',
+      resultPath,
       '--cd',
       '/tmp/lictor-workspace',
       '-',
     ]);
+    // Beside the database, not in the workspace the sandbox reports as
+    // writable. A smaller target, not a trust boundary.
+    expect(resultPath.startsWith(`${join(stateDirOf(statePath), 'runs')}/`)).toBe(true);
     expect(request.request?.input).toContain('$(touch /tmp/nope)');
     expect(request.request?.stderrRetention).toBe('tail');
     expect(request.request?.cwd).toBe('/tmp/lictor-workspace');
@@ -580,6 +615,140 @@ describe('AgentExecutor', () => {
     });
   });
 
+  // Derived from the decoder, so what is worth pinning is where the file has to
+  // depart from `JSONSchema.make` to satisfy `strict: true`.
+  it('states the result shape as a strict schema covering every decoded field', async () => {
+    const statePath = tempStatePath();
+    await runWith(
+      Effect.flatMap(AgentExecutor, (agent) => agent.execute(work)),
+      completingRunner,
+      'codex',
+      statePath,
+    );
+
+    const schema = JSON.parse(
+      readFileSync(join(stateDirOf(statePath), 'result-schema.json'), 'utf8'),
+    ) as Record<string, unknown>;
+
+    expect(schema.type).toBe('object');
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.$schema).toBeUndefined();
+    expect(Object.keys(schema.properties as object).sort()).toEqual([
+      'artifacts',
+      'status',
+      'summary',
+    ]);
+    // `artifacts` is optional in the decoder and required here.
+    expect((schema.required as string[]).sort()).toEqual(['artifacts', 'status', 'summary']);
+  });
+
+  // A state directory each: sharing one lets the second executor's startup sweep
+  // remove the first run's directory, and the success half then passes on that.
+  it.each([
+    ['succeeded', false],
+    ['failed', true],
+  ])('removes the run directory after the agent %s', async (_outcome, fails) => {
+    const paths: string[] = [];
+    const remember = (request: ProcessRequest) => {
+      paths.push(resultPathOf(request.command));
+    };
+
+    const result = await runWith(
+      Effect.flatMap(AgentExecutor, (agent) => Effect.either(agent.execute(work))),
+      fails
+        ? ProcessRunner.make({
+            run: (request) =>
+              Effect.sync(() => {
+                remember(request);
+                return exited({ exitCode: 1, stderr: 'failed' });
+              }),
+          })
+        : writingRunner(completedResult, remember),
+      'codex',
+      tempStatePath(),
+    );
+
+    expect(result._tag).toBe(fails ? 'Left' : 'Right');
+    expect(paths).toHaveLength(1);
+    expect(existsSync(dirname(paths[0] as string))).toBe(false);
+  });
+
+  // `Effect.flip` succeeding is the assertion: a defect here would reach the
+  // supervisor instead, and take the daemon down over one job.
+  it('fails the job, not the fiber, when the run directory cannot be created', async () => {
+    const statePath = tempStatePath();
+    const error = await runWith(
+      Effect.flatMap(AgentExecutor, (agent) =>
+        Effect.flip(
+          Effect.zipRight(
+            Effect.sync(() =>
+              rmSync(join(stateDirOf(statePath), 'runs'), { recursive: true, force: true }),
+            ),
+            agent.execute(work),
+          ),
+        ),
+      ),
+      completingRunner,
+      'codex',
+      statePath,
+    );
+
+    expect(error).toMatchObject({
+      retryable: true,
+      message: 'Could not create a directory for the agent result',
+    });
+  });
+
+  // Same reason as the acquire above, and worse: the agent has run by now, so a
+  // throw here would discard work whose side effects already landed.
+  it('keeps a completed result when the run directory cannot be removed', async () => {
+    const logs: LogLine[] = [];
+    let runDir = '';
+    try {
+      const result = await runWith(
+        Effect.flatMap(AgentExecutor, (agent) => agent.execute(work)),
+        ProcessRunner.make({
+          run: (request) =>
+            Effect.sync(() => {
+              const resultPath = resultPathOf(request.command);
+              writeFileSync(resultPath, completedResult);
+              // A read-only directory still holding a file: `force` forgives a
+              // missing path, not an undeletable one, so the release throws.
+              runDir = dirname(resultPath);
+              chmodSync(runDir, 0o500);
+              return exited();
+            }),
+        }),
+        'codex',
+        tempStatePath(),
+        capturedLogger(logs),
+      );
+
+      expect(result).toMatchObject({ status: 'completed', summary: 'completed' });
+      expect(logs.map((line) => line.message)).toContain('Run directory could not be removed');
+    } finally {
+      // Or `afterAll` inherits a directory it cannot remove either.
+      if (runDir) chmodSync(runDir, 0o700);
+    }
+  });
+
+  // Declared as the recovery path for a daemon killed outright, which is the one
+  // exit a scope cannot reach — so nothing but startup removes this.
+  it('sweeps a run directory left behind by a killed daemon', async () => {
+    const statePath = tempStatePath();
+    const stale = join(stateDirOf(statePath), 'runs', 'run-stale');
+    mkdirSync(stale, { recursive: true });
+
+    await runWith(
+      Effect.flatMap(AgentExecutor, (agent) => agent.execute(work)),
+      completingRunner,
+      'codex',
+      statePath,
+    );
+
+    expect(existsSync(stale)).toBe(false);
+  });
+
   // The argv above is the `jobId === undefined` path, which carries no broker at
   // all. Only a job with all three identifiers opens a listener and gets one.
   it('gives a job-bound run an MCP server pointed at its own attempt socket', async () => {
@@ -590,18 +759,8 @@ describe('AgentExecutor', () => {
       Effect.flatMap(AgentExecutor, (agent) =>
         agent.execute(work, '/tmp/lictor-workspace', 1000, 7, 2, 'worker-1'),
       ),
-      ProcessRunner.make({
-        run: (request) =>
-          Effect.sync(() => {
-            observed = request;
-            return {
-              exitCode: 0,
-              stdout: '{"status":"completed","summary":"completed"}',
-              stderr: '',
-              stdoutTruncated: false,
-              stderrTruncated: false,
-            };
-          }),
+      writingRunner(completedResult, (request) => {
+        observed = request;
       }),
       'codex',
       tempStatePath(),
@@ -631,20 +790,13 @@ describe('AgentExecutor', () => {
   it('bounds the summary and the artifact list the agent returns', async () => {
     const result = await runWith(
       Effect.flatMap(AgentExecutor, (agent) => agent.execute(work)),
-      ProcessRunner.make({
-        run: () =>
-          Effect.succeed({
-            exitCode: 0,
-            stdout: JSON.stringify({
-              status: 'completed',
-              summary: 'x'.repeat(5000),
-              artifacts: Array.from({ length: 60 }, () => 'a'.repeat(600)),
-            }),
-            stderr: '',
-            stdoutTruncated: false,
-            stderrTruncated: false,
-          }),
-      }),
+      writingRunner(
+        JSON.stringify({
+          status: 'completed',
+          summary: 'x'.repeat(5000),
+          artifacts: Array.from({ length: 60 }, () => 'a'.repeat(600)),
+        }),
+      ),
     );
 
     expect(Buffer.byteLength(result.summary)).toBe(4096);
@@ -758,72 +910,110 @@ describe('AgentExecutor', () => {
     expect(error).toMatchObject({ retryable: false, message: 'Agent execution is disabled' });
   });
 
-  it('rejects malformed structured output without exposing stderr', async () => {
-    const runner = ProcessRunner.make({
-      run: () =>
-        Effect.succeed({
-          exitCode: 0,
-          stdout: 'not-json',
-          stderr: 'LICTOR_GITHUB_TOKEN=must-not-surface',
-          stdoutTruncated: false,
-          stderrTruncated: false,
-        }),
-    });
+  it('rejects a malformed result without exposing stderr', async () => {
     const error = await runWith(
       Effect.flatMap(AgentExecutor, (agent) => Effect.flip(agent.execute(work))),
-      runner,
+      ProcessRunner.make({
+        run: (request) =>
+          Effect.sync(() => {
+            writeFileSync(resultPathOf(request.command), 'not-json');
+            return exited({ stderr: 'LICTOR_GITHUB_TOKEN=must-not-surface' });
+          }),
+      }),
     );
     expect(error).toMatchObject({ retryable: false, message: 'Codex returned a malformed result' });
     expect(String(error)).not.toContain('must-not-surface');
   });
 
-  it('separates a result cut off at the output budget from a malformed one', async () => {
-    const runner = ProcessRunner.make({
-      run: () =>
-        Effect.succeed({
-          exitCode: 0,
-          // Valid JSON until the budget cut it, so `JSON.parse` would fail here
-          // too — the truncation branch has to be reached first.
-          stdout: '{"status":"completed","summary":"tru',
-          stderr: 'LICTOR_GITHUB_TOKEN=must-not-surface',
-          stdoutTruncated: true,
-          // Deliberately false: with both set, a branch on the wrong stream
-          // reaches the same message and this test cannot tell them apart.
-          stderrTruncated: false,
-        }),
-    });
+  // Absent and empty are one outcome: a rerun of byte-identical input produces
+  // the same nothing, so neither is worth an attempt.
+  it.each([
+    ['no result file at all', undefined],
+    ['an empty result file', ''],
+  ])('reports %s as a clean exit that produced nothing', async (_case, written) => {
     const error = await runWith(
       Effect.flatMap(AgentExecutor, (agent) => Effect.flip(agent.execute(work))),
-      runner,
+      ProcessRunner.make({
+        run: (request) =>
+          Effect.sync(() => {
+            const path = resultPathOf(request.command);
+            if (written !== undefined) writeFileSync(path, written);
+            return exited({ stderr: 'LICTOR_GITHUB_TOKEN=must-not-surface' });
+          }),
+      }),
+    );
+
+    expect(error).toMatchObject({
+      retryable: false,
+      message: 'Codex exited without writing a result',
+    });
+    expect(String(error)).not.toContain('must-not-surface');
+  });
+
+  // Not the agent's doing and not permanent, unlike every other way a result
+  // fails to arrive — so this is the one of them worth another attempt.
+  it('retries when the result is there but cannot be read back', async () => {
+    const error = await runWith(
+      Effect.flatMap(AgentExecutor, (agent) => Effect.flip(agent.execute(work))),
+      ProcessRunner.make({
+        run: (request) =>
+          Effect.sync(() => {
+            // Rests on a directory reporting a non-zero size; one reporting 0
+            // would land on the no-result branch and fail on the message.
+            mkdirSync(resultPathOf(request.command));
+            return exited();
+          }),
+      }),
+    );
+
+    expect(error).toMatchObject({
+      retryable: true,
+      message: 'Codex result could not be read back',
+    });
+  });
+
+  // The result answers to its own budget now. A run that fills the diagnostic
+  // one and still writes a good result is a success, not a cut-off result.
+  it('accepts a result written alongside a stdout that hit the output budget', async () => {
+    const result = await runWith(
+      Effect.flatMap(AgentExecutor, (agent) => agent.execute(work)),
+      ProcessRunner.make({
+        run: (request) =>
+          Effect.sync(() => {
+            writeFileSync(resultPathOf(request.command), completedResult);
+            return exited({ stdout: 'x'.repeat(4096), stdoutTruncated: true });
+          }),
+      }),
+    );
+
+    expect(result).toMatchObject({ status: 'completed', summary: 'completed' });
+  });
+
+  it('rejects a result past the result budget', async () => {
+    const error = await runWith(
+      Effect.flatMap(AgentExecutor, (agent) => Effect.flip(agent.execute(work))),
+      // Valid and decodable but oversized, so only the budget can reject it —
+      // and past the summary bound, so a decode would have succeeded.
+      writingRunner(JSON.stringify({ status: 'completed', summary: 'x'.repeat(70_000) })),
     );
 
     expect(error).toMatchObject({
       retryable: false,
       message:
-        'Codex wrote more than the 4096-byte output budget (LICTOR_EXECUTOR_OUTPUT_BYTES) and its result was cut off',
+        'Codex wrote a result larger than the 65536-byte result budget (LICTOR_EXECUTOR_RESULT_BYTES)',
     });
-    expect(String(error)).not.toContain('must-not-surface');
   });
 
-  // Unlike the malformed-JSON case above, a schema rejection used to render
-  // Codex's stdout into its own message, which the worker then logs verbatim.
+  // Unlike the malformed-JSON case above, a schema rejection used to render what
+  // Codex returned into its own message, which the worker then logs verbatim.
   it.each([
     ['an out-of-schema status', '{"status":"root:x:0:0:leaked","summary":"x"}'],
     ['a bare JSON string', '"root:x:0:0:leaked"'],
     ['a non-string summary', '{"status":"completed","summary":{"at":"root:x:0:0:leaked"}}'],
-  ])('rejects %s without quoting what Codex printed', async (_case, stdout) => {
+  ])('rejects %s without quoting what Codex wrote', async (_case, written) => {
     const error = await runWith(
       Effect.flatMap(AgentExecutor, (agent) => Effect.flip(agent.execute(work))),
-      ProcessRunner.make({
-        run: () =>
-          Effect.succeed({
-            exitCode: 0,
-            stdout,
-            stderr: '',
-            stdoutTruncated: false,
-            stderrTruncated: false,
-          }),
-      }),
+      writingRunner(written),
     );
 
     expect(error).toMatchObject({

@@ -32,6 +32,7 @@ const ConfigLive = Layer.succeed(
     agentWorkdir: '.',
     executorTimeoutMs: 1000,
     executorOutputBytes: 1024,
+    executorResultBytes: 1024,
     gitTimeoutMs: 180_000,
     workerPollMs: 1,
     workerMaxAttempts: 3,
