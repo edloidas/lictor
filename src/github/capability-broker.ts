@@ -88,7 +88,11 @@ const toolSchemas: Readonly<
   >
 > = {
   get_repository: {
-    description: 'Read the job repository: default branch, visibility and granted permissions.',
+    // `permissions` in the response is the daemon account's rights on the
+    // repository, which are wider than this job's grants. The advertised tool
+    // list is what this job may do; this says nothing about it.
+    description:
+      "Read the job repository: default branch, visibility, and the account's own repository rights — which are not this job's permissions.",
     properties: {},
   },
   get_issue: {

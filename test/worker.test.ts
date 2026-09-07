@@ -263,12 +263,38 @@ describe('Worker.runOnce', () => {
         yield* worker.runOnce;
         return { job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
       }),
-      () => Effect.succeed({ status: 'failed', summary: 'transient' }),
+      () => Effect.fail(new ExecutorError({ message: 'Codex died', retryable: true })),
       3,
     );
 
     expect(result.job?.status).toBe('retry');
     expect(result.messages).toHaveLength(0);
+  });
+
+  it('answers the thread at once when the agent itself reports a failure', async () => {
+    // The defect: a capability the policy withholds came back as `failed`, and
+    // the retry that bought cost the thread every word of the explanation for
+    // the whole attempt budget — three identical runs of byte-identical input.
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return { job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
+      }),
+      () => Effect.succeed({ status: 'failed', summary: 'issue creation is not granted here' }),
+      3,
+    );
+
+    // `fail` derives the status from `retryAt`, so `failed` rather than `retry`
+    // is what says no further attempt was scheduled.
+    expect(result.job?.status).toBe('failed');
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toMatchObject({
+      outcome: 'failed',
+      note: 'issue creation is not granted here',
+    });
   });
 
   it('owes the thread an outcome when policy refuses the job, without the code', async () => {
@@ -850,18 +876,16 @@ describe('Worker.runOnce observability', () => {
     expect(annotationsOf(logs, 'Queued work did not complete')).toBeUndefined();
   });
 
-  it('reports the scheduled retry when the agent reports its own failure', async () => {
-    const before = Date.now();
+  it('schedules nothing further when the agent reports its own failure', async () => {
     const { logs } = await observe(() =>
       Effect.succeed({ status: 'failed', summary: 'could not push' }),
     );
-    const after = Date.now();
 
     const annotations = annotationsOf(logs, 'Queued work did not complete');
     expect(annotations?.status).toBe('failed');
-    // The first attempt's backoff is workerRetryBaseMs, taken from the finish time.
-    expect(annotations?.retryAt).toBeGreaterThanOrEqual(before + 100);
-    expect(annotations?.retryAt).toBeLessThanOrEqual(after + 100);
+    // A retry is earned by an observed cause, and this one carries none: the
+    // next attempt would re-run byte-identical input for a second opinion.
+    expect(annotations?.retryAt).toBeUndefined();
   });
 
   it('keeps the agent-authored summary out of every log line', async () => {
