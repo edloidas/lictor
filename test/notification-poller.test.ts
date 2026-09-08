@@ -7,6 +7,7 @@ import { CredentialHealth } from '../src/github/credential-health.ts';
 import { NotificationPoller } from '../src/notifications/poller.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
+import type { WorkItem } from '../src/work-item.ts';
 
 const config = (
   overrides: {
@@ -53,6 +54,22 @@ const thread = (id: string, updatedAt = '2026-08-21T10:00:00Z') => ({
   repository: { full_name: 'edloidas/lictor' },
 });
 
+/** Enqueued and parked by the `parkedJob` option, never fetched from GitHub. */
+const parkableWork: WorkItem = {
+  deliveryId: 'parked-delivery',
+  interactionId: 'parked-interaction',
+  repository: 'edloidas/lictor',
+  sender: 'edloidas',
+  targets: ['adiutriel'],
+  reasons: ['assigned'],
+  subject: {
+    kind: 'issue',
+    number: 17,
+    title: 'Waiting on an answer',
+    url: 'https://github.com/edloidas/lictor/issues/17',
+  },
+};
+
 // `setUrlParams` is serialized at execution time, so `request.url` carries no
 // query string — a matcher looking for one routes every list call elsewhere.
 const isList = (url: string): boolean =>
@@ -88,6 +105,10 @@ const run = (
     readonly acceptInvitations?: boolean;
     /** Runs the invitation pass *before* the sweeps. */
     readonly acceptFirst?: boolean;
+    /** Seeds one job parked on its own question before the sweeps run. */
+    readonly parkedJob?: boolean;
+    /** Seeds one claimed, still-running job before the sweeps run. */
+    readonly runningJob?: boolean;
   } = {},
 ) => {
   const calls: string[] = [];
@@ -97,6 +118,23 @@ const run = (
       Effect.gen(function* () {
         const poller = yield* NotificationPoller;
         const queue = yield* WorkQueue;
+        if (options.parkedJob) {
+          yield* queue.enqueue(parkableWork);
+          const claimed = yield* queue.claim;
+          yield* queue.park({
+            jobId: claimed?.id ?? -1,
+            attemptNumber: claimed?.attempts ?? 1,
+            repository: 'edloidas/lictor',
+            subjectNumber: 17,
+            question: 'which branch?',
+            answerers: ['edloidas'],
+            expiresAt: Date.now() + 3_600_000,
+          });
+        }
+        if (options.runningJob) {
+          yield* queue.enqueue(parkableWork);
+          yield* queue.claim;
+        }
         if (options.acceptFirst) {
           yield* poller.acceptInvitations.pipe(Effect.ignore);
         }
@@ -374,6 +412,35 @@ describe('NotificationPoller', () => {
     expect(full.outcomes[0]?.stored).toBe(2);
     expect(full.outcomes[0]?.deferred).toBe(true);
     expect(marks(full.calls)).toHaveLength(2);
+  });
+
+  // The deadlock this depth check used to cause, at the depth it was found on:
+  // the one job parks, its answer is a comment only a sweep can collect, and a
+  // sweep that counted the parked row refused to run — so the job waited out
+  // `answerExpiryHours` and failed as `unanswered` on a thread that answered.
+  it('sweeps at full depth when the only job is parked on its question', async () => {
+    const result = await run([{ body: [thread('1')] }], {
+      maxQueueDepth: 1,
+      parkedJob: true,
+    });
+
+    expect(result.outcomes[0]?.deferred).toBe(false);
+    expect(result.outcomes[0]?.stored).toBe(1);
+    expect(marks(result.calls)).toHaveLength(1);
+  });
+
+  // The other half: the exclusion must not make the limit unenforceable. The
+  // same fixture, claimed instead of parked, still holds the budget — so what
+  // the sweep reads is why the job is unfinished, not that it is.
+  it('still defers at full depth when the job holding it is runnable', async () => {
+    const result = await run([{ body: [thread('1')] }], {
+      maxQueueDepth: 1,
+      runningJob: true,
+    });
+
+    expect(result.outcomes[0]?.deferred).toBe(true);
+    expect(result.outcomes[0]?.stored).toBe(0);
+    expect(marks(result.calls)).toHaveLength(0);
   });
 
   // A deferred sweep must not advance the cursor. Advancing it turns the next

@@ -941,6 +941,73 @@ describe('WorkQueue', () => {
     },
   );
 
+  // The counterpart to the two above: `retry` and `interrupted` are work the
+  // daemon owes itself and stay counted, but a job waiting on a person is not
+  // work the daemon is behind on. Counted, it deferred the sweep its own answer
+  // arrives through, and the answer expiry then failed it as `unanswered` on a
+  // thread that had answered.
+  it('leaves a job waiting on a question outside the depth budget', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue(work('depth-asked'), 1);
+        const claimed = yield* queue.claim;
+        const whileRunning = yield* Effect.flip(queue.enqueue(work('depth-next'), 1));
+        yield* queue.park({
+          jobId: claimed?.id ?? -1,
+          attemptNumber: claimed?.attempts ?? 1,
+          repository: 'edloidas/lictor',
+          subjectNumber: 17,
+          question: 'which branch?',
+          answerers: ['edloidas'],
+          expiresAt: Date.now() + 3_600_000,
+        });
+        return {
+          whileRunning,
+          backlog: yield* queue.backlog,
+          admitted: yield* queue.enqueue(work('depth-next'), 1),
+          counts: yield* queue.counts,
+        };
+      }),
+    );
+
+    // Counted while it ran, so the exclusion is the park and not the fixture.
+    expect(result.whileRunning.cause).toBeInstanceOf(QueueFull);
+    expect(result.backlog).toBe(0);
+    // The row is still there and still `pending` — excluded from the count, not
+    // finished. A test asserting only `backlog` would pass on a deleted job.
+    expect(result.counts.pending).toBe(2);
+    // The subset property, which is the invariant a later edit would break:
+    // `enqueue` must admit whatever a `backlog` under the limit admitted, or
+    // the sweep marks a thread read that `enqueue` then refuses.
+    expect(result.admitted.inserted).toBe(true);
+  });
+
+  // The boundary of the exclusion above, and the reason it reads `question_id`
+  // rather than `hold_expires_at`: `park` stamps both, so a predicate keyed on
+  // the deadline would take approval holds with it. Held work stays counted —
+  // it is released by `job.approve` on the control socket, which no depth check
+  // gates, so unlike a question it cannot be starved by its own budget.
+  it('counts a job held for an operator approval toward queue depth', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue({ ...work('depth-held'), approvalRequired: true }, 1, 3_600_000);
+        return {
+          held: yield* queue.job(1),
+          backlog: yield* queue.backlog,
+          rejected: yield* Effect.flip(queue.enqueue(work('depth-next'), 1)),
+        };
+      }),
+    );
+
+    // The deadline is set, so a predicate reading it would have excluded this
+    // row. That is what makes the two assertions below discriminating.
+    expect(result.held?.holdExpiresAt).toBeDefined();
+    expect(result.backlog).toBe(1);
+    expect(result.rejected.cause).toBeInstanceOf(QueueFull);
+  });
+
   it('dedupes a replay at full queue depth on either key', async () => {
     const result = await run(
       Effect.gen(function* () {

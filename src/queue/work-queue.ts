@@ -119,6 +119,22 @@ export type OutboxMessage = {
  */
 const TERMINAL_JOB_STATUSES: readonly JobStatus[] = ['completed', 'failed', 'dead_letter'];
 
+/**
+ * Work the depth budget holds back: accepted, unfinished, and not waiting on a
+ * person. Shared by the two counts that gate intake — `backlog`, which the
+ * poller reads before it fetches, and `enqueue`'s own refusal a stage later —
+ * because they are one rule and drift silently when written twice.
+ *
+ * ! `question_id IS NULL` is what keeps a job parked on its question out of the
+ * ! count. Its answer arrives through the sweep, so charging it against the
+ * ! budget let one parked job defer the sweep that would release it, and the
+ * ! answer expiry then failed the job as `unanswered` on a thread that had
+ * ! answered. What bounds parked rows is what one worker can park within
+ * ! `limits.answerExpiryHours` — a rate against a window, not a depth.
+ */
+const COUNTED_JOBS_WHERE =
+  "status IN ('pending', 'retry', 'interrupted', 'running') AND question_id IS NULL";
+
 export type QueuedJob = {
   readonly id: number;
   readonly work: WorkItem;
@@ -1150,9 +1166,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             .get(work.deliveryId, work.interactionId) as { id: number } | null;
           if (existing !== null) return { jobId: existing.id, inserted: false } as const;
           const active = database
-            .query(
-              "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('pending', 'retry', 'interrupted', 'running')",
-            )
+            .query(`SELECT COUNT(*) AS count FROM jobs WHERE ${COUNTED_JOBS_WHERE}`)
             .get() as { count: number };
           if (active.count >= maxDepth) throw new QueueFull({ limit: maxDepth });
           const holdExpiresAt =
@@ -2072,8 +2086,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       });
 
     /**
-     * Work already accepted and not yet finished: active jobs plus deliveries
-     * the worker has not drained.
+     * Work already accepted and not yet finished: jobs the depth budget counts
+     * (`COUNTED_JOBS_WHERE`) plus deliveries the worker has not drained.
      *
      * ! The poller checks this before storing anything, because the depth limit
      * ! itself lives in `enqueue` — which the poller never calls. By the time
@@ -2082,15 +2096,25 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
      * ! nowhere left to sit. Measured here instead, an over-depth sweep simply
      * ! leaves the threads unread and GitHub holds them until the queue drains.
      * !
+     * ! This is the wider of the two counts by the deliveries term, and must
+     * ! stay that way: `enqueue` refusing what the sweep admitted is the state
+     * ! above.
+     * !
      * ! A delivery being handed off to a job is counted twice for that moment.
      * ! Deliberate: erring toward a smaller sweep costs a poll interval, erring
      * ! the other way costs whatever the queue could not hold.
+     *
+     * `answerQuestion` returns a row to this count without consulting it, so a
+     * run of answers can leave it briefly over the limit. The sweep defers
+     * until the worker drains the excess, and a delivery already admitted that
+     * then meets a full `enqueue` is refused, refunded, and retried rather than
+     * dropped. `approve` is not one of these: a held row carries no
+     * `question_id`, so it was counted all along and approving it changes
+     * nothing here.
      */
     const backlog = attempt('measure backlog', () => {
       const jobs = database
-        .query(
-          "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('pending', 'retry', 'interrupted', 'running')",
-        )
+        .query(`SELECT COUNT(*) AS count FROM jobs WHERE ${COUNTED_JOBS_WHERE}`)
         .get() as { count: number };
       const deliveries = database
         .query("SELECT COUNT(*) AS count FROM deliveries WHERE status IN ('pending', 'processing')")
@@ -2101,6 +2125,9 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
     const diagnostics = Effect.gen(function* () {
       const jobCounts = yield* counts;
       return yield* attempt('queue diagnostics', () => {
+        // Deliberately not `COUNTED_JOBS_WHERE`: this answers what the operator
+        // is still waiting on, and a job parked for two days is the row they
+        // most want to see. That count gates intake; this one only reports.
         const oldest = database
           .query(
             `SELECT MIN(created_at) AS createdAt FROM jobs
