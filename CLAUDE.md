@@ -85,13 +85,17 @@ indistinguishable from a revoked token.
 - **Never mark read past the queue-depth limit.** GitHub is the overflow buffer;
   the limit is checked before the sweep, not in `enqueue`, which runs a stage
   later when the thread is already gone
-- **The depth budget counts runnable work, so a job parked on its question is
-  outside it.** Its answer arrives through the sweep, and a parked row that
-  charged against the budget deferred the sweep that would release it. Both
-  counts read one `COUNTED_JOBS_WHERE`: `backlog` is the wider by the deliveries
-  term and must stay so, or `enqueue` refuses what the sweep already marked
-  read. What bounds parked rows is what one worker can park within
-  `limits.answerExpiryHours` — a rate against a window, not a depth
+- **The depth budget counts work the daemon is behind on, so a job parked on its
+  question and a job held for an operator approval are both outside it.** A row
+  the claim skips still deferred the sweep while it counted — the parked row's
+  own answer arrives through that sweep, and enough holds stop it for the whole
+  queue. Both counts read one `COUNTED_JOBS_WHERE`, which shares
+  `UNHELD_JOBS_WHERE` with `claimFor` so the two cannot drift; `backlog` is the
+  wider by the deliveries term and must stay so, or `enqueue` refuses what the
+  sweep already marked read. Neither population is bounded by a number any
+  more — parked rows by `limits.answerExpiryHours`, held rows by
+  `limits.approvalExpiryHours` against the rate that arms them, a rate against a
+  window rather than a depth
 - The eyes reaction is strictly best-effort and goes through `GitHubClient`, not
   `CapabilityBroker`. The broker refuses anything that is not a `running` job with
   a live lease, and a just-enqueued job is `pending`

@@ -132,20 +132,41 @@ export type OutboxMessage = {
 const TERMINAL_JOB_STATUSES: readonly JobStatus[] = ['completed', 'failed', 'dead_letter'];
 
 /**
- * Work the depth budget holds back: accepted, unfinished, and not waiting on a
- * person. Shared by the two counts that gate intake — `backlog`, which the
- * poller reads before it fetches, and `enqueue`'s own refusal a stage later —
- * because they are one rule and drift silently when written twice.
+ * Not held for an operator approval, with the malformed arms as the exception:
+ * a payload carrying no `repository` or no `subject` is claimable despite its
+ * hold, because dead-lettering it is the only way it ever finishes. Shared with
+ * `claimFor` so the count that gates intake and the claim cannot disagree about
+ * which rows are held.
  *
- * ! `question_id IS NULL` is what keeps a job parked on its question out of the
- * ! count. Its answer arrives through the sweep, so charging it against the
- * ! budget let one parked job defer the sweep that would release it, and the
- * ! answer expiry then failed the job as `unanswered` on a thread that had
- * ! answered. What bounds parked rows is what one worker can park within
- * ! `limits.answerExpiryHours` — a rate against a window, not a depth.
+ * Goes in a `WHERE` and nowhere else. `json_type` raises on a malformed
+ * payload, and what keeps it unreached is the `json_valid` arm resolving to
+ * `0 = 0` first — which relies on SQLite short-circuiting `OR`, and it does
+ * that in a predicate but not in a projected column.
  */
-const COUNTED_JOBS_WHERE =
-  "status IN ('pending', 'retry', 'interrupted', 'running') AND question_id IS NULL";
+const UNHELD_JOBS_WHERE = `(
+                   CASE WHEN json_valid(payload)
+                     THEN COALESCE(json_extract(payload, '$.approvalRequired'), 0)
+                     ELSE 0 END = 0
+                   OR json_type(payload, '$.repository') IS NULL
+                   OR json_type(payload, '$.subject') IS NULL
+                 )`;
+
+/**
+ * Work the depth budget holds back: accepted, unfinished, and runnable. Shared
+ * by the two counts that gate intake — `backlog`, which the poller reads before
+ * it fetches, and `enqueue`'s own refusal a stage later — because they are one
+ * rule and drift silently when written twice.
+ *
+ * ! Both exclusions keep a row the claim skips from deferring the sweep. A job
+ * ! parked on its question deferred the sweep its own answer arrives through,
+ * ! and the answer expiry then failed it as `unanswered` on a thread that had
+ * ! answered; approval holds do that to every parked row at once. So no number
+ * ! bounds either population — parked rows are bounded by what one worker can
+ * ! park within `limits.answerExpiryHours`, held rows by
+ * ! `limits.approvalExpiryHours` against the rate that arms them.
+ */
+const COUNTED_JOBS_WHERE = `status IN ('pending', 'retry', 'interrupted', 'running')
+                 AND question_id IS NULL AND ${UNHELD_JOBS_WHERE}`;
 
 export type QueuedJob = {
   readonly id: number;
@@ -1292,8 +1313,6 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               // ! not accept — so ageing out an unapproved job destroyed the
               // ! operator's ability to approve it. Expiry belongs to
               // ! `maintenance`, which finishes the row without claiming it.
-              // The malformed-payload arms stay: those rows have to be claimed
-              // to be dead-lettered.
               const row = database
                 .query(
                   `SELECT id, payload, status, attempts, created_at AS createdAt,
@@ -1301,13 +1320,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                FROM jobs
                WHERE status IN ('pending', 'retry', 'interrupted') AND available_at <= ?
                  AND question_id IS NULL
-                 AND (
-                   CASE WHEN json_valid(payload)
-                     THEN COALESCE(json_extract(payload, '$.approvalRequired'), 0)
-                     ELSE 0 END = 0
-                   OR json_type(payload, '$.repository') IS NULL
-                   OR json_type(payload, '$.subject') IS NULL
-                 )
+                 AND ${UNHELD_JOBS_WHERE}
                ORDER BY available_at, id
                LIMIT 1`,
                 )
@@ -2120,8 +2133,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               // ! with a fresh deadline, never to `retry`. The claim skips
               // ! approval-required rows, and `approve` and the expiry sweep
               // ! both read `pending` only — so a held job left in `retry` can
-              // ! never run, be approved, or expire, while still counting
-              // ! against the queue depth.
+              // ! never run, be approved, or expire.
               const held = (JSON.parse(row.payload) as WorkItem).approvalRequired === true;
               return (
                 database
@@ -2186,13 +2198,11 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
      * ! Deliberate: erring toward a smaller sweep costs a poll interval, erring
      * ! the other way costs whatever the queue could not hold.
      *
-     * `answerQuestion` returns a row to this count without consulting it, so a
-     * run of answers can leave it briefly over the limit. The sweep defers
-     * until the worker drains the excess, and a delivery already admitted that
-     * then meets a full `enqueue` is refused, refunded, and retried rather than
-     * dropped. `approve` is not one of these: a held row carries no
-     * `question_id`, so it was counted all along and approving it changes
-     * nothing here.
+     * `answerQuestion` and `approve` both return a row to this count without
+     * consulting it, so a run of either can leave it briefly over the limit.
+     * The sweep defers until the worker drains the excess, and a delivery
+     * already admitted that then meets a full `enqueue` is refused, refunded,
+     * and retried rather than dropped.
      */
     const backlog = attempt('measure backlog', () => {
       const jobs = database
