@@ -4,10 +4,22 @@ import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Clock, Data, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
+import { processAlive } from '../process-liveness.ts';
 import { type WorkItem, WorkItemSchema } from '../work-item.ts';
 
 const WORKER_LEASE_MS = 60_000;
 const DAEMON_LEASE_MS = 30_000;
+/**
+ * How long past a lapsed lease an owner is believed alive on its pid alone.
+ *
+ * The escape from pid reuse, and the reason a takeover cannot deadlock: a
+ * crashed daemon's number can be handed to an unrelated process, which reads
+ * as alive and would otherwise refuse every start forever. Past this the
+ * lease decides again, as it did before liveness was consulted — so the floor
+ * is the old behaviour, never worse. Sized well above the 10s heartbeat: an
+ * owner this far behind has missed ~60 of them and is not serving work.
+ */
+const DAEMON_TAKEOVER_GRACE_MS = 10 * 60_000;
 const DELIVERY_LEASE_MS = 60_000;
 const OUTBOX_LEASE_MS = 60_000;
 /**
@@ -259,11 +271,12 @@ const migrate = (database: Database) => {
     (database.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(
       (existing) => existing.name === column,
     );
-  // Every v13 artifact checked, not a sample: one missing piece would fail on
+  // Every v14 artifact checked, not a sample: one missing piece would fail on
   // every use — the v6 equality-guard failure, one version later. The
   // `installation_id` check is negative so a database predating its drop heals.
   if (
-    version.user_version === 13 &&
+    version.user_version === 14 &&
+    hasColumn('daemon_owner', 'pid') &&
     deliveriesHaveSource() &&
     hasColumn('deliveries', 'lease_expires_at') &&
     hasColumn('capability_audit', 'actor') &&
@@ -282,7 +295,7 @@ const migrate = (database: Database) => {
     hasColumn('outbox', 'lease_expires_at')
   )
     return;
-  if (version.user_version > 13) {
+  if (version.user_version > 14) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -441,7 +454,8 @@ const migrate = (database: Database) => {
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         owner_id TEXT NOT NULL,
         heartbeat_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL
+        expires_at INTEGER NOT NULL,
+        pid INTEGER
       );
       CREATE TABLE IF NOT EXISTS capability_audit (
         id INTEGER PRIMARY KEY,
@@ -508,8 +522,14 @@ const migrate = (database: Database) => {
         last_error TEXT
       );
       CREATE INDEX IF NOT EXISTS outbox_claimable ON outbox(status, available_at, id);
-      PRAGMA user_version = 13;
+      PRAGMA user_version = 14;
     `);
+    // Ordered after the CREATE TABLE above, like the `deliveries` and `jobs`
+    // ALTERs: a fresh table is created complete, and only one predating the
+    // column reaches this.
+    if (!hasColumn('daemon_owner', 'pid')) {
+      database.exec('ALTER TABLE daemon_owner ADD COLUMN pid INTEGER');
+    }
     // ! Condemned, not drained: no decoder exists for webhook bodies anymore,
     // ! so leaving one claimable kills the delivery worker on a defect per cycle.
     database.exec(
@@ -580,6 +600,39 @@ const decodeJob = (row: JobRow): QueuedJob => ({
   ...(row.leaseExpiresAt == null ? {} : { leaseExpiresAt: row.leaseExpiresAt }),
 });
 
+type OwnerRow = {
+  readonly ownerId: string;
+  readonly pid: number | null;
+  readonly heartbeatAt: number;
+  readonly expiresAt: number;
+};
+
+/**
+ * Whether an owner whose lease has lapsed may be displaced.
+ *
+ * ! The lease answers "has it stopped reporting", and a suspended laptop or a
+ * ! stalled event loop answers yes while the daemon is still running jobs.
+ * ! Taking the database from one there is what deletes its live run
+ * ! directories and fails a job whose side effects have already landed.
+ */
+const ownerIsGone = (owner: OwnerRow, now: number): boolean => {
+  // ! Recorded before the column existed — and a live owner's row gains a null
+  // ! pid the moment an upgraded daemon migrates the table, so this is not
+  // ! proof of absence. Only the grace may settle it, or the one daemon still
+  // ! running the old code is displaced mid-job during the upgrade.
+  if (owner.pid === null) return now - owner.expiresAt > DAEMON_TAKEOVER_GRACE_MS;
+  // Our own number cannot belong to another live process: either this process
+  // wrote the row, or a dead daemon's number was reassigned to us. Only
+  // consulted once the lease has lapsed, so a reload inside the lease window is
+  // refused exactly as it was before.
+  if (owner.pid === process.pid) return true;
+  if (!processAlive(owner.pid)) return true;
+  return now - owner.expiresAt > DAEMON_TAKEOVER_GRACE_MS;
+};
+
+const ownershipRefusal = (owner: OwnerRow, now: number): string =>
+  `Another Lictor daemon owns this database: ${owner.pid === null ? 'pid unrecorded' : `pid ${owner.pid}`}, last heartbeat ${Math.round((now - owner.heartbeatAt) / 1000)}s ago. Stop it, or point LICTOR_DATABASE_PATH at a different state directory.`;
+
 export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
   scoped: Effect.gen(function* () {
     const config = yield* LictorConfig;
@@ -589,17 +642,46 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
     const startupTime = yield* Clock.currentTimeMillis;
     const ownerId = randomUUID();
     yield* Effect.acquireRelease(
-      attempt('claim daemon ownership', () => {
-        const result = database
-          .query(
-            `INSERT INTO daemon_owner (singleton, owner_id, heartbeat_at, expires_at)
-             VALUES (1, ?, ?, ?)
-             ON CONFLICT(singleton) DO UPDATE SET owner_id = excluded.owner_id,
-               heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at
-             WHERE daemon_owner.expires_at < ?`,
-          )
-          .run(ownerId, startupTime, startupTime + DAEMON_LEASE_MS, startupTime);
-        if (result.changes !== 1) throw new Error('Another Lictor daemon owns this database');
+      Effect.gen(function* () {
+        const owner = yield* attempt(
+          'read daemon ownership',
+          () =>
+            database
+              .query(
+                `SELECT owner_id AS ownerId, pid, heartbeat_at AS heartbeatAt, expires_at AS expiresAt
+                 FROM daemon_owner WHERE singleton = 1`,
+              )
+              .get() as OwnerRow | null,
+        );
+        if (
+          owner !== null &&
+          (owner.expiresAt >= startupTime || !ownerIsGone(owner, startupTime))
+        ) {
+          // Logged as well as failed: `QueueError` carries no message, so a
+          // described cause names the statement and never the daemon holding
+          // the directory — the one thing the operator has to act on.
+          yield* Effect.logFatal(ownershipRefusal(owner, startupTime));
+          return yield* new QueueError({
+            operation: 'claim daemon ownership',
+            cause: undefined,
+          });
+        }
+        yield* attempt('claim daemon ownership', () => {
+          const result = database
+            .query(
+              `INSERT INTO daemon_owner (singleton, owner_id, heartbeat_at, expires_at, pid)
+               VALUES (1, ?, ?, ?, ?)
+               ON CONFLICT(singleton) DO UPDATE SET owner_id = excluded.owner_id,
+                 heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at,
+                 pid = excluded.pid
+               WHERE daemon_owner.expires_at < ?`,
+            )
+            .run(ownerId, startupTime, startupTime + DAEMON_LEASE_MS, process.pid, startupTime);
+          // The predicate decides, not the read above: two starters that both
+          // find the owner gone reach here, and only one matches a lapsed lease.
+          if (result.changes !== 1)
+            throw new Error('Another Lictor daemon claimed this database first');
+        });
       }),
       () =>
         attempt('release daemon ownership', () => {

@@ -3,10 +3,32 @@ import { describe, expect, it } from 'bun:test';
 import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Clock, Effect, Layer, Logger, Redacted, TestClock, TestContext } from 'effect';
+import {
+  Cause,
+  Clock,
+  Effect,
+  Layer,
+  Logger,
+  Option,
+  Redacted,
+  TestClock,
+  TestContext,
+} from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { QueueFull, WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
+
+/**
+ * The message of the error a `QueueError` wrapped. `QueueError` carries no
+ * message of its own, so neither `String(exit)` nor `describeCause` reaches
+ * what actually went wrong.
+ */
+const wrappedMessage = (cause: Cause.Cause<unknown>): string => {
+  const failure = Cause.failureOption(cause);
+  if (Option.isNone(failure)) return '';
+  const inner = (failure.value as { readonly cause?: unknown }).cause;
+  return inner instanceof Error ? inner.message : String(inner ?? '');
+};
 
 const config = (databasePath: string) =>
   LictorConfig.make({
@@ -1944,7 +1966,7 @@ describe('WorkQueue', () => {
       const after = new Database(path);
       expect(
         (after.query('PRAGMA user_version').get() as { user_version: number }).user_version,
-      ).toBe(13);
+      ).toBe(14);
       after.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -1997,7 +2019,7 @@ describe('WorkQueue', () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
     const database = new Database(path, { create: true });
-    database.exec('PRAGMA user_version = 14');
+    database.exec('PRAGMA user_version = 15');
     database.close();
 
     try {
@@ -2013,6 +2035,12 @@ describe('WorkQueue', () => {
       );
 
       expect(exit._tag).toBe('Failure');
+      // The message, not just failure: falling through past an unrecognised
+      // stamp into the migration body would die on an ALTER against a table it
+      // never created, reading as a corrupt database rather than a newer one.
+      expect(exit._tag === 'Failure' ? wrappedMessage(exit.cause) : '').toContain(
+        'Unsupported queue schema version 15',
+      );
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -2021,19 +2049,166 @@ describe('WorkQueue', () => {
   it('rejects a second live daemon owner for one database', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-owner-'));
     const path = join(directory, 'queue.sqlite');
+    const logged: string[] = [];
     try {
       const exit = await Effect.runPromise(
         Effect.scoped(
           Effect.gen(function* () {
             yield* WorkQueue;
-            return yield* Effect.exit(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))));
+            return yield* Effect.exit(
+              Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))).pipe(
+                Effect.provide(
+                  Logger.replace(
+                    Logger.defaultLogger,
+                    Logger.make<unknown, void>(({ message }) => {
+                      logged.push(String(message));
+                    }),
+                  ),
+                ),
+              ),
+            );
           }).pipe(Effect.provide(queueLayer(path))),
         ),
       );
-      expect(String(exit)).toContain('claim daemon ownership');
+      expect(exit._tag).toBe('Failure');
+      // The pid, not just the operation name: an operator who cannot see which
+      // process holds the directory has nothing to act on. This is the
+      // live-owner case, so the pid it names is this process's own.
+      expect(logged.join('\n')).toContain(`pid ${process.pid}`);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  /**
+   * Stamps a synthetic owner row onto an initialized database, then reports
+   * what a fresh daemon makes of it. Building the queue once creates the
+   * schema; releasing that scope clears the row it claimed for itself.
+   */
+  const claimAgainstOwner = async (owner: {
+    readonly pid: number | null;
+    readonly expiresAt: number;
+  }) => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-owner-'));
+    const path = join(directory, 'queue.sqlite');
+    const logged: string[] = [];
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))));
+      const database = new Database(path);
+      database
+        .query(
+          `INSERT INTO daemon_owner (singleton, owner_id, heartbeat_at, expires_at, pid)
+           VALUES (1, 'other-daemon', ?, ?, ?)`,
+        )
+        .run(owner.expiresAt - 30_000, owner.expiresAt, owner.pid);
+      database.close();
+      const exit = await Effect.runPromise(
+        Effect.exit(
+          Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))).pipe(
+            Effect.provide(
+              Logger.replace(
+                Logger.defaultLogger,
+                Logger.make<unknown, void>(({ message }) => {
+                  logged.push(String(message));
+                }),
+              ),
+            ),
+          ),
+        ),
+      );
+      return { exit, logged };
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  };
+
+  // pid 1 is alive and is not ours, and `kill(1, 0)` unprivileged fails with
+  // `EPERM` rather than `ESRCH` — the answer that must not read as dead.
+  it('refuses an owner whose lease lapsed while its process is still alive', async () => {
+    const { exit, logged } = await claimAgainstOwner({ pid: 1, expiresAt: Date.now() - 60_000 });
+
+    expect(exit._tag).toBe('Failure');
+    expect(logged.join('\n')).toContain('pid 1,');
+  });
+
+  it('takes over from an owner whose process is gone', async () => {
+    const { exit } = await claimAgainstOwner({
+      pid: Bun.spawnSync(['true']).pid,
+      expiresAt: Date.now() - 60_000,
+    });
+
+    expect(exit._tag).toBe('Success');
+  });
+
+  it('takes over a lapsed lease once it is past the takeover grace', async () => {
+    const { exit } = await claimAgainstOwner({ pid: 1, expiresAt: Date.now() - 11 * 60_000 });
+
+    expect(exit._tag).toBe('Success');
+  });
+
+  it('takes over a record that holds its own pid', async () => {
+    const { exit } = await claimAgainstOwner({
+      pid: process.pid,
+      expiresAt: Date.now() - 60_000,
+    });
+
+    expect(exit._tag).toBe('Success');
+  });
+
+  it('refuses a record whose pid is unrecorded until the grace passes', async () => {
+    const { exit, logged } = await claimAgainstOwner({
+      pid: null,
+      expiresAt: Date.now() - 60_000,
+    });
+
+    expect(exit._tag).toBe('Failure');
+    expect(logged.join('\n')).toContain('pid unrecorded');
+  });
+
+  it('takes over a record whose pid is unrecorded once the grace passes', async () => {
+    const { exit } = await claimAgainstOwner({ pid: null, expiresAt: Date.now() - 11 * 60_000 });
+
+    expect(exit._tag).toBe('Success');
+  });
+
+  // The state the presence checks exist for: a database carrying the current
+  // stamp while its table lacks the column. Without the repair, claiming
+  // ownership tries an INSERT naming a column that is not there, which reads
+  // as a corrupt database rather than an old one.
+  it('adds the daemon owner pid column to a database that carries the stamp without it', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-owner-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))));
+      const stripped = new Database(path);
+      stripped.exec('ALTER TABLE daemon_owner DROP COLUMN pid');
+      stripped.exec('PRAGMA user_version = 14');
+      stripped.close();
+
+      const exit = await Effect.runPromise(
+        Effect.exit(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path)))),
+      );
+
+      const repaired = new Database(path);
+      const columns = (
+        repaired.query('PRAGMA table_info(daemon_owner)').all() as { name: string }[]
+      ).map((column) => column.name);
+      repaired.close();
+
+      expect(exit._tag).toBe('Success');
+      expect(columns).toContain('pid');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  // An unexpired lease still refuses on its own: the probe only ever adds a
+  // reason to refuse, never removes one.
+  it('refuses an owner whose lease has not lapsed', async () => {
+    const { exit, logged } = await claimAgainstOwner({ pid: 1, expiresAt: Date.now() + 30_000 });
+
+    expect(exit._tag).toBe('Failure');
+    expect(logged.join('\n')).toContain('pid 1,');
   });
 
   it('dead-letters an expired claim at the attempt limit', async () => {
