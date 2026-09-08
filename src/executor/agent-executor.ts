@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Cause, Data, Effect, JSONSchema, Schema } from 'effect';
@@ -6,6 +6,7 @@ import { bounded } from '../bounded.ts';
 import { LictorConfig } from '../config.ts';
 import { AgentListener } from '../control/agent-listener.ts';
 import { describeCause } from '../diagnostics.ts';
+import { processAlive } from '../process-liveness.ts';
 import type { WorkItem } from '../work-item.ts';
 import { type ProcessResult, ProcessRunner } from './process-runner.ts';
 
@@ -235,6 +236,28 @@ Report the outcome as one status:
 - \`failed\` — something broke that you could not work around. This run is the last one either way, so \`summary\` has to carry what broke. Never for a capability you were not granted.`;
 };
 
+/**
+ * A daemon killed outright never runs its own cleanup, so its run directory
+ * survives it. One whose pid has since been recycled is left alone and
+ * leaks a directory — the safe direction to be wrong in.
+ */
+const sweepDeadRuns = (runsRoot: string): Effect.Effect<void> =>
+  Effect.try(() => {
+    for (const entry of readdirSync(runsRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const pid = Number(entry.name);
+      if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
+      if (processAlive(pid)) continue;
+      rmSync(join(runsRoot, entry.name), { recursive: true, force: true });
+    }
+  }).pipe(
+    Effect.catchAll((cause) =>
+      Effect.logWarning('Stale run directories could not be swept').pipe(
+        Effect.annotateLogs({ path: runsRoot, error: describeCause(Cause.fail(cause)) }),
+      ),
+    ),
+  );
+
 export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecutor', {
   effect: Effect.gen(function* () {
     const config = yield* LictorConfig;
@@ -249,15 +272,22 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
     yield* Effect.sync(() => mkdirSync(codexHome, { recursive: true, mode: 0o700 }));
     // Beside the database, not in the workspace or TMPDIR that `codex exec`
     // reports its sandbox as writable. A smaller target, not a boundary.
-    const runsDir = join(config.stateDir, 'runs');
+    const runsRoot = join(config.stateDir, 'runs');
+    // ! Keyed by pid so a sweep cannot reach a directory another daemon is
+    // ! still writing into. One daemon per state directory is enforced by the
+    // ! queue's ownership claim, but this holds even where that is bypassed:
+    // ! deleting a live run loses a result whose side effects already landed,
+    // ! and reports it as the agent's failure.
+    const runsDir = join(runsRoot, String(process.pid));
     const schemaPath = join(config.stateDir, 'result-schema.json');
     yield* Effect.sync(() => {
-      // Every run removes its own directory; one that survived belongs to a
-      // daemon that was killed outright, and no scope can clean up after that.
+      // Our own number can only be our own restart — `bun --watch` replaces the
+      // image in place and keeps the pid — so anything under it is ours to drop.
       rmSync(runsDir, { recursive: true, force: true });
       mkdirSync(runsDir, { recursive: true, mode: 0o700 });
       writeFileSync(schemaPath, resultJsonSchema(), { mode: 0o600 });
     });
+    yield* sweepDeadRuns(runsRoot);
     // Operator-authored standing instructions — the one trusted prose in the
     // prompt, so it is prepended ahead of the untrusted JSON, never inside it.
     const soulPath = join(config.stateDir, 'SOUL.md');

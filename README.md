@@ -54,9 +54,11 @@ Daemon state lives in `~/.lictor/` — database, control socket, policy, and the
 agent's `CODEX_HOME` — deliberately outside any repository, since one of the
 repositories lictor manages may be lictor itself. Override any of the three paths
 with `LICTOR_DATABASE_PATH`, `LICTOR_POLICY_PATH`, or `LICTOR_SOCKET_PATH`; a
-leading `~/` is expanded. One daemon per user owns that state: a second instance
-sharing it loses the ownership lease and stops itself, so give a development
-instance its own paths rather than pointing it at the same home.
+leading `~/` is expanded. One daemon per user owns that state, and a second
+instance sharing it refuses to start, naming the pid that holds it. Ownership
+survives a stall: an owner that stops reporting is displaced only once its
+process is gone, or once it is far enough behind to be presumed so. Give a
+development instance its own paths rather than pointing it at the same home.
 
 If a `.lictor/` directory from an earlier version is still present in the working
 directory, startup refuses rather than opening a fresh database beside it.

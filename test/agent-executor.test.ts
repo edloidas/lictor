@@ -736,7 +736,10 @@ describe('AgentExecutor', () => {
   // exit a scope cannot reach — so nothing but startup removes this.
   it('sweeps a run directory left behind by a killed daemon', async () => {
     const statePath = tempStatePath();
-    const stale = join(stateDirOf(statePath), 'runs', 'run-stale');
+    // A real pid that has certainly exited, rather than a number guessed to be
+    // free: `spawnSync` has reaped the child by the time it returns.
+    const dead = Bun.spawnSync(['true']).pid;
+    const stale = join(stateDirOf(statePath), 'runs', String(dead), 'run-stale');
     mkdirSync(stale, { recursive: true });
 
     await runWith(
@@ -747,6 +750,37 @@ describe('AgentExecutor', () => {
     );
 
     expect(existsSync(stale)).toBe(false);
+  });
+
+  // pid 1 is alive and is not ours, and `kill(1, 0)` from an unprivileged
+  // process fails with `EPERM` rather than `ESRCH` — the answer that must not
+  // be read as dead.
+  it('leaves a run directory belonging to a live daemon alone', async () => {
+    const statePath = tempStatePath();
+    const live = join(stateDirOf(statePath), 'runs', '1', 'run-live');
+    mkdirSync(live, { recursive: true });
+
+    await runWith(
+      Effect.flatMap(AgentExecutor, (agent) => agent.execute(work)),
+      completingRunner,
+      'codex',
+      statePath,
+    );
+
+    expect(existsSync(live)).toBe(true);
+  });
+
+  it('keeps its own runs under a directory named for its pid', async () => {
+    const statePath = tempStatePath();
+
+    await runWith(
+      Effect.flatMap(AgentExecutor, (agent) => agent.execute(work)),
+      completingRunner,
+      'codex',
+      statePath,
+    );
+
+    expect(existsSync(join(stateDirOf(statePath), 'runs', String(process.pid)))).toBe(true);
   });
 
   // The argv above is the `jobId === undefined` path, which carries no broker at
