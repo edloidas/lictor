@@ -1005,12 +1005,10 @@ describe('WorkQueue', () => {
     expect(result.admitted.inserted).toBe(true);
   });
 
-  // The boundary of the exclusion above, and the reason it reads `question_id`
-  // rather than `hold_expires_at`: `park` stamps both, so a predicate keyed on
-  // the deadline would take approval holds with it. Held work stays counted —
-  // it is released by `job.approve` on the control socket, which no depth check
-  // gates, so unlike a question it cannot be starved by its own budget.
-  it('counts a job held for an operator approval toward queue depth', async () => {
+  // The same exclusion one population over: `claimFor` will not take a job held
+  // for an operator approval either, and while it counted, a budget full of
+  // holds deferred the sweep every parked job's answer arrives through.
+  it('leaves a job held for an operator approval out of the queue depth', async () => {
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
@@ -1018,17 +1016,68 @@ describe('WorkQueue', () => {
         return {
           held: yield* queue.job(1),
           backlog: yield* queue.backlog,
-          rejected: yield* Effect.flip(queue.enqueue(work('depth-next'), 1)),
+          admitted: yield* queue.enqueue(work('depth-next'), 1),
+          counts: yield* queue.counts,
         };
       }),
     );
 
-    // The deadline is set, so a predicate reading it would have excluded this
-    // row. That is what makes the two assertions below discriminating.
+    // The hold is real, so the exclusion below is the predicate and not a
+    // fixture that failed to set `approvalRequired`.
+    expect(result.held?.work.approvalRequired).toBe(true);
     expect(result.held?.holdExpiresAt).toBeDefined();
-    expect(result.backlog).toBe(1);
-    expect(result.rejected.cause).toBeInstanceOf(QueueFull);
+    expect(result.backlog).toBe(0);
+    expect(result.counts.pending).toBe(2);
+    expect(result.admitted.inserted).toBe(true);
   });
+
+  // `approvalExpiryMs` omitted, so `hold_expires_at` is NULL — a shape
+  // `maintenance` supports by dating it one window from `ready_at`. It is what
+  // proves the exclusion reads the payload and not the deadline column.
+  it('leaves an undated approval hold out of the queue depth', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        yield* queue.enqueue({ ...work('depth-undated'), approvalRequired: true }, 1);
+        return {
+          held: yield* queue.job(1),
+          backlog: yield* queue.backlog,
+          admitted: yield* queue.enqueue(work('depth-next'), 1),
+        };
+      }),
+    );
+
+    expect(result.held?.holdExpiresAt).toBeUndefined();
+    expect(result.backlog).toBe(0);
+    expect(result.admitted.inserted).toBe(true);
+  });
+
+  // Why the predicate is a disjunction rather than a plain `approvalRequired
+  // = 0`: a held payload the claim cannot route is claimed anyway, since
+  // dead-lettering it is the only way it finishes, so it stays counted.
+  it.each(['repository', 'subject'] as const)(
+    'claims and dead-letters a held job missing %s',
+    async (field) => {
+      const { [field]: _dropped, ...unroutable } = work(`depth-unroutable-${field}`);
+      const result = await run(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.enqueue({ ...unroutable, approvalRequired: true } as WorkItem, 1, 3_600_000);
+          return {
+            backlog: yield* queue.backlog,
+            claimed: yield* queue.claim,
+            counts: yield* queue.counts,
+          };
+        }),
+      );
+
+      expect(result.backlog).toBe(1);
+      // The outcome is also the fixture guard: `queue.job` cannot stand in,
+      // because decoding this payload throws.
+      expect(result.claimed).toBeUndefined();
+      expect(result.counts.dead_letter).toBe(1);
+    },
+  );
 
   it('dedupes a replay at full queue depth on either key', async () => {
     const result = await run(
