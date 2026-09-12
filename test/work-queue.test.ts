@@ -2154,6 +2154,59 @@ describe('WorkQueue', () => {
     fingerprint,
   });
 
+  // ! `COALESCE` on the approve write, not `AND grant IS NULL`: an approval must
+  // ! never replace a recorded ceiling, and — unlike `recordGrant`, where a lost
+  // ! race is a no-op — must still approve the job when one is already there.
+  it('records the approved scope without replacing a ceiling already on the row', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-approve-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      const held = { ...work('held'), approvalRequired: true } as const;
+      const carried = { ...work('carried'), approvalRequired: true } as const;
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* queue.enqueue(held);
+            yield* queue.enqueue(carried);
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+      // The one state no queue call can reach: a held row already carrying a
+      // ceiling. It is what the `COALESCE` exists for.
+      const database = new Database(path);
+      database
+        .query('UPDATE jobs SET grant = ? WHERE id = 2')
+        .run(JSON.stringify(grant('already-recorded')));
+      database.close();
+
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            const fresh = yield* queue.approve(1, grant('minted-at-approval'));
+            const occupied = yield* queue.approve(2, grant('minted-at-approval'));
+            return {
+              fresh,
+              occupied,
+              first: yield* queue.job(1),
+              second: yield* queue.job(2),
+            };
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(result.fresh).toBe(true);
+      expect(result.first?.grant?.fingerprint).toBe('minted-at-approval');
+      expect(result.first?.work.approvalRequired).toBe(false);
+      expect(result.occupied).toBe(true);
+      expect(result.second?.grant?.fingerprint).toBe('already-recorded');
+      expect(result.second?.work.approvalRequired).toBe(false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   // ! The `AND grant IS NULL` clause is what makes the mint once. Without it a
   // ! later attempt could replace the ceiling with a grant derived from policy
   // ! edited since — the widening the record exists to block.

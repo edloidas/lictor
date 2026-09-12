@@ -2163,6 +2163,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       id: number,
       action: 'approve' | 'cancel' | 'retry',
       approvalExpiryMs?: number,
+      grant?: Grant,
     ) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
@@ -2178,15 +2179,27 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               if (payload.approvalRequired !== true || row.status !== 'pending') return false;
               // Resets `ready_at` so a long-held job isn't immediately refused
               // by the age gate once approved.
+              //
+              // ! `COALESCE` keeps the mint once, as `recordGrant`'s
+              // ! `grant IS NULL` does: the approval is the authorization
+              // ! decision and records the scope released here, but a ceiling
+              // ! already on the row outranks it — and unlike `recordGrant`, a
+              // ! lost race must still approve the job.
               return (
                 database
                   .query(
                     `UPDATE jobs SET payload = ?, updated_at = ?, ready_at = ?,
-                       available_at = ?, hold_expires_at = NULL
+                       available_at = ?, hold_expires_at = NULL, grant = COALESCE(grant, ?)
                      WHERE id = ? AND status = 'pending'`,
                   )
-                  .run(JSON.stringify({ ...payload, approvalRequired: false }), now, now, now, id)
-                  .changes === 1
+                  .run(
+                    JSON.stringify({ ...payload, approvalRequired: false }),
+                    now,
+                    now,
+                    now,
+                    grant === undefined ? null : JSON.stringify(grant),
+                    id,
+                  ).changes === 1
               );
             }
             if (action === 'retry') {
@@ -2367,7 +2380,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       listJobs,
       job,
       liveJobIds,
-      approve: (id: number) => mutateJob(id, 'approve'),
+      approve: (id: number, grant?: Grant) => mutateJob(id, 'approve', undefined, grant),
       retry: (id: number, approvalExpiryMs?: number) => mutateJob(id, 'retry', approvalExpiryMs),
       cancel: (id: number) => mutateJob(id, 'cancel'),
       diagnostics,
