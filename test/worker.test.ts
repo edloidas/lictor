@@ -394,6 +394,70 @@ describe('Worker.runOnce grants', () => {
     expect(result.messages.at(-1)?.note).toBeUndefined();
   });
 
+  // The gate reads the grant's ceiling, so a policy that raised `maxAttempts`
+  // after the mint cannot buy this job the attempt its record does not hold.
+  it('bounds the attempt gate by the recorded ceiling when policy has since raised it', async () => {
+    let executions = 0;
+    const repository: { maxAttempts: number } = { maxAttempts: 1 };
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        repository.maxAttempts = 5;
+        yield* TestClock.adjust('150 millis');
+        yield* worker.runOnce;
+        return yield* queue.job(jobId);
+      }).pipe(Effect.provide(TestContext.TestContext)),
+      () => {
+        executions += 1;
+        return Effect.fail(new ExecutorError({ message: 'temporary', retryable: true }));
+      },
+      5,
+      true,
+      undefined,
+      { repository },
+    );
+
+    expect(executions).toBe(1);
+    expect(result?.lastError).toBe('POLICY_ATTEMPTS_EXHAUSTED');
+  });
+
+  // ! An unreadable ceiling outranks every policy gate: the row's own
+  // ! authorization is the thing that cannot be adjudicated, so refusing it as
+  // ! a policy denial would name a cause an operator can correct and leave the
+  // ! corruption unreported.
+  it('refuses an unreadable grant ahead of a policy gate that is also closed', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        yield* queue.recordGrant(jobId, claimed?.attempts ?? 1, claimed?.workerId ?? '', {
+          version: 1,
+          nonsense: true,
+        } as unknown as Grant);
+        yield* queue.fail(jobId, claimed?.attempts ?? 1, 'reset', undefined, 'failed', {
+          repository: work.repository,
+          subjectNumber: work.subject.number,
+          outcome: 'failed',
+        });
+        yield* queue.retry(jobId, 0);
+        yield* (yield* Worker).runOnce;
+        return yield* queue.job(jobId);
+      }),
+      () => Effect.succeed({ status: 'completed', summary: 'done' }),
+      5,
+      true,
+      undefined,
+      { repository: { execution: 'denied' } },
+    );
+
+    expect(result?.outcome).toBe('rejected');
+    expect(result?.lastError).toBe('Recorded authorization for this job could not be read');
+  });
+
   it('records what the job was admitted under on the first claim', async () => {
     const result = await grantsOver(1, { repository: { capabilities: readAndComment } });
 
