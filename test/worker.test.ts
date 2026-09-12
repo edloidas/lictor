@@ -818,7 +818,7 @@ describe('Worker.runOnce', () => {
         const worker = yield* Worker;
         const worked = yield* worker.runOnce;
         return { worked, counts: yield* queue.counts, job: yield* queue.job(jobId) };
-      }),
+      }).pipe(Effect.provide(TestContext.TestContext)),
       () => Effect.die('the executor must not run'),
       3,
       true,
@@ -874,7 +874,7 @@ describe('Worker.runOnce', () => {
   });
 
   it('drops a claimed job that sat in the queue past the maximum job age', async () => {
-    const result = await dropped(work, { maxJobAgeMs: 10 }, Effect.sleep('30 millis'));
+    const result = await dropped(work, { maxJobAgeMs: 10 }, TestClock.adjust('30 millis'));
 
     expect(result.worked).toBe(true);
     expect(result.counts.failed).toBe(1);
@@ -891,10 +891,10 @@ describe('Worker.runOnce', () => {
         const { jobId } = yield* queue.enqueue(work);
         const worker = yield* Worker;
         yield* worker.runOnce;
-        yield* Effect.sleep('150 millis');
+        yield* TestClock.adjust('150 millis');
         const second = yield* worker.runOnce;
         return { second, counts: yield* queue.counts, job: yield* queue.job(jobId) };
-      }),
+      }).pipe(Effect.provide(TestContext.TestContext)),
       () => {
         executions += 1;
         return Effect.fail(new ExecutorError({ message: 'temporary', retryable: true }));
@@ -952,9 +952,9 @@ describe('Worker.runOnce', () => {
         yield* queue.enqueue(work);
         const worker = yield* Worker;
         yield* worker.runOnce;
-        yield* Effect.sleep('250 millis');
+        yield* TestClock.adjust('250 millis');
         return { reclaimed: yield* queue.claim, counts: yield* queue.counts };
-      }),
+      }).pipe(Effect.provide(TestContext.TestContext)),
       () => Effect.die('the executor must not run'),
       3,
       true,
@@ -977,9 +977,9 @@ describe('Worker.runOnce', () => {
         yield* queue.enqueue(work);
         const worker = yield* Worker;
         yield* worker.runOnce;
-        yield* Effect.sleep('250 millis');
+        yield* TestClock.adjust('250 millis');
         return yield* queue.claim;
-      }),
+      }).pipe(Effect.provide(TestContext.TestContext)),
       () => Effect.die('the executor must not run'),
       3,
       true,
@@ -1169,6 +1169,10 @@ describe('Worker.runOnce observability', () => {
     const annotations = annotationsOf(logs, 'Dropped queued work denied by policy');
     expect(annotations?.errorCode).toBe('POLICY_EXECUTION_DENIED');
     expect(annotations?.durationMs).toBeTypeOf('number');
+    // `toBeTypeOf` alone admits `NaN`, which is what a reversed subtraction of
+    // the two timestamps would produce. The drop path has no sleep to make a
+    // lower bound meaningful, but it cannot be negative either.
+    expect(annotations?.durationMs as number).toBeGreaterThanOrEqual(0);
     // A dropped job is failed, never completed.
     expect(counts.failed).toBe(1);
     expect(counts.completed).toBe(0);

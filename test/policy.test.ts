@@ -263,33 +263,47 @@ describe('policy refusal', () => {
     expect(policyRefusal(gate())).toBeUndefined();
   });
 
-  test.each<readonly [string, PolicyGate, PolicyRefusal]>([
-    [
-      'a repository the allow and deny lists do not accept',
-      gate({ repository: repositoryPolicy({ accepted: false }) }),
-      'POLICY_REPOSITORY_NOT_ACCEPTED',
-    ],
-    [
-      'a repository whose execution is denied',
-      gate({ repository: repositoryPolicy({ execution: 'denied' }) }),
-      'POLICY_EXECUTION_DENIED',
-    ],
-    [
-      'an approval gate no operator has opened',
-      gate({ repository: repositoryPolicy({ execution: 'approval' }), approvalRequired: true }),
-      'POLICY_APPROVAL_REQUIRED',
-    ],
-    [
-      'an approval gate on work that never recorded an answer',
-      gate({
-        repository: repositoryPolicy({ execution: 'approval' }),
-        approvalRequired: undefined,
-      }),
-      'POLICY_APPROVAL_REQUIRED',
-    ],
-    ['an attempt past the repository limit', gate({ attempts: 4 }), 'POLICY_ATTEMPTS_EXHAUSTED'],
-    ['a job older than the age limit', gate({ now: 61_001 }), 'POLICY_JOB_TOO_OLD'],
-  ])('names the gate that closed on %s', (_name, closed, code) => {
+  /**
+   * Keyed by the union rather than listed as an array: a `PolicyRefusal` member
+   * added later without a case here fails to compile. The array form accepted a
+   * missing code silently, so a new gate could ship untested.
+   */
+  const refusalCases: Readonly<Record<PolicyRefusal, readonly (readonly [string, PolicyGate])[]>> =
+    {
+      POLICY_REPOSITORY_NOT_ACCEPTED: [
+        [
+          'a repository the allow and deny lists do not accept',
+          gate({ repository: repositoryPolicy({ accepted: false }) }),
+        ],
+      ],
+      POLICY_EXECUTION_DENIED: [
+        [
+          'a repository whose execution is denied',
+          gate({ repository: repositoryPolicy({ execution: 'denied' }) }),
+        ],
+      ],
+      POLICY_APPROVAL_REQUIRED: [
+        [
+          'an approval gate no operator has opened',
+          gate({ repository: repositoryPolicy({ execution: 'approval' }), approvalRequired: true }),
+        ],
+        [
+          'an approval gate on work that never recorded an answer',
+          gate({
+            repository: repositoryPolicy({ execution: 'approval' }),
+            approvalRequired: undefined,
+          }),
+        ],
+      ],
+      POLICY_ATTEMPTS_EXHAUSTED: [['an attempt past the repository limit', gate({ attempts: 4 })]],
+      POLICY_JOB_TOO_OLD: [['a job older than the age limit', gate({ now: 61_001 })]],
+    };
+
+  test.each(
+    Object.entries(refusalCases).flatMap(([code, cases]) =>
+      cases.map(([name, closed]) => [name, closed, code as PolicyRefusal] as const),
+    ),
+  )('names the gate that closed on %s', (_name, closed, code) => {
     expect(policyRefusal(closed)).toBe(code);
   });
 
@@ -308,7 +322,11 @@ describe('policy refusal', () => {
     expect(policyRefusal(open)).toBeUndefined();
   });
 
-  // Opening the gates one at a time walks the whole order, so a reordered clause fails a row here.
+  // Opening the gates one at a time walks the whole order, so a reordered clause
+  // fails a step here. Every step spreads `closed` and lifts exactly one field,
+  // including the last: it opens the attempt gate by naming `maxAttempts` rather
+  // than by dropping the spread, which would reopen it invisibly by letting the
+  // default back in.
   test('reports the first closed gate when several are closed at once', () => {
     const closed = {
       accepted: false,
@@ -321,28 +339,18 @@ describe('policy refusal', () => {
       approvalRequired: true,
       now: 61_001,
     });
+    const order: readonly (readonly [Partial<RepositoryPolicy>, PolicyRefusal])[] = [
+      [{}, 'POLICY_REPOSITORY_NOT_ACCEPTED'],
+      [{ accepted: true }, 'POLICY_EXECUTION_DENIED'],
+      [{ accepted: true, execution: 'approval' }, 'POLICY_APPROVAL_REQUIRED'],
+      [{ accepted: true, execution: 'automatic' }, 'POLICY_ATTEMPTS_EXHAUSTED'],
+      [{ accepted: true, execution: 'automatic', maxAttempts: 3 }, 'POLICY_JOB_TOO_OLD'],
+    ];
 
-    expect(policyRefusal(all)).toBe('POLICY_REPOSITORY_NOT_ACCEPTED');
-    expect(
-      policyRefusal({ ...all, repository: repositoryPolicy({ ...closed, accepted: true }) }),
-    ).toBe('POLICY_EXECUTION_DENIED');
-    expect(
-      policyRefusal({
-        ...all,
-        repository: repositoryPolicy({ ...closed, accepted: true, execution: 'approval' }),
-      }),
-    ).toBe('POLICY_APPROVAL_REQUIRED');
-    expect(
-      policyRefusal({
-        ...all,
-        repository: repositoryPolicy({ ...closed, accepted: true, execution: 'automatic' }),
-      }),
-    ).toBe('POLICY_ATTEMPTS_EXHAUSTED');
-    expect(
-      policyRefusal({
-        ...all,
-        repository: repositoryPolicy({ accepted: true, execution: 'automatic' }),
-      }),
-    ).toBe('POLICY_JOB_TOO_OLD');
+    for (const [opened, code] of order) {
+      expect(
+        policyRefusal({ ...all, repository: repositoryPolicy({ ...closed, ...opened }) }),
+      ).toBe(code);
+    }
   });
 });
