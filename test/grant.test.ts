@@ -6,6 +6,7 @@ import {
   GrantSchema,
   grantCapabilities,
   grantedTools,
+  grantNarrowing,
   intersectGrant,
   mintGrant,
   toolCapabilities,
@@ -176,6 +177,52 @@ describe('intersectGrant', () => {
     expect(effective.decision).toBe('approved');
     expect(effective.mintedAt).toBe(42);
     expect(effective.fingerprint).toBe(narrow.fingerprint);
+  });
+});
+
+describe('grantNarrowing', () => {
+  const wide = mintGrant(policy({ capabilities: everything, maxAttempts: 5 }), work, 0);
+  const narrow = mintGrant(policy({ maxAttempts: 2 }), work, 0);
+
+  it('names every capability current policy took, and the budgets it lowered', () => {
+    const taken = grantNarrowing(wide, narrow);
+
+    expect(taken?.withheld).toEqual([
+      'comment',
+      'issues',
+      'branches',
+      'pullRequests',
+      'merge',
+      'forcePush',
+      'deleteBranches',
+    ]);
+    expect(taken?.grantFingerprint).toBe(wide.fingerprint);
+    expect(taken?.policyFingerprint).toBe(narrow.fingerprint);
+    expect(taken?.maxAttempts).toBe(2);
+  });
+
+  // A fingerprint that merely differs is not a narrowing: policy may have
+  // widened, and recording that would say the job ran narrower than it did.
+  it('reports nothing where policy widened after the mint', () => {
+    expect(grantNarrowing(narrow, wide)).toBeUndefined();
+  });
+
+  it('reports nothing where policy has not moved', () => {
+    expect(grantNarrowing(wide, wide)).toBeUndefined();
+  });
+
+  // The capability set can be untouched while the run budget is not.
+  it('reports a lowered duration on its own', () => {
+    const shorter = mintGrant(
+      policy({ capabilities: everything, maxAttempts: 5, maxDurationMs: 60_000 }),
+      work,
+      0,
+    );
+    const taken = grantNarrowing(wide, shorter);
+
+    expect(taken?.withheld).toEqual([]);
+    expect(taken?.maxDurationMs).toBe(60_000);
+    expect(taken?.maxAttempts).toBeUndefined();
   });
 });
 

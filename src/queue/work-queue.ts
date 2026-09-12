@@ -4,7 +4,12 @@ import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Clock, Data, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
-import { type Grant, GrantSchema } from '../github/grant.ts';
+import {
+  type Grant,
+  type GrantNarrowing,
+  GrantNarrowingSchema,
+  GrantSchema,
+} from '../github/grant.ts';
 import { processAlive } from '../process-liveness.ts';
 import { type WorkItem, WorkItemSchema } from '../work-item.ts';
 
@@ -207,6 +212,12 @@ export type QueuedJob = {
    * ! daemon is rolled back past one. The worker refuses such a row.
    */
   readonly grantUnreadable?: true;
+  /**
+   * What policy as it stands took from that grant on the attempt that ran last.
+   * Absent where the tightening took nothing, and cleared by an attempt that a
+   * corrected policy no longer narrows.
+   */
+  readonly narrowing?: GrantNarrowing;
 };
 
 export type QueueCounts = Readonly<Record<JobStatus, number>>;
@@ -235,6 +246,7 @@ type JobRow = {
   readonly workerId?: string | null;
   readonly leaseExpiresAt?: number | null;
   readonly grant?: string | null;
+  readonly narrowing?: string | null;
 };
 
 type OutboxRow = {
@@ -327,7 +339,7 @@ const migrate = (database: Database) => {
   // every use — the v6 equality-guard failure, one version later. The
   // `installation_id` check is negative so a database predating its drop heals.
   if (
-    version.user_version === 14 &&
+    version.user_version === 15 &&
     hasColumn('daemon_owner', 'pid') &&
     deliveriesHaveSource() &&
     hasColumn('deliveries', 'lease_expires_at') &&
@@ -339,6 +351,7 @@ const migrate = (database: Database) => {
     hasColumn('jobs', 'question_id') &&
     hasColumn('jobs', 'question_answerers') &&
     hasColumn('jobs', 'grant') &&
+    hasColumn('jobs', 'narrowing') &&
     hasTable('notification_cursors') &&
     hasTable('poller_state') &&
     hasTable('subject_branches') &&
@@ -504,6 +517,12 @@ const migrate = (database: Database) => {
     if (!hasColumn('jobs', 'grant')) {
       database.exec('ALTER TABLE jobs ADD COLUMN grant TEXT');
     }
+    // Diagnostic, so the stamp stays at 15: an older daemon reading a row that
+    // carries this column loses a record it never rendered, and refusing to
+    // start would be the worse trade.
+    if (!hasColumn('jobs', 'narrowing')) {
+      database.exec('ALTER TABLE jobs ADD COLUMN narrowing TEXT');
+    }
     database.exec(`
       CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs(status, available_at, id);
       CREATE TABLE IF NOT EXISTS daemon_owner (
@@ -645,6 +664,16 @@ const grantOf = (stored: string | null | undefined): { grant?: Grant; grantUnrea
   }
 };
 
+/** Never throws, for the reason `grantOf` does not — and it records less. */
+const narrowingOf = (stored: string | null | undefined): { narrowing?: GrantNarrowing } => {
+  if (stored == null) return {};
+  try {
+    return { narrowing: Schema.decodeUnknownSync(GrantNarrowingSchema)(JSON.parse(stored)) };
+  } catch {
+    return {};
+  }
+};
+
 const decodeJob = (row: JobRow): QueuedJob => ({
   id: row.id,
   work: Schema.decodeUnknownSync(WorkItemSchema)(JSON.parse(row.payload)),
@@ -665,6 +694,7 @@ const decodeJob = (row: JobRow): QueuedJob => ({
   ...(row.workerId == null ? {} : { workerId: row.workerId }),
   ...(row.leaseExpiresAt == null ? {} : { leaseExpiresAt: row.leaseExpiresAt }),
   ...grantOf(row.grant),
+  ...narrowingOf(row.narrowing),
 });
 
 type OwnerRow = {
@@ -1361,7 +1391,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               const row = database
                 .query(
                   `SELECT id, payload, status, attempts, created_at AS createdAt,
-                      ready_at AS readyAt, grant
+                      ready_at AS readyAt, grant, narrowing
                FROM jobs
                WHERE status IN ('pending', 'retry', 'interrupted') AND available_at <= ?
                  AND question_id IS NULL
@@ -1465,6 +1495,40 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                  AND grant IS NULL`,
               )
               .run(JSON.stringify(grant), now, jobId, attemptNumber, workerId).changes === 1,
+        );
+      });
+
+    /**
+     * What the running attempt lost to a tightening, or `undefined` to clear a
+     * record a corrected policy has made false.
+     *
+     * Overwrites, where `recordGrant` refuses to: this describes the attempt in
+     * flight rather than the authorization, and the authorization it is read
+     * beside is the column that must not move.
+     */
+    const recordNarrowing = (
+      jobId: number,
+      attemptNumber: number,
+      workerId: string,
+      narrowing: GrantNarrowing | undefined,
+    ): Effect.Effect<boolean, QueueError> =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        return yield* attempt(
+          'record job narrowing',
+          () =>
+            database
+              .query(
+                `UPDATE jobs SET narrowing = ?, updated_at = ?
+               WHERE id = ? AND status = 'running' AND attempts = ? AND worker_id = ?`,
+              )
+              .run(
+                narrowing === undefined ? null : JSON.stringify(narrowing),
+                now,
+                jobId,
+                attemptNumber,
+                workerId,
+              ).changes === 1,
         );
       });
 
@@ -2086,7 +2150,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       attempt('list jobs', () => {
         const rows = database
           .query(
-            `SELECT id, payload, status, attempts, last_error AS lastError, grant,
+            `SELECT id, payload, status, attempts, last_error AS lastError, grant, narrowing,
                created_at AS createdAt, updated_at AS updatedAt,
                ready_at AS readyAt, outcome, hold_expires_at AS holdExpiresAt,
                question_id AS questionId, question_answerers AS questionAnswerers
@@ -2135,7 +2199,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       attempt('inspect job', () => {
         const row = database
           .query(
-            `SELECT id, payload, status, attempts, last_error AS lastError, grant,
+            `SELECT id, payload, status, attempts, last_error AS lastError, grant, narrowing,
                created_at AS createdAt, updated_at AS updatedAt,
                ready_at AS readyAt, outcome, hold_expires_at AS holdExpiresAt,
                question_id AS questionId, question_answerers AS questionAnswerers,
@@ -2360,6 +2424,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       claim,
       claimFor,
       recordGrant,
+      recordNarrowing,
       heartbeat,
       heartbeatDaemon,
       complete,

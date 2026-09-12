@@ -435,8 +435,87 @@ describe('Worker.runOnce grants', () => {
     // What the operator released, not what the daemon loaded afterwards.
     expect(result?.grant?.decision).toBe('approved');
     expect(result?.grant?.capabilities.comment).toBe(true);
-    // The tightening still bites on what actually ran.
+    // The tightening still bites on what actually ran, and now says so.
     expect(seen[0]?.capabilities.comment).toBe(false);
+    expect(result?.narrowing?.withheld).toEqual(['comment']);
+  });
+
+  // ! The partial tightening is the silent one. An empty ceiling is refused with
+  // ! a reason, and a ceiling lowered past what the job has spent refuses through
+  // ! `policyRefusal` — but revoking one capability of several just runs the job
+  // ! narrower, and before this the row said nothing about it.
+  it('records what a tightening withheld, and clears it once policy is corrected', async () => {
+    const repository: { capabilities: Capabilities } = { capabilities: readAndComment };
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        const minted = yield* queue.job(jobId);
+        repository.capabilities = readOnly;
+        yield* queue.retry(jobId, 0);
+        yield* worker.runOnce;
+        const narrowed = yield* queue.job(jobId);
+        // The record is only worth writing if the operator can read it back.
+        const shown = yield* (yield* ControlPlane).execute({
+          command: 'job.show',
+          args: [String(jobId)],
+        });
+        repository.capabilities = readAndComment;
+        yield* queue.retry(jobId, 0);
+        yield* worker.runOnce;
+        return { minted, narrowed, shown, restored: yield* queue.job(jobId) };
+      }),
+      () => Effect.succeed({ status: 'failed', summary: 'nope' }),
+      5,
+      true,
+      undefined,
+      { repository },
+    );
+
+    expect(result.minted?.narrowing).toBeUndefined();
+    expect(result.narrowed?.narrowing?.withheld).toEqual(['comment']);
+    expect(result.narrowed?.narrowing?.grantFingerprint).toBe(result.minted?.grant?.fingerprint);
+    expect(result.narrowed?.narrowing?.policyFingerprint).not.toBe(
+      result.narrowed?.narrowing?.grantFingerprint,
+    );
+    // The authorization itself never moves — only the record of what was taken.
+    expect(result.narrowed?.grant?.capabilities.comment).toBe(true);
+    // Beside the grant `job.show` already displays, which is the whole point.
+    expect(result.shown).toMatchObject({
+      grant: { capabilities: { comment: true } },
+      narrowing: { withheld: ['comment'] },
+    });
+    // A stale record would say the job ran narrower than it did.
+    expect(result.restored?.narrowing).toBeUndefined();
+  });
+
+  // A budget lowered under a running job is the same defect wearing a different
+  // field, and just as invisible.
+  it('records a budget current policy lowered, not only a capability it withheld', async () => {
+    const repository: { maxDurationMs: number } = { maxDurationMs: 600_000 };
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        repository.maxDurationMs = 60_000;
+        yield* queue.retry(jobId, 0);
+        yield* worker.runOnce;
+        return yield* queue.job(jobId);
+      }),
+      () => Effect.succeed({ status: 'failed', summary: 'nope' }),
+      5,
+      true,
+      undefined,
+      { repository },
+    );
+
+    expect(result?.narrowing?.withheld).toEqual([]);
+    expect(result?.narrowing?.maxDurationMs).toBe(60_000);
+    expect(result?.grant?.maxDurationMs).toBe(600_000);
   });
 
   // The gate reads the grant's ceiling, so a policy that raised `maxAttempts`

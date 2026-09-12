@@ -2,7 +2,7 @@ import { Clock, Effect, Exit, PartitionedSemaphore, Ref } from 'effect';
 import { LictorConfig } from './config.ts';
 import { AgentExecutor, ExecutorError } from './executor/agent-executor.ts';
 import { CredentialHealth } from './github/credential-health.ts';
-import { grantedTools, intersectGrant, mintGrant } from './github/grant.ts';
+import { grantedTools, grantNarrowing, intersectGrant, mintGrant } from './github/grant.ts';
 import { canonicalRepository, Policy, policyRefusal } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 import { RepositoryWorkspace, WorkspaceError } from './workspace/repository-workspace.ts';
@@ -155,15 +155,40 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
 
       if (job.grant === undefined) {
         yield* queue.recordGrant(job.id, job.attempts, job.workerId ?? queue.ownerId, live);
-      } else if (job.grant.fingerprint !== live.fingerprint) {
-        yield* Effect.logWarning('Running under a grant older than current policy').pipe(
-          Effect.annotateLogs({
-            job: job.id,
-            attempt: job.attempts,
-            grantFingerprint: job.grant.fingerprint,
-            policyFingerprint: live.fingerprint,
-          }),
-        );
+      } else {
+        // A tightening that leaves the job *some* capability is the only one
+        // nothing else reports: an empty one is refused above, and a ceiling
+        // lowered past what the job has spent refuses through `policyRefusal`.
+        // So the row carries it, for `job.show` to render after the fact.
+        const narrowing = grantNarrowing(job.grant, live);
+        if (narrowing !== undefined || job.narrowing !== undefined) {
+          yield* queue.recordNarrowing(
+            job.id,
+            job.attempts,
+            job.workerId ?? queue.ownerId,
+            narrowing,
+          );
+        }
+        if (narrowing !== undefined) {
+          yield* Effect.logWarning('Running under a grant narrowed by current policy').pipe(
+            Effect.annotateLogs({
+              job: job.id,
+              attempt: job.attempts,
+              grantFingerprint: narrowing.grantFingerprint,
+              policyFingerprint: narrowing.policyFingerprint,
+              withheld: narrowing.withheld.join(','),
+            }),
+          );
+        } else if (job.grant.fingerprint !== live.fingerprint) {
+          yield* Effect.logWarning('Running under a grant older than current policy').pipe(
+            Effect.annotateLogs({
+              job: job.id,
+              attempt: job.attempts,
+              grantFingerprint: job.grant.fingerprint,
+              policyFingerprint: live.fingerprint,
+            }),
+          );
+        }
       }
 
       // Parking spends no attempt but restores none, so a question asked with

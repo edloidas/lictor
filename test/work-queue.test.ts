@@ -2341,6 +2341,54 @@ describe('WorkQueue', () => {
     }
   });
 
+  // The case the presence checks exist for, and the one the stamp cannot catch:
+  // `narrowing` ships without a version bump, so a database already carrying the
+  // current stamp is exactly where it is missing. Miss it in the guard and the
+  // fast path returns before the ALTER, and every statement naming the column
+  // dies afterwards.
+  it('adds the narrowing column to a database already carrying the current stamp', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-narrowing-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* queue.enqueue(work('carried'));
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+      const stripped = new Database(path);
+      stripped.exec('ALTER TABLE jobs DROP COLUMN narrowing');
+      stripped.close();
+
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            return yield* queue.job(1);
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(result?.work.deliveryId).toBe('carried');
+      expect(result?.narrowing).toBeUndefined();
+      const repaired = new Database(path);
+      const columns = (repaired.query('PRAGMA table_info(jobs)').all() as { name: string }[]).map(
+        (column) => column.name,
+      );
+      const stamp = (repaired.query('PRAGMA user_version').get() as { user_version: number })
+        .user_version;
+      repaired.close();
+
+      expect(columns).toContain('narrowing');
+      // Diagnostic column, so a daemon rolled back past it still starts.
+      expect(stamp).toBe(15);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('refuses a database created by a newer queue schema', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');

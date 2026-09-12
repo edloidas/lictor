@@ -114,6 +114,46 @@ export const GrantSchema: Schema.Schema<Grant> = Schema.Struct({
   fingerprint: Schema.String,
 });
 
+const capabilityKeys = [
+  'read',
+  'comment',
+  'issues',
+  'branches',
+  'pullRequests',
+  'merge',
+  'forcePush',
+  'deleteBranches',
+] as const satisfies readonly (keyof GrantCapabilities)[];
+
+/**
+ * What a policy tightened since the mint took from a job that still holds the
+ * wider grant.
+ *
+ * Diagnostic only, like the fingerprint — the intersection is what enforces.
+ * It exists because the partial case is otherwise silent: withdrawing every
+ * capability refuses the job with a reason, and lowering the attempt ceiling
+ * past what it has spent refuses it through `policyRefusal`, but revoking one
+ * capability of several just runs the job narrower with nothing on the row.
+ */
+export type GrantNarrowing = {
+  /** The policy the grant records, as the mint fingerprinted it. */
+  readonly grantFingerprint: string;
+  /** Policy as it stood when the job ran. */
+  readonly policyFingerprint: string;
+  readonly withheld: readonly (typeof capabilityKeys)[number][];
+  /** Each present only where current policy lowered the recorded budget. */
+  readonly maxAttempts?: number;
+  readonly maxDurationMs?: number;
+};
+
+export const GrantNarrowingSchema: Schema.Schema<GrantNarrowing> = Schema.Struct({
+  grantFingerprint: Schema.String,
+  policyFingerprint: Schema.String,
+  withheld: Schema.Array(Schema.Literal(...capabilityKeys)),
+  maxAttempts: Schema.optionalWith(Schema.Number, { exact: true }),
+  maxDurationMs: Schema.optionalWith(Schema.Number, { exact: true }),
+});
+
 /** Fixed key order, so the fingerprint is stable without a canonicalizer. */
 export const grantCapabilities = (capabilities: Capabilities): GrantCapabilities => ({
   read: capabilities.read === true,
@@ -176,6 +216,29 @@ export const intersectGrant = (stored: Grant, live: Grant): Grant => ({
   maxAttempts: Math.min(stored.maxAttempts, live.maxAttempts),
   maxDurationMs: Math.min(stored.maxDurationMs, live.maxDurationMs),
 });
+
+/**
+ * What the intersection takes, or `undefined` where it takes nothing. A
+ * fingerprint that merely differs is not a narrowing: policy may have widened,
+ * or moved a field the grant does not record.
+ */
+export const grantNarrowing = (stored: Grant, live: Grant): GrantNarrowing | undefined => {
+  const effective = intersectGrant(stored, live);
+  const withheld = capabilityKeys.filter(
+    (capability) => stored.capabilities[capability] && !effective.capabilities[capability],
+  );
+  const attempts = effective.maxAttempts < stored.maxAttempts ? effective.maxAttempts : undefined;
+  const duration =
+    effective.maxDurationMs < stored.maxDurationMs ? effective.maxDurationMs : undefined;
+  if (withheld.length === 0 && attempts === undefined && duration === undefined) return undefined;
+  return {
+    grantFingerprint: stored.fingerprint,
+    policyFingerprint: live.fingerprint,
+    withheld,
+    ...(attempts === undefined ? {} : { maxAttempts: attempts }),
+    ...(duration === undefined ? {} : { maxDurationMs: duration }),
+  };
+};
 
 // Escalation is `merge`, `forcePush`, `deleteBranches`; only `merge` is a `ToolCapability`.
 const withheldOnContinuation = (capability: ToolCapability): boolean => capability === 'merge';
