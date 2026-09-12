@@ -220,8 +220,12 @@ describe('OutboxWorker', () => {
       status: 'delivered',
       commentUrl: 'https://github.com/c/1',
     });
-    expect(result.bodies[0]).toContain('Opened the pull request.');
+    expect(result.bodies[0]).toContain('Done.');
     expect(result.bodies[0]).toContain(result.marker);
+    // The fixture carries a note, and a `completed` outcome does not publish
+    // one — asserted through the delivered body, not the renderer, so the whole
+    // path is pinned rather than the one function that decides it.
+    expect(result.bodies[0]).not.toContain('Opened the pull request.');
   });
 
   it('records the outcome locally and posts nothing when policy forbids commenting', async () => {

@@ -32,11 +32,13 @@ const headline: Readonly<Record<JobOutcome, string>> = {
 const NOTE_BOUND_BYTES = 500;
 
 /**
- * The agent's own contribution, reduced to one line of quotable prose.
+ * The agent's own contribution, reduced to one line of prose.
  *
- * Bounding and attribution are what this can promise. They do not make
- * arbitrary agent text safe — it is prose the repository influenced — so it is
- * published as a quotation from the agent rather than as the daemon's words.
+ * Bounding is what this can promise. It does not make arbitrary agent text
+ * safe — it is prose the repository influenced, and it is published in the
+ * daemon's own message with nothing marking where it starts. The collapse is
+ * load-bearing for that: a note that kept its newlines could open headings and
+ * lists, and restructure the comment around itself.
  */
 const publicNote = (note: string): string | undefined => {
   // ! Before the marker is appended, and repeated to a fixed point. One pass is
@@ -61,26 +63,24 @@ const publicNote = (note: string): string | undefined => {
 /**
  * The public comment for one terminal outcome.
  *
- * An outcome with no agent note is one the daemon reached on its own — a
- * timeout, a crash, a policy refusal, an expiry. Those carry no explanation at
- * all rather than an excerpt of a diagnostic: the strings the daemon holds on
- * those paths are error prose and capability codes, and a thread is not where
- * either belongs.
+ * One message, and for every outcome but `needs_input` the opening line is all
+ * of it. That covers the paths the daemon reached on its own — a timeout, a
+ * crash, a policy refusal, an expiry — where the only strings it holds are
+ * error prose and capability codes, and a thread is not where either belongs.
  */
 export const renderOutcome = (message: OutboxMessage): string => {
   const note = message.note === undefined ? undefined : publicNote(message.note);
-  // Every other outcome stands on its headline alone. `needs_input` cannot: its
-  // headline promises a question, and the agent is free to return the status
-  // with nothing in `summary` — so a thread would be told to answer something
-  // the comment never asked.
+  // `needs_input` is the one outcome that publishes the note, because there the
+  // note is the question the headline promises and a thread cannot answer one it
+  // cannot read. The agent is free to return the status with nothing in
+  // `summary`, which is what the replacement opening covers.
+  const asksForInput = message.outcome === 'needs_input';
   const lines = [
-    message.outcome === 'needs_input' && note === undefined
+    asksForInput && note === undefined
       ? 'I need an answer before I can continue, but did not say what I need.'
       : headline[message.outcome],
   ];
-  if (note !== undefined) {
-    lines.push('', `> ${note}`, '', "*Quoted above is the agent's own summary, not Lictor's.*");
-  }
+  if (asksForInput && note !== undefined) lines.push('', note);
   lines.push('', outcomeMarker(message.messageId));
   return lines.join('\n');
 };

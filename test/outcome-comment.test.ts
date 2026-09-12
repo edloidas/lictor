@@ -67,20 +67,37 @@ describe('renderOutcome', () => {
 
   it('cannot be made to open an HTML comment by splicing the strip', () => {
     // One strip pass turns `<-->!--` into `<!--`, and an unclosed one hides the
-    // attribution line and the marker after it when GitHub renders the comment.
-    const body = renderOutcome(message({ messageId: 'real', note: 'quiet <-->!-- swallow' }));
-    const quoted = body.split('\n').find((line) => line.startsWith('> ')) ?? '';
+    // marker after it when GitHub renders the comment. On `needs_input`, the
+    // one outcome that still publishes a note and so the only one that reaches
+    // the strip at all.
+    const body = renderOutcome(
+      message({ messageId: 'real', outcome: 'needs_input', note: 'quiet <-->!-- swallow' }),
+    );
 
-    expect(quoted).not.toContain('<!--');
+    expect(body).toContain('quiet swallow');
     expect(body.match(/<!--/gu)).toHaveLength(1);
-    expect(body).toContain("*Quoted above is the agent's own summary, not Lictor's.*");
+    expect(body).toContain('<!-- lictor:real -->');
   });
 
-  it('quotes the agent note and says whose words they are', () => {
-    const body = renderOutcome(message({ outcome: 'needs_input', note: 'Which branch?' }));
+  it('publishes the question inline so the thread can answer it', () => {
+    const body = renderOutcome(
+      message({ messageId: 'ask', outcome: 'needs_input', note: 'Which branch?' }),
+    );
 
-    expect(body).toContain('> Which branch?');
-    expect(body).toContain("the agent's own summary");
+    expect(body).toBe(
+      'I need an answer before I can continue.\n\nWhich branch?\n\n<!-- lictor:ask -->',
+    );
+  });
+
+  // The note is the agent's, and nothing in the rendered comment separates it
+  // from the daemon's own wording — so an outcome that is not asking a question
+  // must not reach it. `completed` is the one an agent always supplies a
+  // summary for, which makes it the case that would regress.
+  it('publishes no agent note on an outcome that is not asking for input', () => {
+    const body = renderOutcome(message({ outcome: 'completed', note: 'I rewrote the parser.' }));
+
+    expect(body).toBe('Done.\n\n<!-- lictor:aa11bb22 -->');
+    expect(body).not.toContain('I rewrote the parser.');
   });
 
   it('publishes nothing at all for an outcome the daemon reached on its own', () => {
@@ -89,25 +106,30 @@ describe('renderOutcome', () => {
     expect(body).toBe('This did not finish.\n\n<!-- lictor:aa11bb22 -->');
   });
 
-  it('collapses a multi-line note onto one quoted line', () => {
-    const body = renderOutcome(message({ note: 'First line.\n\n# A heading\n- a list item' }));
+  // ! Published into the daemon's own message, so a note that kept its newlines
+  // ! could open a heading or a list and restructure the comment around itself.
+  it('collapses a multi-line note onto one line', () => {
+    const body = renderOutcome(
+      message({ outcome: 'needs_input', note: 'First line.\n\n# A heading\n- a list item' }),
+    );
 
-    expect(body).toContain('> First line. # A heading - a list item');
-    expect(body.split('\n').filter((line) => line.startsWith('>'))).toHaveLength(1);
+    expect(body).toContain('First line. # A heading - a list item');
+    expect(body.split('\n')).toHaveLength(5);
   });
 
   it('bounds the note to its first 500 bytes', () => {
-    const note = `${'x'.repeat(600)}TAIL`;
-    const quoted = renderOutcome(message({ note }))
-      .split('\n')
-      .find((line) => line.startsWith('> '));
+    const body = renderOutcome(message({ outcome: 'needs_input', note: `${'x'.repeat(600)}TAIL` }));
 
-    expect(quoted).toBe(`> ${'x'.repeat(500)}`);
+    expect(body).toContain('x'.repeat(500));
+    expect(body).not.toContain('TAIL');
+    expect(body).not.toContain('x'.repeat(501));
   });
 
   it('strips comment delimiters from the note before the marker is appended', () => {
     const forged = 'done <!-- lictor:forged --> more';
-    const body = renderOutcome(message({ messageId: 'real', note: forged }));
+    const body = renderOutcome(
+      message({ messageId: 'real', outcome: 'needs_input', note: forged }),
+    );
 
     expect(body).not.toContain('lictor:forged -->');
     expect(body).toContain('<!-- lictor:real -->');
@@ -116,14 +138,17 @@ describe('renderOutcome', () => {
   });
 
   it('treats a note that is only whitespace as no note', () => {
-    expect(renderOutcome(message({ note: '   \n\t ' }))).toBe('Done.\n\n<!-- lictor:aa11bb22 -->');
+    expect(renderOutcome(message({ outcome: 'needs_input', note: '   \n\t ' }))).toBe(
+      'I need an answer before I can continue, but did not say what I need.\n\n<!-- lictor:aa11bb22 -->',
+    );
   });
 
-  // ! The attribution line is appended to any note, so a daemon-authored one
-  // ! would be published as the agent's words. A clipped question carries its
-  // ! wording in the headline and is written with no note at all, and this is
-  // ! what pins that: it asks a whole question and credits nobody but Lictor.
-  it('asks the clipped question without crediting it to the agent', () => {
+  // ! A clipped request is the daemon asking its own question, and `needs_input`
+  // ! is the only outcome whose note is published. Were `clipped` ever to route
+  // ! its wording through the note instead of the headline, it would go out on a
+  // ! path that publishes nothing, and the thread would be told to reply with no
+  // ! question in front of it.
+  it('asks the clipped question from the headline, not the note', () => {
     expect(renderOutcome(message({ outcome: 'clipped' }))).toBe(
       `${openings.clipped}\n\n<!-- lictor:aa11bb22 -->`,
     );
