@@ -111,10 +111,13 @@ the database.
 
 Every outcome that finishes a job also owes the thread a comment, and `Posted the
 outcome to the thread` is where that lands. The comment is rendered from a fixed
-template: the daemon writes the opening line, and the agent's own summary is
-quoted beneath it and attributed to the agent. An outcome the daemon reached on
-its own — a timeout, a crash, an expiry, a policy refusal — carries no quotation
-at all, because the only text available on those paths is a diagnostic. Where the
+template and arrives as a single message: for most outcomes the daemon's opening
+line is the whole of it. The one exception is a job that stops to ask something,
+where the agent's question follows the opening line in the same message — the
+thread cannot answer a question it was never shown. Nothing else the agent wrote
+is republished, and an outcome the daemon reached on its own — a timeout, a
+crash, an expiry, a policy refusal — carries nothing but its opening line,
+because the only text available on those paths is a diagnostic. Where the
 repository policy withholds `comment`, the outcome is kept locally and logged as
 `Outcome cannot be posted; policy forbids commenting` instead.
 
