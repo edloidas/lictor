@@ -658,13 +658,22 @@ const ownerIsGone = (owner: OwnerRow, now: number): boolean => {
   // ! proof of absence. Only the grace may settle it, or the one daemon still
   // ! running the old code is displaced mid-job during the upgrade.
   if (owner.pid === null) return now - owner.expiresAt > DAEMON_TAKEOVER_GRACE_MS;
-  // Our own number cannot belong to another live process: either this process
-  // wrote the row, or a dead daemon's number was reassigned to us. Only
-  // consulted once the lease has lapsed, so a reload inside the lease window is
-  // refused exactly as it was before.
-  if (owner.pid === process.pid) return true;
   if (!processAlive(owner.pid)) return true;
   return now - owner.expiresAt > DAEMON_TAKEOVER_GRACE_MS;
+};
+
+/**
+ * Whether an existing row denies this process the database.
+ *
+ * A row naming our own pid cannot belong to another live process — either this
+ * process wrote it, or a dead daemon's number was reassigned here. That test
+ * sits ahead of the lease rather than inside `ownerIsGone`: a `bun --watch`
+ * reload keeps the pid and runs no finalizer, so behind the lease it refuses
+ * against its own row.
+ */
+const ownerDeniesClaim = (owner: OwnerRow, now: number): boolean => {
+  if (owner.pid === process.pid) return false;
+  return owner.expiresAt >= now || !ownerIsGone(owner, now);
 };
 
 const ownershipRefusal = (owner: OwnerRow, now: number): string =>
@@ -690,10 +699,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               )
               .get() as OwnerRow | null,
         );
-        if (
-          owner !== null &&
-          (owner.expiresAt >= startupTime || !ownerIsGone(owner, startupTime))
-        ) {
+        if (owner !== null && ownerDeniesClaim(owner, startupTime)) {
           // Logged as well as failed: `QueueError` carries no message, so a
           // described cause names the statement and never the daemon holding
           // the directory — the one thing the operator has to act on.
@@ -711,11 +717,20 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                ON CONFLICT(singleton) DO UPDATE SET owner_id = excluded.owner_id,
                  heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at,
                  pid = excluded.pid
-               WHERE daemon_owner.expires_at < ?`,
+               WHERE daemon_owner.expires_at < ? OR daemon_owner.pid = ?`,
             )
-            .run(ownerId, startupTime, startupTime + DAEMON_LEASE_MS, process.pid, startupTime);
+            .run(
+              ownerId,
+              startupTime,
+              startupTime + DAEMON_LEASE_MS,
+              process.pid,
+              startupTime,
+              process.pid,
+            );
           // The predicate decides, not the read above: two starters that both
           // find the owner gone reach here, and only one matches a lapsed lease.
+          // The pid arm does not widen that — two starters are two processes,
+          // so only one of them can match its own number.
           if (result.changes !== 1)
             throw new Error('Another Lictor daemon claimed this database first');
         });
