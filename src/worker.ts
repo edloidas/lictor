@@ -53,6 +53,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       // Measured from the claim, not the child spawn, so clone and cleanup
       // count toward every outcome's duration.
       const claimedAt = yield* Clock.currentTimeMillis;
+      const deliveryContext = job.work.context === undefined ? {} : { context: job.work.context };
 
       const keepLease = Effect.forever(
         Effect.sleep('1 second').pipe(
@@ -91,6 +92,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
           repository: job.work.repository,
           subjectNumber: job.work.subject.number,
           outcome: 'rejected',
+          ...deliveryContext,
         });
         yield* Effect.logError('Refused queued work carrying an unreadable grant').pipe(
           Effect.annotateLogs({
@@ -117,6 +119,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
           repository: job.work.repository,
           subjectNumber: job.work.subject.number,
           outcome: 'failed',
+          ...deliveryContext,
         });
         yield* Effect.logWarning('Dropped queued work denied by policy').pipe(
           Effect.annotateLogs({
@@ -133,8 +136,6 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       // on the thread. Denied before `recordGrant`: an empty ceiling once
       // written is never overwritten, and correcting the policy could not
       // release the row.
-      // ! The reason stays out of `note`, which publishes as a quotation
-      // ! attributed to an agent that never ran.
       if (grantedTools(grant.capabilities, job.work.continuation === true).length === 0) {
         const deniedAt = yield* Clock.currentTimeMillis;
         const reason = 'Repository policy leaves this job no capability to act with';
@@ -142,6 +143,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
           repository: job.work.repository,
           subjectNumber: job.work.subject.number,
           outcome: 'rejected',
+          ...deliveryContext,
         });
         yield* Effect.logWarning('Denied queued work left without any capability').pipe(
           Effect.annotateLogs({
@@ -193,48 +195,26 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
 
       // Parking spends no attempt but restores none, so a question asked with
       // the budget already gone parks a row the next claim dead-letters on
-      // sight — the thread would read: I need an answer, answered, this did
-      // not finish. Finish now and say so instead.
+      // sight: answered, and then refused. Finish now and say so instead.
       const attemptsLeft = job.attempts < Math.min(grant.maxAttempts, config.workerMaxAttempts);
 
       // ! Before the workspace is acquired, so a request the record could not
       // ! hold never reaches the agent at all. Truncated instructions read as
       // ! whole ones, and the cut part is precisely what nothing downstream can
-      // ! weigh the absence of. Asked once: a resumed job carries an answer and
-      // ! runs on it, or this would re-ask every claim and never progress.
-      if (job.work.trigger?.clipped === true && job.work.answerUrl === undefined) {
+      // ! weigh the absence of.
+      if (job.work.trigger?.clipped === true) {
         const clippedAt = yield* Clock.currentTimeMillis;
         const reason = 'Request exceeded the recordable bound; refused to act on part of it';
-        if (attemptsLeft) {
-          yield* queue.park({
-            jobId: job.id,
-            attemptNumber: job.attempts,
-            repository: job.work.repository,
-            subjectNumber: job.work.subject.number,
-            question: reason,
-            answerers: answerersFor(
-              job.work.sender,
-              repositoryPolicy.trustedSenders,
-              config.expectedLogin,
-            ),
-            expiresAt: clippedAt + policy.answerExpiryMs,
-            outcome: 'clipped',
-          });
-        } else {
-          // No attempt left to ask with. `rejected` is the honest outcome: the
-          // daemon decided not to carry this out, and the reason stays in the
-          // row rather than on the thread.
-          yield* queue.fail(job.id, job.attempts, reason, undefined, 'rejected', {
-            repository: job.work.repository,
-            subjectNumber: job.work.subject.number,
-            outcome: 'rejected',
-          });
-        }
+        yield* queue.fail(job.id, job.attempts, reason, undefined, 'clipped', {
+          repository: job.work.repository,
+          subjectNumber: job.work.subject.number,
+          outcome: 'clipped',
+          ...deliveryContext,
+        });
         yield* Effect.logWarning('Refused queued work recorded from a clipped request').pipe(
           Effect.annotateLogs({
             job: job.id,
             attempt: job.attempts,
-            asked: attemptsLeft,
             durationMs: clippedAt - claimedAt,
           }),
         );
@@ -329,6 +309,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
             subjectNumber: job.work.subject.number,
             outcome: 'completed',
             note: result.right.summary,
+            ...deliveryContext,
           });
           yield* Effect.logInfo('Completed queued work').pipe(
             Effect.annotateLogs({
@@ -340,7 +321,15 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
           );
           return true;
         }
-        if (result.right.status === 'needs_input' && attemptsLeft) {
+        // ! Parked only where the agent actually published its question: the
+        // ! daemon sends nothing, so an unpublished one would sit invisible on
+        // ! the thread and swallow the next trusted reply as its answer —
+        // ! resuming this job on input meant as new work.
+        const askedAt =
+          result.right.status === 'needs_input'
+            ? yield* queue.lastCommentAt(job.id, job.work.subject.number, claimedAt)
+            : undefined;
+        if (result.right.status === 'needs_input' && attemptsLeft && askedAt !== undefined) {
           const answerers = answerersFor(
             job.work.sender,
             repositoryPolicy.trustedSenders,
@@ -353,6 +342,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
             subjectNumber: job.work.subject.number,
             question: result.right.summary,
             answerers,
+            askedAt,
             expiresAt: finishedAt + policy.answerExpiryMs,
           });
           yield* Effect.logInfo('Parked queued work pending an answer').pipe(
@@ -372,22 +362,20 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         // ! branch below with `retryable` computed from evidence. `failed` here
         // ! is only the agent's opinion of a run whose input the next attempt
         // ! would reproduce byte for byte, and scheduling one costs the thread
-        // ! its answer: `queue.fail` withholds the outbox row until an attempt
-        // ! is final, so a mislabelled capability denial used to buy silence for
-        // ! the whole budget instead of the explanation the agent had in hand.
-        yield* queue.fail(
-          job.id,
-          job.attempts,
-          result.right.summary,
-          undefined,
-          result.right.status,
-          {
-            repository: job.work.repository,
-            subjectNumber: job.work.subject.number,
-            outcome: result.right.status,
-            note: result.right.summary,
-          },
-        );
+        // ! its signal: `queue.fail` withholds the outbox row until an attempt
+        // ! is final, so a mislabelled capability denial leaves the
+        // ! acknowledgement unresolved for the whole budget.
+        //
+        // A `needs_input` reaching here was never published, or has no attempt
+        // left to answer it with. Either way nothing is waiting on it.
+        const outcome = result.right.status === 'needs_input' ? 'rejected' : result.right.status;
+        yield* queue.fail(job.id, job.attempts, result.right.summary, undefined, outcome, {
+          repository: job.work.repository,
+          subjectNumber: job.work.subject.number,
+          outcome,
+          note: result.right.summary,
+          ...deliveryContext,
+        });
         // `summary` is parsed out of Codex stdout and stays in the database:
         // logging it would echo whatever the repository made the agent say.
         yield* Effect.logWarning('Queued work did not complete').pipe(
@@ -412,6 +400,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         repository: job.work.repository,
         subjectNumber: job.work.subject.number,
         outcome: 'failed',
+        ...deliveryContext,
       });
       yield* Effect.logWarning(retry ? 'Queued work will retry' : 'Queued work failed').pipe(
         Effect.annotateLogs({

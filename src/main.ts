@@ -185,9 +185,9 @@ const Application = Layer.merge(
             Effect.all([
               Effect.forkScoped(supervised('worker', 'never', worker.run)),
               Effect.forkScoped(supervised('delivery worker', 'never', deliveryWorker.run)),
-              // ! Behind the same gate as the rest: this loop comments as the
-              // ! account, and posting before `GET /user` agrees on who owns the
-              // ! token writes an outcome into a stranger's thread.
+              // ! Behind the same gate as the rest: this loop reacts as the
+              // ! account, and signalling before `GET /user` agrees on who owns
+              // ! the token marks a stranger's thread.
               Effect.forkScoped(supervised('outbox worker', 'never', outboxWorker.run)),
               // ! The poller marks threads read — destructive and irreversible.
               // ! Doing that before `GET /user` agrees on the credential can

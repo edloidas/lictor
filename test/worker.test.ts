@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'bun:test';
-import { Effect, Layer, Logger, type LogLevel, Redacted, TestClock, TestContext } from 'effect';
+import {
+  Effect,
+  Layer,
+  Logger,
+  type LogLevel,
+  Redacted,
+  Runtime,
+  TestClock,
+  TestContext,
+} from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { ControlPlane } from '../src/control/control-plane.ts';
 import { AgentExecutor, ExecutorError } from '../src/executor/agent-executor.ts';
@@ -104,6 +113,30 @@ type PolicyOverrides = {
   readonly maxJobAgeMs?: number;
   readonly repository?: Partial<RepositoryPolicy>;
 };
+
+/**
+ * The agent publishing its question before returning it, which is what the
+ * prompt requires and the only thing that makes a parked question visible.
+ *
+ * Driven through a captured runtime because the executor stub runs inside the
+ * worker's own fiber, where the test has no other way to reach the queue.
+ */
+const publishing = (queue: InstanceType<typeof WorkQueue>, jobId: number) =>
+  Effect.map(
+    Effect.runtime<never>(),
+    (runtime) => () =>
+      Runtime.runSync(runtime)(
+        Effect.ignore(
+          queue.recordAudit({
+            jobId,
+            repository: 'edloidas/lictor',
+            capability: 'create_comment',
+            input: JSON.stringify({ number: 17, body: 'which branch?' }),
+            outcome: 'ok',
+          }),
+        ),
+      ),
+  );
 
 const run = <A, E>(
   effect: Effect.Effect<A, E, Worker | WorkQueue | CredentialHealth | ControlPlane>,
@@ -325,8 +358,8 @@ describe('Worker.runOnce grants', () => {
 
     expect(ran).toBe(false);
     expect(result.job?.outcome).toBe('rejected');
-    // ! The reason is the daemon's, and `note` publishes as a quotation
-    // ! attributed to the agent — which never ran.
+    // The reason is the daemon's, and `note` carries `ExecutorResult.summary`
+    // and nothing else — here there was no agent run to summarise.
     expect(result.messages[0]?.note).toBeUndefined();
     // Nothing recorded: `recordGrant` never overwrites, so an empty grant stored
     // here could never be released by correcting the policy.
@@ -640,32 +673,55 @@ describe('Worker.runOnce', () => {
     });
   });
 
-  it("owes the thread the agent's own words on a question", async () => {
+  it('owes the thread nothing for a question the agent published itself', async () => {
+    let publish: () => void = () => undefined;
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        publish = yield* publishing(queue, jobId);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return { job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
+      }),
+      () => {
+        publish();
+        return Effect.succeed({ status: 'needs_input', summary: 'which branch?' });
+      },
+      3,
+    );
+
+    // Parked, and silent: the agent's own comment is the question.
+    expect(result.job?.status).toBe('pending');
+    expect(result.job?.questionId).toBeString();
+    expect(result.messages).toEqual([]);
+  });
+
+  it('refuses to park a question the agent never published', async () => {
+    // A parked job consumes the next trusted reply on its thread as the answer.
+    // Arming that for a question nobody was shown swallows unrelated work, so
+    // an unpublished question is terminal instead.
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
         const { jobId } = yield* queue.enqueue(work);
         const worker = yield* Worker;
         yield* worker.runOnce;
-        return yield* queue.outboxFor(jobId);
+        return { job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
       }),
       () => Effect.succeed({ status: 'needs_input', summary: 'which branch?' }),
       3,
     );
 
-    expect(result).toHaveLength(1);
-    expect(result[0]).toMatchObject({
-      outcome: 'needs_input',
-      note: 'which branch?',
-      repository: 'edloidas/lictor',
-      subjectNumber: 17,
-    });
+    expect(result.job?.status).toBe('failed');
+    expect(result.job?.questionId).toBeUndefined();
+    expect(result.messages.map((message) => message.outcome)).toEqual(['rejected']);
   });
 
   it('owes the thread an outcome with no note when the executor itself failed', async () => {
-    // ! The message the worker holds here is Codex's own stderr diagnosis, or
-    // ! git's. Publishing it is how a repository gets its prose onto a thread
-    // ! under the daemon's account.
+    // The message the worker holds here is Codex's own stderr diagnosis, or
+    // git's — whatever the repository made it say. It stays a diagnostic and
+    // never becomes the outcome's `note`.
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
@@ -768,6 +824,7 @@ describe('Worker.runOnce', () => {
   });
 
   it('parks a question instead of finishing it, and does not re-ask unprompted', async () => {
+    let publish: () => void = () => undefined;
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
@@ -775,6 +832,7 @@ describe('Worker.runOnce', () => {
         // is the union of the two, normalized, and a fixture where they agree
         // cannot tell that from either half alone.
         const { jobId } = yield* queue.enqueue({ ...work, sender: 'Stranger' });
+        publish = yield* publishing(queue, jobId);
         const worker = yield* Worker;
         yield* worker.runOnce;
         return {
@@ -783,7 +841,10 @@ describe('Worker.runOnce', () => {
           counts: yield* queue.counts,
         };
       }),
-      () => Effect.succeed({ status: 'needs_input', summary: 'which branch?' }),
+      () => {
+        publish();
+        return Effect.succeed({ status: 'needs_input', summary: 'which branch?' });
+      },
       3,
       true,
       undefined,
@@ -809,33 +870,39 @@ describe('Worker.runOnce', () => {
     // Parking spends no attempt and restores none, so asking on the last one
     // parks a row the next claim dead-letters. The thread would read: I need an
     // answer — answered — this did not finish.
+    let publish: () => void = () => undefined;
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
         const { jobId } = yield* queue.enqueue(work);
+        publish = yield* publishing(queue, jobId);
         yield* (yield* Worker).runOnce;
         return { job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
       }),
-      () => Effect.succeed({ status: 'needs_input', summary: 'which branch?' }),
+      () => {
+        publish();
+        return Effect.succeed({ status: 'needs_input', summary: 'which branch?' });
+      },
       1,
     );
 
     expect(result.job?.questionId).toBeUndefined();
     expect(result.job?.status).toBe('failed');
-    expect(result.job?.outcome).toBe('needs_input');
-    // The question still reaches the thread — it just carries no promise that
-    // an answer will be acted on.
-    expect(result.messages.map((message) => message.outcome)).toEqual(['needs_input']);
+    // `rejected`, not `needs_input`: nothing is waiting on it, and the thread
+    // is told so by the same reaction every other refusal gets.
+    expect(result.job?.outcome).toBe('rejected');
+    expect(result.messages.map((message) => message.outcome)).toEqual(['rejected']);
   });
 
-  it('rolls the question message back when the park is fenced out', async () => {
-    // The park writes the question and the message in one transaction. A write
-    // that loses its fence must take the message with it — a question posted to
-    // a thread where no job is waiting can never be answered.
+  it('leaves the job untouched when the park is fenced out', async () => {
+    // A park that loses its fence must write nothing. `question_id` is what the
+    // claim skips on and what an answer is matched against, so a half-applied
+    // park would hold a job nobody can resume.
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
         const { jobId } = yield* queue.enqueue(work);
+        const before = yield* queue.job(jobId);
         const parked = yield* Effect.either(
           queue.park({
             jobId,
@@ -844,17 +911,21 @@ describe('Worker.runOnce', () => {
             subjectNumber: work.subject.number,
             question: 'which branch?',
             answerers: ['edloidas'],
+            askedAt: Date.now(),
             expiresAt: 1_000_000,
           }),
         );
-        return { parked, outbox: yield* queue.outboxFor(jobId), job: yield* queue.job(jobId) };
+        return { parked, before, job: yield* queue.job(jobId) };
       }),
       () => Effect.succeed({ status: 'completed', summary: 'done' }),
     );
 
     expect(result.parked._tag).toBe('Left');
-    expect(result.outbox).toHaveLength(0);
     expect(result.job?.questionId).toBeUndefined();
+    expect(result.job?.questionAnswerers).toBeUndefined();
+    // Nothing moved: the same row the fence found, not one partly rewritten.
+    expect(result.job?.status).toBe(result.before?.status);
+    expect(result.job?.holdExpiresAt).toBe(result.before?.holdExpiresAt);
   });
 
   it('runs a job approved after the runnable age limit instead of refusing it', async () => {
@@ -1292,8 +1363,19 @@ describe('Worker.runOnce observability', () => {
   });
 
   it('reports a job parked on the question the agent asked', async () => {
-    const { logs } = await observe(() =>
-      Effect.succeed({ status: 'needs_input', summary: 'which branch?' }),
+    let publish: () => void = () => undefined;
+    const logs: LogLine[] = [];
+    await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        publish = yield* publishing(queue, jobId);
+        yield* (yield* Worker).runOnce;
+      }).pipe(Effect.provide(capture(logs))),
+      () => {
+        publish();
+        return Effect.succeed({ status: 'needs_input', summary: 'which branch?' });
+      },
     );
 
     const annotations = annotationsOf(logs, 'Parked queued work pending an answer');
@@ -1384,26 +1466,7 @@ describe('Worker.runOnce on a clipped request', () => {
   // as though it were the whole one. `Effect.die` rather than a recorded flag —
   // a spy that is merely asserted-not-called still passes if the assertion is
   // the thing that breaks.
-  it('parks without ever running the agent', async () => {
-    const messages = await run(
-      Effect.gen(function* () {
-        const queue = yield* WorkQueue;
-        const { jobId } = yield* queue.enqueue(clippedWork);
-        const worker = yield* Worker;
-        yield* worker.runOnce;
-        return yield* queue.outboxFor(jobId);
-      }),
-      () => Effect.die('the executor must not run on a clipped request'),
-    );
-
-    expect(messages).toHaveLength(1);
-    expect(messages[0]?.outcome).toBe('clipped');
-    // ! No note. The wording is the daemon's, and every note published carries
-    // ! an "the agent's own summary" attribution that would then be false.
-    expect(messages[0]?.note).toBeUndefined();
-  });
-
-  it('leaves the job answerable rather than finished', async () => {
+  it('refuses without ever running the agent', async () => {
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
@@ -1415,50 +1478,48 @@ describe('Worker.runOnce on a clipped request', () => {
       () => Effect.die('the executor must not run on a clipped request'),
     );
 
-    expect(result.job?.status).toBe('pending');
-    // The question's identity, not merely its presence: the claim skips on this
-    // column and an answer is fenced by it, so a `question_id` naming no message
-    // parks a job nothing can ever resume.
-    expect(result.job?.questionId).toBe(result.messages[0]?.messageId);
-    expect(result.job?.questionAnswerers).toEqual(['edloidas']);
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]?.outcome).toBe('clipped');
+    // Terminal, not parked. The bound is a megabyte against a 64 KiB GitHub
+    // body, so nothing reaches here that a restatement would fix — and a parked
+    // job would consume the next reply on the thread as its answer.
+    expect(result.job?.status).toBe('failed');
+    expect(result.job?.questionId).toBeUndefined();
   });
 
-  // Otherwise every claim re-asks and the job never progresses, however many
-  // times the requester answers.
-  it('runs the agent once an answer has come back', async () => {
-    const answered: WorkItem = { ...clippedWork, answerUrl: 'https://github.com/a/b/issues/1#c-9' };
+  it('reacts on the trigger the acknowledgement went to', async () => {
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
-        const { jobId } = yield* queue.enqueue(answered);
-        const worker = yield* Worker;
-        yield* worker.runOnce;
-        return yield* queue.job(jobId);
-      }),
-      () => Effect.succeed({ status: 'completed', summary: 'done' }),
-    );
-
-    expect(result?.outcome).toBe('completed');
-  });
-
-  // Parking spends no attempt but refunds none, so with the budget gone there
-  // is nothing left to ask with. It must still not run on the fragment.
-  it('refuses instead of asking when no attempt is left to ask with', async () => {
-    const messages = await run(
-      Effect.gen(function* () {
-        const queue = yield* WorkQueue;
-        const { jobId } = yield* queue.enqueue(clippedWork);
+        const { jobId } = yield* queue.enqueue({
+          ...clippedWork,
+          context: { kind: 'issue_comment', id: 200 },
+        });
         const worker = yield* Worker;
         yield* worker.runOnce;
         return yield* queue.outboxFor(jobId);
       }),
       () => Effect.die('the executor must not run on a clipped request'),
-      1,
     );
 
-    expect(messages).toHaveLength(1);
-    expect(messages[0]?.outcome).toBe('rejected');
-    expect(messages[0]?.note).toBeUndefined();
+    expect(result[0]?.context).toEqual({ kind: 'issue_comment', id: 200 });
+  });
+
+  // The reason is a diagnostic and stays in the row, where `job.show` reads it.
+  it('keeps the refusal off the thread and in the record', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(clippedWork);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return { job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
+      }),
+      () => Effect.die('the executor must not run on a clipped request'),
+    );
+
+    expect(result.messages[0]?.note).toBeUndefined();
+    expect(result.job?.lastError).toContain('recordable bound');
   });
 
   it('runs normally when the record fit', async () => {

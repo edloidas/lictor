@@ -110,8 +110,7 @@ const run = <A, E>(
         const GitHubLive = Layer.succeed(
           GitHubClient,
           GitHubClient.make({
-            createComment: () => Effect.succeed({}),
-            listComments: () => Effect.succeed([]),
+            reconcileReaction: () => Effect.void,
             authenticated: Effect.succeed(scopedClient),
             addReaction: () => Effect.succeed(undefined),
           }),

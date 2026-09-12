@@ -1,10 +1,10 @@
-import { Cause, Clock, Data, Effect, Schedule } from 'effect';
+import { Cause, Clock, Effect, Schedule } from 'effect';
 import { isTagged } from 'effect/Predicate';
 import { LictorConfig } from './config.ts';
 import { describeCause } from './diagnostics.ts';
 import { GitHubClient } from './github/client.ts';
 import { CredentialHealth } from './github/credential-health.ts';
-import { outcomeMarker, renderOutcome } from './github/outcome-comment.ts';
+import { outcomeReaction, staleContents } from './github/outcome-reaction.ts';
 import { Policy } from './policy.ts';
 import {
   OUTBOX_FENCED_OPERATIONS,
@@ -12,49 +12,26 @@ import {
   type QueueError,
   WorkQueue,
 } from './queue/work-queue.ts';
+import type { ContextRef } from './work-item.ts';
 
 const OUTBOX_BACKOFF_CAP_MS = 300_000;
-/** Well inside the row's lease, so a hung request cannot outlive its claim. */
-const REQUEST_TIMEOUT = '30 seconds';
-/** Pages of an issue's comments a reconciliation will read before giving up. */
-const RECONCILE_PAGES = 10;
-/** The whole scan. Ten pages at the per-request timeout would outlast the lease. */
-const RECONCILE_TIMEOUT = '20 seconds';
-
-/** A scan that ran out of pages, which is not the same answer as "not there". */
-class ReconcileUnresolved extends Data.TaggedError('ReconcileUnresolved')<{
-  readonly messageId: string;
-}> {}
+/**
+ * The whole reconciliation — an add, a listing, and a delete per stale reaction.
+ * Bounded well inside `OUTBOX_LEASE_MS` so a slow target cannot let a second
+ * sender claim the row out from under this one.
+ */
+const DELIVERY_TIMEOUT = '45 seconds';
 
 const claimLost: ReadonlySet<string> = new Set(Object.values(OUTBOX_FENCED_OPERATIONS));
 
 const isClaimLost = (error: unknown): error is QueueError =>
   isTagged('QueueError')(error) && claimLost.has((error as QueueError).operation);
 
-/**
- * Whether this message is already on the thread.
- *
- * ! Only an exhausted thread answers "not there". A scan that failed, and one
- * ! that ran out of pages while the thread kept going, are both unresolved —
- * ! they fail the caller rather than reporting absence and licensing a second
- * ! post.
- */
-const findPosted = (github: GitHubClient, message: OutboxMessage) =>
-  Effect.gen(function* () {
-    const marker = outcomeMarker(message.messageId);
-    for (let page = 1; page <= RECONCILE_PAGES; page += 1) {
-      const comments = yield* github
-        .listComments(message.repository, message.subjectNumber, message.createdAt, page)
-        .pipe(Effect.timeout(REQUEST_TIMEOUT));
-      const found = comments.find((comment) => comment.body?.includes(marker) === true);
-      if (found !== undefined) return found.html_url ?? '';
-      if (comments.length === 0) return undefined;
-    }
-    return yield* new ReconcileUnresolved({ messageId: message.messageId });
-  }).pipe(Effect.timeout(RECONCILE_TIMEOUT));
+const reactionTarget = (message: OutboxMessage): ContextRef =>
+  message.context ?? { kind: 'body', number: message.subjectNumber };
 
 /**
- * Delivers the message a terminal outcome owes its GitHub thread.
+ * Resolves the acknowledgement a terminal outcome left on its GitHub thread.
  *
  * Separate from the job it describes on purpose: the job is finished before the
  * row is claimed, so no delivery failure can spend an execution attempt or rerun
@@ -79,23 +56,25 @@ export class OutboxWorker extends Effect.Service<OutboxWorker>()('OutboxWorker',
       // takes time, and a wait GitHub measured from its own response shrinks by
       // that much if it is added to a timestamp from before the request.
       const waitUntil = (extraMs?: number) =>
-        Effect.map(Clock.currentTimeMillis, (now) =>
-          extraMs === undefined
-            ? now +
+        Effect.map(
+          Clock.currentTimeMillis,
+          (now) =>
+            now +
+            (extraMs ??
               Math.min(
                 config.workerRetryBaseMs * 2 ** Math.max(0, message.attempts - 1),
                 OUTBOX_BACKOFF_CAP_MS,
-              )
-            : now + extraMs,
+              )),
         );
 
       const deliver = Effect.gen(function* () {
         const repositoryPolicy = policy.forRepository(message.repository);
-        // Admission and capability both, as the broker checks them: a repository
-        // policy denies can still carry `comment: true`.
-        if (!repositoryPolicy.accepted || repositoryPolicy.capabilities.comment !== true) {
+        // Admission alone, the same gate the acknowledgement keyed on: a
+        // reaction is the daemon's own state signal, not agent authority, and
+        // a capability check here would leave eyes that never resolve.
+        if (!repositoryPolicy.accepted) {
           yield* queue.finishOutbox(message.id, message.attempts, 'blocked', 'blocked_by_policy');
-          yield* Effect.logWarning('Outcome cannot be posted; policy forbids commenting').pipe(
+          yield* Effect.logWarning('Outcome cannot be signalled; repository is not accepted').pipe(
             Effect.annotateLogs({
               job: message.jobId,
               repository: message.repository,
@@ -104,21 +83,17 @@ export class OutboxWorker extends Effect.Service<OutboxWorker>()('OutboxWorker',
           );
           return;
         }
-        // Attempt 1 is the first send; anything above it follows an attempt that
-        // may have reached GitHub before losing its claim.
-        if (message.attempts > 1) {
-          const posted = yield* findPosted(github, message);
-          if (posted !== undefined) {
-            yield* queue.deliverOutbox(message.id, message.attempts, posted);
-            yield* Effect.logInfo('Reconciled an outcome already on the thread').pipe(
-              Effect.annotateLogs({ job: message.jobId, outcome: message.outcome }),
-            );
-            return;
-          }
+        const content = outcomeReaction(message.outcome);
+        // An outcome with nothing to say leaves the acknowledgement alone. The
+        // row is still owed a terminal status, so it settles here rather than
+        // being claimed again every poll.
+        if (content === undefined) {
+          yield* queue.deliverOutbox(message.id, message.attempts);
+          return;
         }
         // ! Re-read immediately before the request, because the fenced write
         // ! comes after it: an operator retry cancels this row mid-reconcile,
-        // ! and `deliverOutbox` only notices once the comment is already there.
+        // ! and `deliverOutbox` only notices once the reaction is already there.
         const claim = yield* queue.outboxHeld(message.id, message.attempts);
         if (!claim.held) {
           // A lost claim is loud because a sender losing it every time goes
@@ -137,15 +112,28 @@ export class OutboxWorker extends Effect.Service<OutboxWorker>()('OutboxWorker',
               );
           return;
         }
-        const comment = yield* github
-          .createComment(message.repository, message.subjectNumber, renderOutcome(message))
-          .pipe(Effect.timeout(REQUEST_TIMEOUT));
-        yield* queue.deliverOutbox(message.id, message.attempts, comment.url);
-        yield* Effect.logInfo('Posted the outcome to the thread').pipe(
+        const target = reactionTarget(message);
+        const firstAttempt = message.attempt <= 1 && message.attempts <= 1;
+        yield* github
+          .reconcileReaction(message.repository, target, content, staleContents(firstAttempt))
+          .pipe(Effect.timeout(DELIVERY_TIMEOUT));
+        yield* queue.deliverOutbox(message.id, message.attempts);
+        yield* queue
+          .recordAudit({
+            jobId: message.jobId,
+            repository: message.repository,
+            actor: 'daemon',
+            capability: 'react',
+            input: JSON.stringify({ target, content }),
+            outcome: 'ok',
+          })
+          .pipe(Effect.ignore);
+        yield* Effect.logInfo('Signalled the outcome on the thread').pipe(
           Effect.annotateLogs({
             job: message.jobId,
             repository: message.repository,
             outcome: message.outcome,
+            reaction: content,
           }),
         );
       });
@@ -171,7 +159,10 @@ export class OutboxWorker extends Effect.Service<OutboxWorker>()('OutboxWorker',
               ),
             );
           }
-          // The subject is gone. Nothing can be posted to it, ever.
+          // The target is gone — a deleted trigger comment, or the subject
+          // itself — so nothing can be reacted on, ever. A stale reaction
+          // already removed never reaches here; that 404 means converged, and
+          // `reconcileReaction` swallows it.
           if (error.status === 404 || error.status === 410) {
             return queue.finishOutbox(message.id, message.attempts, 'failed', error.message);
           }

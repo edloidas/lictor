@@ -425,6 +425,7 @@ describe('local control plane', () => {
             // The socket is not bound by these; an operator holding it already
             // has `approve` and `cancel` on the same row.
             answerers: ['someone-else'],
+            askedAt: Date.now(),
             expiresAt: Date.now() + 3_600_000,
           });
           const notAUrl = yield* Effect.either(

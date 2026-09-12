@@ -12,7 +12,7 @@ import {
   GrantSchema,
 } from '../github/grant.ts';
 import { processAlive } from '../process-liveness.ts';
-import { type WorkItem, WorkItemSchema } from '../work-item.ts';
+import { type ContextRef, ContextRefSchema, type WorkItem, WorkItemSchema } from '../work-item.ts';
 
 const WORKER_LEASE_MS = 60_000;
 const DAEMON_LEASE_MS = 30_000;
@@ -98,18 +98,19 @@ export type JobOutcome =
 export type OutboxStatus = 'pending' | 'sending' | 'delivered' | 'blocked' | 'failed' | 'canceled';
 
 /**
- * The public message a terminal outcome owes its GitHub thread, handed to the
- * write that records the outcome so the two commit together.
+ * The signal a terminal outcome owes its GitHub thread, handed to the write that
+ * records the outcome so the two commit together.
  *
- * ! `note` is agent-authored prose and nothing else. Every other string the
- * ! worker holds at a terminal write — an `ExecutorError` message, a policy
- * ! refusal code — is a diagnostic, and this field is published verbatim.
+ * `note` is stored for the operator and never published; `context` is the
+ * trigger the acknowledgement reaction was placed on, and the one the outcome
+ * reconciles.
  */
 export type OutcomeDelivery = {
   readonly repository: string;
   readonly subjectNumber: number;
   readonly outcome: JobOutcome;
   readonly note?: string;
+  readonly context?: ContextRef;
 };
 
 export type OutboxMessage = {
@@ -127,7 +128,12 @@ export type OutboxMessage = {
   /** When delivery may next be attempted; a backoff moves it forward. */
   readonly availableAt: number;
   readonly deliveredAt?: number;
-  readonly commentUrl?: string;
+  /**
+   * The trigger the acknowledgement was placed on. Absent where the work had no
+   * reactable context and on rows written before the column existed; delivery
+   * falls back to the subject itself, which `subjectNumber` always names.
+   */
+  readonly context?: ContextRef;
   readonly lastError?: string;
 };
 
@@ -264,27 +270,44 @@ type OutboxRow = {
   readonly createdAt: number;
   readonly availableAt: number;
   readonly deliveredAt: number | null;
-  readonly commentUrl: string | null;
+  readonly context: string | null;
   readonly lastError: string | null;
 };
 
-const decodeOutbox = (row: OutboxRow): OutboxMessage => ({
-  id: row.id,
-  messageId: row.messageId,
-  jobId: row.jobId,
-  attempt: row.attempt,
-  repository: row.repository,
-  subjectNumber: row.subjectNumber,
-  outcome: row.outcome,
-  status: row.status,
-  attempts: row.attempts,
-  createdAt: row.createdAt,
-  availableAt: row.availableAt,
-  ...(row.note === null ? {} : { note: row.note }),
-  ...(row.deliveredAt === null ? {} : { deliveredAt: row.deliveredAt }),
-  ...(row.commentUrl === null ? {} : { commentUrl: row.commentUrl }),
-  ...(row.lastError === null ? {} : { lastError: row.lastError }),
-});
+/**
+ * Decoded, never trusted: a `JSON.parse` throw inside the outbox worker's
+ * `Effect.gen` is a defect no recovery branch sees, so one unreadable row would
+ * kill the loop. An undecodable context degrades to the subject instead.
+ */
+const decodeContext = (stored: string | null): ContextRef | undefined => {
+  if (stored === null) return undefined;
+  try {
+    return Schema.decodeUnknownSync(ContextRefSchema)(JSON.parse(stored));
+  } catch {
+    return undefined;
+  }
+};
+
+const decodeOutbox = (row: OutboxRow): OutboxMessage => {
+  const context = decodeContext(row.context);
+  return {
+    id: row.id,
+    messageId: row.messageId,
+    jobId: row.jobId,
+    attempt: row.attempt,
+    repository: row.repository,
+    subjectNumber: row.subjectNumber,
+    outcome: row.outcome,
+    status: row.status,
+    attempts: row.attempts,
+    createdAt: row.createdAt,
+    availableAt: row.availableAt,
+    ...(row.note === null ? {} : { note: row.note }),
+    ...(row.deliveredAt === null ? {} : { deliveredAt: row.deliveredAt }),
+    ...(context === undefined ? {} : { context }),
+    ...(row.lastError === null ? {} : { lastError: row.lastError }),
+  };
+};
 
 /**
  * `QueueError.operation` for every delivery write fenced on `attempts`, the way
@@ -340,7 +363,7 @@ const migrate = (database: Database) => {
   // every use — the v6 equality-guard failure, one version later. The
   // `installation_id` check is negative so a database predating its drop heals.
   if (
-    version.user_version === 15 &&
+    version.user_version === 17 &&
     hasColumn('daemon_owner', 'pid') &&
     deliveriesHaveSource() &&
     hasColumn('deliveries', 'lease_expires_at') &&
@@ -351,6 +374,7 @@ const migrate = (database: Database) => {
     hasColumn('jobs', 'hold_expires_at') &&
     hasColumn('jobs', 'question_id') &&
     hasColumn('jobs', 'question_answerers') &&
+    hasColumn('jobs', 'question_asked_at') &&
     hasColumn('jobs', 'grant') &&
     hasColumn('jobs', 'narrowing') &&
     hasTable('notification_cursors') &&
@@ -360,10 +384,12 @@ const migrate = (database: Database) => {
     hasTable('outbox') &&
     hasColumn('outbox', 'message_id') &&
     hasColumn('outbox', 'lease_expires_at') &&
+    hasColumn('outbox', 'context') &&
+    !hasColumn('outbox', 'comment_url') &&
     hasTable('agent_processes')
   )
     return;
-  if (version.user_version > 16) {
+  if (version.user_version > 17) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -595,7 +621,7 @@ const migrate = (database: Database) => {
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         delivered_at INTEGER,
-        comment_url TEXT,
+        context TEXT,
         last_error TEXT
       );
       CREATE INDEX IF NOT EXISTS outbox_claimable ON outbox(status, available_at, id);
@@ -607,13 +633,35 @@ const migrate = (database: Database) => {
         owner_id TEXT NOT NULL,
         started_at INTEGER NOT NULL
       );
-      PRAGMA user_version = 16;
+      PRAGMA user_version = 17;
     `);
     // Ordered after the CREATE TABLE above, like the `deliveries` and `jobs`
     // ALTERs: a fresh table is created complete, and only one predating the
     // column reaches this.
     if (!hasColumn('daemon_owner', 'pid')) {
       database.exec('ALTER TABLE daemon_owner ADD COLUMN pid INTEGER');
+    }
+    // Backfilled from the outbox row that used to publish the question, so one
+    // parked by the previous daemon keeps the boundary it was asked on. The old
+    // row's own gate comes across with it: `attempts > 0` and a status other
+    // than `blocked` were what proved the question reached the thread.
+    if (!hasColumn('jobs', 'question_asked_at')) {
+      database.exec('ALTER TABLE jobs ADD COLUMN question_asked_at INTEGER');
+      database.exec(
+        `UPDATE jobs SET question_asked_at =
+           (SELECT created_at FROM outbox
+            WHERE outbox.message_id = jobs.question_id
+              AND outbox.attempts > 0 AND outbox.status <> 'blocked')
+         WHERE question_id IS NOT NULL AND question_asked_at IS NULL`,
+      );
+    }
+    if (!hasColumn('outbox', 'context')) {
+      database.exec('ALTER TABLE outbox ADD COLUMN context TEXT');
+    }
+    // The comment the outbox used to post is gone, and with it the only reader
+    // of this column.
+    if (hasColumn('outbox', 'comment_url')) {
+      database.exec('ALTER TABLE outbox DROP COLUMN comment_url');
     }
     // ! Condemned, not drained: no decoder exists for webhook bodies anymore,
     // ! so leaving one claimable kills the delivery worker on a defect per cycle.
@@ -956,10 +1004,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
 
     /**
      * ! Runs inside the caller's transaction, after its fence has thrown or
-     * ! passed, and stores raw fields rather than rendered text. Rendering here
-     * ! would put the renderer in the transaction that finishes the job: one
-     * ! throw and the outcome rolls back, the lease lapses, and the agent runs
-     * ! again — which is what a durable outbox exists to prevent.
+     * ! passed, and stores raw fields nothing has to interpret. Anything that
+     * ! can throw here throws in the transaction that finishes the job: the
+     * ! outcome rolls back, the lease lapses, and the agent runs again — which
+     * ! is what a durable outbox exists to prevent.
      */
     const insertOutbox = (
       delivery: OutcomeDelivery,
@@ -971,8 +1019,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       database
         .query(
           `INSERT INTO outbox (message_id, job_id, attempt, repository, subject_number,
-             outcome, note, status, available_at, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+             outcome, note, context, status, available_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
         )
         .run(
           messageId,
@@ -982,13 +1030,11 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           delivery.subjectNumber,
           delivery.outcome,
           delivery.note ?? null,
+          delivery.context === undefined ? null : JSON.stringify(delivery.context),
           now,
           now,
           now,
         );
-      // Returned because a question is identified by the message that asks it:
-      // `outcomeMarker` stamps this id into the posted comment, so it is what a
-      // later answer names.
       return messageId;
     };
 
@@ -1008,11 +1054,11 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       database
         .query(
           `INSERT INTO outbox (message_id, job_id, attempt, repository, subject_number,
-             outcome, status, available_at, created_at, updated_at)
+             outcome, context, status, available_at, created_at, updated_at)
            SELECT lower(hex(randomblob(16))), id, attempts,
                   json_extract(payload, '$.repository'),
                   json_extract(payload, '$.subject.number'),
-                  ?, 'pending', ?, ?, ?
+                  ?, json_extract(payload, '$.context'), 'pending', ?, ?, ?
            FROM jobs
            WHERE (${where})
              AND json_valid(payload)
@@ -1210,7 +1256,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
     const OUTBOX_COLUMNS = `id, message_id AS messageId, job_id AS jobId, attempt, repository,
         subject_number AS subjectNumber, outcome, note, status, attempts,
         created_at AS createdAt, available_at AS availableAt,
-        delivered_at AS deliveredAt, comment_url AS commentUrl,
+        delivered_at AS deliveredAt, context,
         last_error AS lastError`;
 
     const claimOutbox = Effect.gen(function* () {
@@ -1240,17 +1286,17 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       );
     });
 
-    const deliverOutbox = (id: number, attempts: number, commentUrl?: string) =>
+    const deliverOutbox = (id: number, attempts: number) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         yield* attempt(OUTBOX_FENCED_OPERATIONS.finish, () => {
           const result = database
             .query(
               `UPDATE outbox SET status = 'delivered', delivered_at = ?, updated_at = ?,
-                 lease_expires_at = NULL, comment_url = ?, last_error = NULL
+                 lease_expires_at = NULL, last_error = NULL
                WHERE id = ? AND status = 'sending' AND attempts = ?`,
             )
-            .run(now, now, commentUrl ?? null, id, attempts);
+            .run(now, now, id, attempts);
           if (result.changes !== 1)
             throw new Error(`Outbox message ${id} attempt ${attempts} is stale`);
         });
@@ -1313,9 +1359,9 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       });
 
     /**
-     * ! Returned to `pending`, never re-sent blindly: the POST that lost its
-     * ! lease may have reached GitHub. The sender reconciles by marker before
-     * ! posting any row it claims with a spent attempt behind it.
+     * ! Returned to `pending`, never failed outright: the request that lost its
+     * ! lease may have reached GitHub. A resend converges rather than
+     * ! duplicating, because the sender reconciles the whole reaction set.
      */
     const recoverStaleOutbox = (olderThan: number) =>
       Effect.gen(function* () {
@@ -1338,10 +1384,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
     /**
      * The row's state as it stands now, for a sender about to make a request it
      * cannot take back. The fenced write afterwards catches a lost claim, but
-     * only once the comment is already on the thread.
+     * only once the reaction is already on the thread.
      *
      * ! Reports which case it is, never a bare boolean. `canceled` means the
-     * ! operator replaced this outcome and it must never post; anything else
+     * ! operator replaced this outcome and it must never send; anything else
      * ! means another pass owns the row and still owes it. Collapsed into one
      * ! answer, a lease this sender keeps losing reads as an operator action
      * ! and the message quietly stops being delivered.
@@ -1766,40 +1812,33 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       readonly attemptNumber: number;
       readonly repository: string;
       readonly subjectNumber: number;
-      /** The question. Recorded either way; published only where it is the agent's. */
+      /** The question, recorded for the operator. The agent published its own. */
       readonly question: string;
       /** Logins allowed to answer, fixed here rather than resolved on reply. */
       readonly answerers: readonly string[];
+      /**
+       * When the question became visible on the thread — the agent's comment,
+       * not this write. It is the whole gate on answering: a question the
+       * thread never saw must not consume the next trusted reply as its answer,
+       * so nothing posted before this instant can answer it and a park without
+       * one is refused.
+       */
+      readonly askedAt: number;
       readonly expiresAt: number;
-      /** What kind of wait this is. Anything but the default is the daemon's own. */
-      readonly outcome?: JobOutcome;
     }) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
-        const outcome = input.outcome ?? 'needs_input';
         return yield* attempt('park', () =>
           database.transaction(() => {
-            const questionId = insertOutbox(
-              {
-                repository: input.repository,
-                subjectNumber: input.subjectNumber,
-                outcome,
-                // ! `note` stays agent-authored prose and nothing else. A
-                // ! daemon question carries its wording in the outcome's own
-                // ! headline, so it publishes without one — otherwise the
-                // ! renderer would append "the agent's own summary" to words
-                // ! the agent never wrote.
-                ...(outcome === 'needs_input' ? { note: input.question } : {}),
-              },
-              input.jobId,
-              input.attemptNumber,
-              now,
-            );
+            // Minted here: the daemon sends nothing for a parked job, so no
+            // message id exists for a resumed answer to name the question by.
+            const questionId = randomUUID();
             const result = database
               .query(
                 `UPDATE jobs
                  SET status = 'pending', outcome = NULL, question_id = ?, question_answerers = ?,
-                     hold_expires_at = ?, available_at = ?, claimed_at = NULL, worker_id = NULL,
+                     question_asked_at = ?, hold_expires_at = ?, available_at = ?,
+                     claimed_at = NULL, worker_id = NULL,
                      lease_expires_at = NULL, retry_at = NULL, failed_at = NULL,
                      last_error = ?, updated_at = ?
                  WHERE id = ? AND status = 'running' AND attempts = ?`,
@@ -1807,6 +1846,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               .run(
                 questionId,
                 JSON.stringify(input.answerers),
+                input.askedAt,
                 input.expiresAt,
                 now,
                 input.question,
@@ -1814,8 +1854,6 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                 input.jobId,
                 input.attemptNumber,
               );
-            // Throwing rolls the message back with the park. A question posted
-            // to a thread nobody is waiting on can never be answered.
             if (result.changes !== 1) {
               throw new Error(`Job ${input.jobId} attempt ${input.attemptNumber} is stale`);
             }
@@ -1855,7 +1893,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             database
               .query(
                 `UPDATE jobs
-                 SET question_id = NULL, question_answerers = NULL, hold_expires_at = NULL,
+                 SET question_id = NULL, question_answerers = NULL, question_asked_at = NULL,
+                     hold_expires_at = NULL,
                      ready_at = ?, available_at = ?, last_error = NULL, updated_at = ?,
                      payload = json_set(payload, '$.answerUrl', ?)
                  WHERE id = ? AND status = 'pending' AND question_id = ? AND json_valid(payload)`,
@@ -1888,10 +1927,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         const row = database
           .query(
             `SELECT j.id AS jobId, j.question_id AS questionId,
-               j.question_answerers AS answerers, o.created_at AS askedAt
-             FROM jobs j JOIN outbox o ON o.message_id = j.question_id
+               j.question_answerers AS answerers, j.question_asked_at AS askedAt
+             FROM jobs j
              WHERE j.status = 'pending' AND j.question_id IS NOT NULL
-               AND o.attempts > 0 AND o.status <> 'blocked'
+               AND j.question_asked_at IS NOT NULL
                AND json_valid(j.payload)
                AND lower(json_extract(j.payload, '$.repository')) = ?
                AND json_extract(j.payload, '$.subject.kind') = ?
@@ -2068,6 +2107,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               `UPDATE jobs
              SET status = 'failed', outcome = 'unanswered', failed_at = ?, updated_at = ?,
                  hold_expires_at = NULL, question_id = NULL, question_answerers = NULL,
+                 question_asked_at = NULL,
                  last_error = 'answer expired'
              WHERE ${unansweredWhere}`,
             )
@@ -2096,17 +2136,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           .run(completedBefore, failedBefore);
         // Pruned on the failed window like the jobs they describe, and only once
         // terminal: an undelivered message is an obligation, not history.
-        // ! Never the row a parked job is still waiting on, however old. It is
-        // ! that question's only record of having been asked, and `retention`
-        // ! can be set shorter than the answer window — dropping it strands the
-        // ! job at `pending` with a `question_id` nothing can look up, so every
-        // ! later reply becomes new work instead of its answer.
         database
           .query(
             `DELETE FROM outbox
-             WHERE status IN ('delivered', 'blocked', 'failed', 'canceled') AND updated_at < ?
-               AND message_id NOT IN
-                 (SELECT question_id FROM jobs WHERE question_id IS NOT NULL)`,
+             WHERE status IN ('delivered', 'blocked', 'failed', 'canceled') AND updated_at < ?`,
           )
           .run(failedBefore);
         // Pruned on the failed window, the longer of the two: a cursor dropped
@@ -2273,6 +2306,29 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             readonly createdAt: number;
           }[],
       );
+
+    /**
+     * When this attempt last published a comment of its own, if it did.
+     *
+     * The audit is the only record that the agent said anything, and the daemon
+     * sends nothing itself — so this is what `park` takes its `askedAt` from.
+     */
+    const lastCommentAt = (jobId: number, subjectNumber: number, sinceMs: number) =>
+      attempt('read last published comment', () => {
+        const row = database
+          .query(
+            // Scoped to this attempt and this thread: the broker fences a call
+            // to the job's repository but not to its subject, so a comment left
+            // on a neighbouring issue would otherwise read as the question.
+            `SELECT created_at AS createdAt FROM capability_audit
+             WHERE job_id = ? AND capability = 'create_comment' AND outcome = 'ok'
+               AND created_at >= ?
+               AND json_valid(input) AND json_extract(input, '$.number') = ?
+             ORDER BY id DESC LIMIT 1`,
+          )
+          .get(jobId, sinceMs, subjectNumber) as { readonly createdAt: number } | null | undefined;
+        return row?.createdAt;
+      });
 
     const listJobs = (limit = 100) =>
       attempt('list jobs', () => {
@@ -2447,7 +2503,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                 .query(
                   `UPDATE jobs SET status = 'failed', outcome = 'canceled', failed_at = ?,
                  worker_id = NULL, lease_expires_at = NULL, hold_expires_at = NULL,
-                 question_id = NULL, question_answerers = NULL,
+                 question_id = NULL, question_answerers = NULL, question_asked_at = NULL,
                  last_error = 'canceled by operator', updated_at = ? WHERE id = ?`,
                 )
                 .run(now, now, id).changes === 1
@@ -2568,6 +2624,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       maintenance,
       recordAudit,
       auditLog,
+      lastCommentAt,
       recordSubjectBranch,
       branchForSubject,
       markLive,

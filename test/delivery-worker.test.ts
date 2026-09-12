@@ -142,8 +142,7 @@ const services = (
   const GitHubLive = Layer.succeed(
     GitHubClient,
     GitHubClient.make({
-      createComment: () => Effect.succeed({}),
-      listComments: () => Effect.succeed([]),
+      reconcileReaction: () => Effect.void,
       authenticated: Effect.succeed(
         client.pipe(HttpClient.mapRequest(HttpClientRequest.prependUrl('https://api.github.test'))),
       ),
@@ -427,17 +426,9 @@ describe('DeliveryWorker', () => {
             subjectNumber: parked.subject.number,
             question: 'which branch?',
             answerers: ['edloidas'],
+            askedAt: yield* Clock.currentTimeMillis,
             expiresAt: 4_000_000_000_000,
           });
-          // The question has to be on the thread before a reply can answer it.
-          // Under the test clock it lands at the epoch, before the fixture
-          // comment rather than after it.
-          const message = yield* queue.claimOutbox;
-          yield* queue.deliverOutbox(
-            message?.id ?? 0,
-            message?.attempts ?? 1,
-            'https://github.com/edloidas/lictor/issues/17#issuecomment-1',
-          );
           yield* queue.receiveDelivery({
             id: 'delivery-1',
             event: 'notification',

@@ -137,9 +137,9 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
             return yield* queue.listJobs(Number(args[0] ?? 100));
           case 'job.show': {
             const jobId = yield* positiveId(args[0]);
-            // The outbox is where a `blocked` delivery and its reason live. A
-            // repository that withholds `comment` never gets a thread comment,
-            // so this is the only place the operator can read what was said.
+            // The outbox is where an outcome's `note` and a `blocked` delivery's
+            // reason live. Nothing is published to the thread, so this is the
+            // only place either can be read.
             //
             // ! Read first, and survive a job that will not decode. A payload
             // ! the schema no longer accepts is dead-lettered *and* owed a

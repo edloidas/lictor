@@ -86,14 +86,6 @@ const work = (deliveryId: string): WorkItem => ({
  * deliberately refuses to match one — so a test that parks and then expects a
  * reply to answer has to put the question on the thread first.
  */
-const deliverPending = Effect.gen(function* () {
-  const queue = yield* WorkQueue;
-  const claimed = yield* queue.claimOutbox;
-  if (claimed === undefined) return undefined;
-  yield* queue.deliverOutbox(claimed.id, claimed.attempts, 'https://github.com/c/1');
-  return claimed;
-});
-
 describe('WorkQueue trigger record', () => {
   it('round-trips the accepted request through the payload', async () => {
     const trigger = {
@@ -471,6 +463,7 @@ describe('WorkQueue', () => {
           subjectNumber: 17,
           question: 'which branch?',
           answerers: ['edloidas'],
+          askedAt: Date.now(),
           expiresAt: Date.now() + 3_600_000,
         });
         const whileWaiting = yield* queue.claim;
@@ -520,6 +513,7 @@ describe('WorkQueue', () => {
           subjectNumber: 17,
           question: 'which branch?',
           answerers: ['edloidas'],
+          askedAt: Date.now(),
           expiresAt: Date.now() + 3_600_000,
         });
         const questionId = (yield* queue.job(jobId))?.questionId ?? 'none';
@@ -569,6 +563,7 @@ describe('WorkQueue', () => {
           subjectNumber: 17,
           question: 'which branch?',
           answerers: ['edloidas'],
+          askedAt: Date.now(),
           expiresAt: (yield* Clock.currentTimeMillis) + 60 * 60 * 1000,
         });
         const held = yield* queue.enqueue(
@@ -603,11 +598,8 @@ describe('WorkQueue', () => {
     // `hold_expires_at`, so the reason is the only thing that tells them apart.
     expect(result.question?.lastError).toBe('answer expired');
     expect(result.approval?.lastError).toBe('approval expired');
-    // The question and its expiry both owe the thread a message.
-    expect(result.messages.map((message) => message.outcome)).toEqual([
-      'needs_input',
-      'unanswered',
-    ]);
+    // The park owed the thread nothing; only its expiry does.
+    expect(result.messages.map((message) => message.outcome)).toEqual(['unanswered']);
   });
 
   it('reports the question a subject is waiting on, and nothing once it is answered', async () => {
@@ -622,6 +614,7 @@ describe('WorkQueue', () => {
         });
         const claimed = yield* queue.claim;
         const before = yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17);
+        const askedAt = Date.now();
         yield* queue.park({
           jobId,
           attemptNumber: claimed?.attempts ?? 1,
@@ -629,11 +622,9 @@ describe('WorkQueue', () => {
           subjectNumber: 17,
           question: 'which branch?',
           answerers: ['edloidas', 'adiutriel'],
+          askedAt,
           expiresAt: Date.now() + 3_600_000,
         });
-        // Undelivered, so it is not on the thread and nothing can answer it.
-        const undelivered = yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17);
-        yield* deliverPending;
         const byLowercase = yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17);
         const byStoredCase = yield* queue.pendingQuestion('EDLOIDAS/Lictor', 'issue', 17);
         const elsewhere = yield* queue.pendingQuestion('edloidas/lictor', 'issue', 18);
@@ -645,8 +636,8 @@ describe('WorkQueue', () => {
         });
         return {
           jobId,
+          askedAt,
           before,
-          undelivered,
           byLowercase,
           byStoredCase,
           elsewhere,
@@ -658,32 +649,28 @@ describe('WorkQueue', () => {
     );
 
     expect(result.before).toBeUndefined();
-    expect(result.undelivered).toBeUndefined();
     expect(result.byLowercase?.jobId).toBe(result.jobId);
     expect(result.byStoredCase?.jobId).toBe(result.jobId);
     expect(result.byLowercase?.answerers).toEqual(['edloidas', 'adiutriel']);
-    // The floor a reply has to beat to count as its answer, taken from the park
-    // rather than from delivery — not merely some positive number.
-    expect(result.byLowercase?.askedAt).toBe(result.message?.createdAt);
-    expect(result.byLowercase?.questionId).toBe(result.message?.messageId);
+    // The floor a reply has to beat, taken from the caller's `askedAt` — the
+    // agent's own comment — and not from this write.
+    expect(result.byLowercase?.askedAt).toBe(result.askedAt);
+    // A parked question owes the thread nothing: the agent published it.
+    expect(result.message).toBeUndefined();
     expect(result.elsewhere).toBeUndefined();
     expect(result.otherKind).toBeUndefined();
     expect(result.after).toBeUndefined();
   });
 
-  // Three states of the question's own message, and only one of them means the
-  // thread never saw it. `delivered_at` cannot tell them apart: it records when
-  // the daemon learned the comment exists, not when it appeared.
-  it.each([
-    ['a send whose response was lost', 'retried', true],
-    ['a question refused by policy', 'blocked', false],
-    ['a question never claimed for sending', 'untouched', false],
-  ])('treats %s as answerable: %s', async (_name, disposition, answerable) => {
+  it('makes a parked question answerable at once, owing the thread nothing', async () => {
+    // `askedAt` is the whole proof the question was shown, so the row is
+    // answerable the moment it is written.
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
-        const { jobId } = yield* queue.enqueue(work(`outbox-${disposition}`));
+        const { jobId } = yield* queue.enqueue(work('asked-once'));
         const claimed = yield* queue.claim;
+        const askedAt = (yield* Clock.currentTimeMillis) - 5_000;
         yield* queue.park({
           jobId,
           attemptNumber: claimed?.attempts ?? 1,
@@ -691,35 +678,24 @@ describe('WorkQueue', () => {
           subjectNumber: 17,
           question: 'which branch?',
           answerers: ['edloidas'],
+          askedAt,
           expiresAt: Date.now() + 3_600_000,
         });
-        if (disposition !== 'untouched') {
-          const message = yield* queue.claimOutbox;
-          yield* disposition === 'retried'
-            ? // The POST reached GitHub; the write recording it did not.
-              queue.retryOutbox(message?.id ?? 0, message?.attempts ?? 1, 'timed out', 0)
-            : queue.finishOutbox(message?.id ?? 0, message?.attempts ?? 1, 'blocked', 'no_comment');
-        }
         return {
+          askedAt,
           question: yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17),
-          message: (yield* queue.outboxFor(jobId))[0],
+          messages: yield* queue.outboxFor(jobId),
         };
       }),
     );
 
-    expect(result.question !== undefined).toBe(answerable);
-    if (answerable) {
-      // Dated from the park, never from delivery: a floor at or before the real
-      // post can reject no genuine answer, while a later one loses it for good.
-      expect(result.question?.askedAt).toBe(result.message?.createdAt);
-      expect(result.message?.deliveredAt).toBeUndefined();
-    }
+    expect(result.question?.askedAt).toBe(result.askedAt);
+    expect(result.messages).toEqual([]);
   });
 
-  it('keeps the message a parked job is waiting on out of the retention sweep', async () => {
-    // `retention.failedDays` can be shorter than the answer window. Pruning the
-    // question's record strands the job: still `pending`, still carrying a
-    // `question_id`, and answerable by nobody.
+  it('leaves a parked job answerable after a retention sweep shorter than its hold', async () => {
+    // `retention.failedDays` can be shorter than the answer window. The question
+    // lives on the job row, which is `pending` and so out of the sweep's reach.
     const result = await run(
       Effect.gen(function* () {
         const queue = yield* WorkQueue;
@@ -732,9 +708,9 @@ describe('WorkQueue', () => {
           subjectNumber: 17,
           question: 'which branch?',
           answerers: ['edloidas'],
+          askedAt: Date.now(),
           expiresAt: (yield* Clock.currentTimeMillis) + 30 * 24 * 3_600_000,
         });
-        yield* deliverPending;
         yield* TestClock.adjust('2 days');
         const now = yield* Clock.currentTimeMillis;
         // Retention far shorter than the hold the job is still sitting in.
@@ -763,9 +739,9 @@ describe('WorkQueue', () => {
           subjectNumber: 17,
           question: 'which branch?',
           answerers: ['edloidas'],
+          askedAt: Date.now(),
           expiresAt: Date.now() + 3_600_000,
         });
-        yield* deliverPending;
         const before = yield* queue.answersTaken('edloidas/lictor', 'issue', 17);
         yield* queue.answerQuestion({
           jobId,
@@ -809,9 +785,9 @@ describe('WorkQueue', () => {
             subjectNumber: 17,
             question: 'which branch?',
             answerers: ['edloidas'],
+            askedAt: Date.now(),
             expiresAt: Date.now() + 3_600_000,
           });
-          yield* deliverPending;
         }).pipe(Effect.provide(queueLayer(path))),
       ),
     );
@@ -984,6 +960,7 @@ describe('WorkQueue', () => {
           subjectNumber: 17,
           question: 'which branch?',
           answerers: ['edloidas'],
+          askedAt: Date.now(),
           expiresAt: Date.now() + 3_600_000,
         });
         return {
@@ -2084,7 +2061,7 @@ describe('WorkQueue', () => {
       const after = new Database(path);
       expect(
         (after.query('PRAGMA user_version').get() as { user_version: number }).user_version,
-      ).toBe(16);
+      ).toBe(17);
       after.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -2335,7 +2312,7 @@ describe('WorkQueue', () => {
       ).toContain('grant');
       expect(
         (after.query('PRAGMA user_version').get() as { user_version: number }).user_version,
-      ).toBe(16);
+      ).toBe(17);
       after.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -2385,17 +2362,82 @@ describe('WorkQueue', () => {
       expect(columns).toContain('narrowing');
       // Diagnostic column, so a daemon rolled back past it still starts. The
       // stamp is the current one, which `agent_processes` moved to 16.
-      expect(stamp).toBe(16);
+      expect(stamp).toBe(17);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
   });
 
+  it.each([
+    ['a question the outbox actually sent', 1, 'delivered', 500],
+    ['a question the outbox never attempted', 0, 'pending', undefined],
+    ['a question policy refused to publish', 0, 'blocked', undefined],
+  ])(
+    'carries the old send gate across the upgrade: %s',
+    async (_name, attempts, status, askedAt) => {
+      // `question_asked_at` is the only gate left. Backfilling a row that never
+      // reached the thread arms an invisible question, and the next trusted
+      // reply on that thread is consumed as its answer.
+      const directory = mkdtempSync(join(tmpdir(), 'lictor-backfill-'));
+      const path = join(directory, 'queue.sqlite');
+      try {
+        await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const queue = yield* WorkQueue;
+              const { jobId } = yield* queue.enqueue(work('upgraded'));
+              const claimed = yield* queue.claim;
+              yield* queue.park({
+                jobId,
+                attemptNumber: claimed?.attempts ?? 1,
+                repository: 'edloidas/lictor',
+                subjectNumber: 17,
+                question: 'which branch?',
+                answerers: ['edloidas'],
+                askedAt: 1000,
+                expiresAt: Date.now() + 3_600_000,
+              });
+            }).pipe(Effect.provide(queueLayer(path))),
+          ),
+        );
+
+        // Rewind to what the previous schema held: the question's state lived
+        // in an outbox row, and `jobs` carried no `question_asked_at`.
+        const stripped = new Database(path);
+        stripped.exec('ALTER TABLE jobs DROP COLUMN question_asked_at');
+        stripped
+          .query(
+            `INSERT INTO outbox (message_id, job_id, attempt, repository, subject_number,
+               outcome, note, status, attempts, available_at, created_at, updated_at)
+             SELECT question_id, id, 1, 'edloidas/lictor', 17, 'needs_input', 'which branch?',
+               ?, ?, 0, 500, 500 FROM jobs WHERE id = 1`,
+          )
+          .run(status, attempts);
+        stripped.close();
+
+        const found = await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const queue = yield* WorkQueue;
+              return yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17);
+            }).pipe(Effect.provide(queueLayer(path))),
+          ),
+        );
+
+        // Dated from the row that published it, so a reply older than the
+        // question still cannot answer it; absent entirely where it never did.
+        expect(found?.askedAt).toBe(askedAt);
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('refuses a database created by a newer queue schema', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
     const database = new Database(path, { create: true });
-    database.exec('PRAGMA user_version = 17');
+    database.exec('PRAGMA user_version = 18');
     database.close();
 
     try {
@@ -2415,7 +2457,7 @@ describe('WorkQueue', () => {
       // stamp into the migration body would die on an ALTER against a table it
       // never created, reading as a corrupt database rather than a newer one.
       expect(exit._tag === 'Failure' ? wrappedMessage(exit.cause) : '').toContain(
-        'Unsupported queue schema version 17',
+        'Unsupported queue schema version 18',
       );
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -3091,7 +3133,7 @@ describe('WorkQueue', () => {
       expect(tables).toContain('agent_processes');
       // Re-stamped as well as repaired: a migration that creates the table and
       // leaves the stamp behind runs its whole body again on every open.
-      expect(stamp).toBe(16);
+      expect(stamp).toBe(17);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -3676,7 +3718,7 @@ describe('WorkQueue', () => {
             outcome: 'completed',
           });
           const delivered = yield* queue.claimOutbox;
-          yield* queue.deliverOutbox(delivered?.id ?? 0, delivered?.attempts ?? 0, 'url');
+          yield* queue.deliverOutbox(delivered?.id ?? 0, delivered?.attempts ?? 0);
 
           const second = yield* queue.enqueue(work('outbox-kept'));
           const secondClaim = yield* queue.claim;
