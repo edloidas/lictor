@@ -16,7 +16,8 @@ import {
 } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import type { Grant } from '../src/github/grant.ts';
-import { QueueFull, WorkQueue } from '../src/queue/work-queue.ts';
+import { processAlive } from '../src/process-liveness.ts';
+import { claimOwnerRow, QueueFull, WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
 
 /**
@@ -2468,6 +2469,16 @@ describe('WorkQueue', () => {
     }
   });
 
+  /** The ownership row as it stands, read through a handle of the test's own. */
+  const readOwner = (path: string) => {
+    const database = new Database(path);
+    const row = database
+      .query('SELECT owner_id AS ownerId, pid FROM daemon_owner WHERE singleton = 1')
+      .get() as { readonly ownerId: string; readonly pid: number | null } | null;
+    database.close();
+    return row;
+  };
+
   /**
    * Stamps a synthetic owner row onto an initialized database, then reports
    * what a fresh daemon makes of it. Building the queue once creates the
@@ -2492,7 +2503,15 @@ describe('WorkQueue', () => {
       database.close();
       const exit = await Effect.runPromise(
         Effect.exit(
-          Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))).pipe(
+          Effect.scoped(
+            // Read from inside the scope, through a handle of its own: the
+            // release deletes the row, so a claim that recorded a wrong pid is
+            // indistinguishable from a right one once the scope has closed.
+            Effect.gen(function* () {
+              yield* WorkQueue;
+              return readOwner(path);
+            }).pipe(Effect.provide(queueLayer(path))),
+          ).pipe(
             Effect.provide(
               Logger.replace(
                 Logger.defaultLogger,
@@ -2504,7 +2523,7 @@ describe('WorkQueue', () => {
           ),
         ),
       );
-      return { exit, logged };
+      return { exit, logged, recorded: exit._tag === 'Success' ? exit.value : undefined };
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -2520,12 +2539,16 @@ describe('WorkQueue', () => {
   });
 
   it('takes over from an owner whose process is gone', async () => {
-    const { exit } = await claimAgainstOwner({
+    const { exit, recorded } = await claimAgainstOwner({
       pid: Bun.spawnSync(['true']).pid,
       expiresAt: Date.now() - 60_000,
     });
 
     expect(exit._tag).toBe('Success');
+    // Every later ownership decision reads this pid; recorded wrong or absent,
+    // `ownerIsGone` has only the grace left to go on.
+    expect(recorded?.pid).toBe(process.pid);
+    expect(recorded?.ownerId).not.toBe('other-daemon');
   });
 
   it('takes over a lapsed lease once it is past the takeover grace', async () => {
@@ -2596,6 +2619,157 @@ describe('WorkQueue', () => {
 
       expect(exit._tag).toBe('Success');
       expect(columns).toContain('pid');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The takeover grace, and the moment the claim reads as its `now`. The
+   * fixtures below are offsets from that moment, which is the only way to sit a
+   * row exactly on a boundary: the claim reads `Clock.currentTimeMillis`, so a
+   * fixture built from `Date.now()` lands a few milliseconds off it and both
+   * comparisons survive being flipped.
+   */
+  const graceMs = 10 * 60_000;
+  const claimNow = 3_600_000;
+
+  /**
+   * A pid belonging to nothing, checked rather than assumed. A recycled number
+   * reads as alive, which silently turns a case about the lease into a case
+   * about liveness and passes for the wrong reason.
+   */
+  const reapedPid = (): number => {
+    const pid = Bun.spawnSync(['true']).pid;
+    // `processAlive`, not a bare `toThrow()`: it reads `EPERM` as alive on
+    // purpose, so a reused number throws here while the claim sees a live owner
+    // and the lease case below passes on the arm it means to exclude.
+    expect(processAlive(pid)).toBe(false);
+    return pid;
+  };
+
+  /**
+   * Claims against a synthetic owner on a clock the test holds still, reporting
+   * the fatal log beside the exit.
+   *
+   * The exit tag alone cannot grade these: a refusal and the claim's
+   * zero-change guard are both `Failure`, and at exactly `expires_at === now`
+   * reading the lease as `>` moves the refusal from the first to the second —
+   * a real regression a tag assertion passes.
+   */
+  const claimAtBoundary = (owner: { readonly pid: number | null; readonly offsetMs: number }) => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-owner-'));
+    const path = join(directory, 'queue.sqlite');
+    const logged: string[] = [];
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        yield* Effect.scoped(Effect.provide(WorkQueue, queueLayer(path)));
+        yield* TestClock.adjust(claimNow);
+        const expiresAt = claimNow + owner.offsetMs;
+        yield* Effect.sync(() => {
+          const database = new Database(path);
+          database
+            .query(
+              `INSERT INTO daemon_owner (singleton, owner_id, heartbeat_at, expires_at, pid)
+               VALUES (1, 'other-daemon', ?, ?, ?)`,
+            )
+            .run(expiresAt - 30_000, expiresAt, owner.pid);
+          database.close();
+        });
+        const exit = yield* Effect.exit(
+          Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))).pipe(
+            Effect.provide(
+              Logger.replace(
+                Logger.defaultLogger,
+                Logger.make<unknown, void>(({ message }) => {
+                  logged.push(String(message));
+                }),
+              ),
+            ),
+          ),
+        );
+        return { tag: exit._tag, logged: logged.join('\n') };
+      }).pipe(
+        Effect.provide(TestContext.TestContext),
+        Effect.ensuring(Effect.sync(() => rmSync(directory, { recursive: true, force: true }))),
+      ),
+    );
+  };
+
+  const refusedTheOwner = 'Another Lictor daemon owns this database';
+
+  // Exactly on the grace, not a millisecond past it: `>` and `>=` differ only
+  // here, and both leave the suite green anywhere else.
+  it('refuses a live owner still exactly on the takeover grace', async () => {
+    const result = await claimAtBoundary({ pid: 1, offsetMs: -graceMs });
+
+    expect(result.tag).toBe('Failure');
+    expect(result.logged).toContain(refusedTheOwner);
+  });
+
+  it('takes over a live owner one millisecond past the takeover grace', async () => {
+    const result = await claimAtBoundary({ pid: 1, offsetMs: -graceMs - 1 });
+
+    expect(result.tag).toBe('Success');
+  });
+
+  it('refuses an unrecorded pid still exactly on the takeover grace', async () => {
+    const result = await claimAtBoundary({ pid: null, offsetMs: -graceMs });
+
+    expect(result.tag).toBe('Failure');
+    expect(result.logged).toContain(refusedTheOwner);
+  });
+
+  it('takes over an unrecorded pid one millisecond past the takeover grace', async () => {
+    const result = await claimAtBoundary({ pid: null, offsetMs: -graceMs - 1 });
+
+    expect(result.tag).toBe('Success');
+  });
+
+  // A lease expiring this instant has not expired. The pid is reaped, so the
+  // lease is the only thing left refusing — and it has to be the thing that
+  // refuses, not the guarded write discovering the same boundary in SQL.
+  it('refuses an owner whose lease expires exactly now', async () => {
+    const result = await claimAtBoundary({ pid: reapedPid(), offsetMs: 0 });
+
+    expect(result.tag).toBe('Failure');
+    expect(result.logged).toContain(refusedTheOwner);
+  });
+
+  it('takes over an owner whose lease expired one millisecond ago', async () => {
+    const result = await claimAtBoundary({ pid: reapedPid(), offsetMs: -1 });
+
+    expect(result.tag).toBe('Success');
+  });
+
+  /**
+   * The claim's own write, against a row that changed after the read admitted
+   * it. Called directly because nothing else can produce that state: every row
+   * the read admits satisfies this `WHERE`, so in a running daemon only a
+   * second process writing between the two statements makes the count zero, and
+   * the loud failure is all that keeps this one from serving a database it does
+   * not own.
+   */
+  it('refuses to take an ownership row a foreign owner holds unexpired', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-owner-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))));
+      const database = new Database(path);
+      database
+        .query(
+          `INSERT INTO daemon_owner (singleton, owner_id, heartbeat_at, expires_at, pid)
+           VALUES (1, 'foreign-daemon', ?, ?, 1)`,
+        )
+        .run(Date.now(), Date.now() + 30_000);
+
+      expect(() => claimOwnerRow(database, 'ours', Date.now())).toThrow(
+        'Another Lictor daemon claimed this database first',
+      );
+      const after = readOwner(path);
+      database.close();
+
+      expect(after?.ownerId).toBe('foreign-daemon');
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
