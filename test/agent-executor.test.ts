@@ -1,3 +1,4 @@
+import { Database } from 'bun:sqlite';
 import { afterAll, describe, expect, it } from 'bun:test';
 import {
   chmodSync,
@@ -21,6 +22,7 @@ import {
   ProcessRunner,
 } from '../src/executor/process-runner.ts';
 import type { Grant, GrantCapabilities } from '../src/github/grant.ts';
+import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
 
 const work: WorkItem = {
@@ -176,6 +178,9 @@ const runWith = <A, E>(
       Effect.provide(AgentExecutor.DefaultWithoutDependencies),
       Effect.provideService(ProcessRunner, runner),
       Effect.provideService(AgentListener, listener),
+      // Real, not stubbed: it owns the table the agent's process group is
+      // recorded in, and a stub would not prove the executor writes to it.
+      Effect.provide(WorkQueue.DefaultWithoutDependencies),
       Effect.provideService(LictorConfig, config(executor, databasePath)),
       Effect.provide(logger),
     ),
@@ -1181,5 +1186,52 @@ describe('AgentExecutor', () => {
     expect(error.retryable).toBe(false);
     expect(error.message).toContain('codex login');
     expect(error.message).not.toContain('undetermined');
+  });
+
+  // The record is what a later incarnation kills by, so the request has to
+  // carry it: a Codex spawned without one is an agent nothing can reach after a
+  // reload takes the database away from the daemon that started it.
+  it('gives the Codex spawn a record of its own process group', async () => {
+    const databasePath = tempStatePath();
+    const groups = (): number[] => {
+      const database = new Database(databasePath);
+      const rows = database.query('SELECT pgid FROM agent_processes').all() as {
+        readonly pgid: number;
+      }[];
+      database.close();
+      return rows.map((row) => row.pgid);
+    };
+    let whileRunning: number[] = [];
+    let afterForget: number[] = [];
+
+    await runWith(
+      Effect.flatMap(AgentExecutor, (agent) => agent.execute(work)),
+      ProcessRunner.make({
+        run: (request) =>
+          Effect.zipRight(
+            request.register?.record(4242) ?? Effect.void,
+            Effect.sync(() => {
+              whileRunning = groups();
+              writeFileSync(resultPathOf(request.command), completedResult);
+              return exited();
+            }),
+          ).pipe(
+            Effect.zipLeft(request.register?.forget(4242) ?? Effect.void),
+            // Read before the queue's scope closes: its release clears this
+            // owner's rows unconditionally, so past it a `forget` that deleted
+            // nothing leaves the table empty just the same.
+            Effect.tap(() =>
+              Effect.sync(() => {
+                afterForget = groups();
+              }),
+            ),
+          ),
+      }),
+      'codex',
+      databasePath,
+    );
+
+    expect(whileRunning).toEqual([4242]);
+    expect(afterForget).toEqual([]);
   });
 });

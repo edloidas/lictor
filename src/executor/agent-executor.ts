@@ -8,8 +8,14 @@ import { AgentListener } from '../control/agent-listener.ts';
 import { describeCause } from '../diagnostics.ts';
 import { describeGrantedTools, type Grant } from '../github/grant.ts';
 import { processAlive } from '../process-liveness.ts';
+import { WorkQueue } from '../queue/work-queue.ts';
 import type { WorkItem } from '../work-item.ts';
-import { type ProcessResult, ProcessRunner } from './process-runner.ts';
+import {
+  ProcessError,
+  type ProcessGroupRecord,
+  type ProcessResult,
+  ProcessRunner,
+} from './process-runner.ts';
 
 export class ExecutorError extends Data.TaggedError('ExecutorError')<{
   readonly message: string;
@@ -289,6 +295,29 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
     const config = yield* LictorConfig;
     const processes = yield* ProcessRunner;
     const listener = yield* AgentListener;
+    const queue = yield* WorkQueue;
+    /**
+     * Makes the agent's process group findable by whatever daemon owns the
+     * database next. Only Codex gets one: it is the child that runs for minutes
+     * and acts on the subject, and the only one whose second run would repeat
+     * side effects that already landed.
+     */
+    const register: ProcessGroupRecord = {
+      record: (pgid) =>
+        Effect.mapError(
+          queue.registerAgentProcess(pgid),
+          (cause) =>
+            new ProcessError({ message: 'Could not record the agent process group', cause }),
+        ),
+      // Logged, never fatal: the run is over by the time this fails, and the
+      // next takeover clears the row after signalling a group already gone.
+      forget: (pgid) =>
+        Effect.catchAll(queue.forgetAgentProcess(pgid), (cause) =>
+          Effect.logWarning('Agent process group could not be forgotten').pipe(
+            Effect.annotateLogs({ pgid, error: describeCause(Cause.fail(cause)) }),
+          ),
+        ),
+    };
     const mcpClientPath = join(import.meta.dir, '../github/mcp-client.ts');
     const codexHome =
       config.codexHome ||
@@ -416,6 +445,7 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                   // need instead of blocking on a prompt until the executor timeout.
                   GIT_TERMINAL_PROMPT: '0',
                 },
+                register,
               }),
             ),
           ),
@@ -518,5 +548,10 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
 
     return { enabled: config.executor !== 'disabled', execute };
   }),
-  dependencies: [LictorConfig.Default, ProcessRunner.Default, AgentListener.Default],
+  dependencies: [
+    LictorConfig.Default,
+    ProcessRunner.Default,
+    AgentListener.Default,
+    WorkQueue.Default,
+  ],
 }) {}

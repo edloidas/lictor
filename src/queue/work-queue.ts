@@ -1,6 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import { uptime } from 'node:os';
 import { dirname } from 'node:path';
 import { Clock, Data, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
@@ -358,10 +359,11 @@ const migrate = (database: Database) => {
     hasTable('thread_liveness') &&
     hasTable('outbox') &&
     hasColumn('outbox', 'message_id') &&
-    hasColumn('outbox', 'lease_expires_at')
+    hasColumn('outbox', 'lease_expires_at') &&
+    hasTable('agent_processes')
   )
     return;
-  if (version.user_version > 15) {
+  if (version.user_version > 16) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -597,7 +599,15 @@ const migrate = (database: Database) => {
         last_error TEXT
       );
       CREATE INDEX IF NOT EXISTS outbox_claimable ON outbox(status, available_at, id);
-      PRAGMA user_version = 15;
+      -- Process groups of agents this daemon spawned, so an incarnation that
+      -- replaced one which left no finalizer behind can still reach its
+      -- children. Keyed by pgid: the runner knows nothing else about them.
+      CREATE TABLE IF NOT EXISTS agent_processes (
+        pgid INTEGER PRIMARY KEY CHECK (pgid > 1),
+        owner_id TEXT NOT NULL,
+        started_at INTEGER NOT NULL
+      );
+      PRAGMA user_version = 16;
     `);
     // Ordered after the CREATE TABLE above, like the `deliveries` and `jobs`
     // ALTERs: a fresh table is created complete, and only one predating the
@@ -766,6 +776,41 @@ export const claimOwnerRow = (database: Database, ownerId: string, now: number):
   if (result.changes !== 1) throw new Error('Another Lictor daemon claimed this database first');
 };
 
+/**
+ * Sends one signal to a recorded process group, reporting whether anything
+ * there could still receive it.
+ *
+ * ! A recorded number need not still name what it named when written — the row
+ * ! exists precisely because its writer may vanish without clearing it. The
+ * ! group rather than the pid narrows that to reuse within one boot, and the
+ * ! refused numbers close what it cannot: negated, 0 is this daemon's own group
+ * ! and 1 is every process this user owns, and our own pid is the group a
+ * ! daemon under `setsid`, systemd, or a shell job leads — measured as a
+ * ! startup killed by its own SIGTERM. `bootedAt` rules out the rest.
+ */
+const signalGroup = (pgid: number, signal: 'SIGTERM' | 'SIGKILL'): boolean => {
+  if (!Number.isInteger(pgid) || pgid < 2 || pgid === process.pid) return false;
+  try {
+    process.kill(-pgid, signal);
+    return true;
+  } catch (cause) {
+    return (cause as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+};
+
+/**
+ * When this machine booted, as a floor on which a record still means anything.
+ *
+ * ! A pgid does not survive a reboot: the numbers restart, so a pre-boot row
+ * ! names whatever the kernel handed its number to next — often a service
+ * ! leading a group of its own, which is just what a group-directed signal
+ * ! reaches. Rows this old are deleted unsignalled.
+ *
+ * Read from the wall clock, not `Clock`: the question is when the kernel's
+ * process table was last empty, which no logical clock knows.
+ */
+const bootedAt = (): number => Date.now() - uptime() * 1000;
+
 export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
   scoped: Effect.gen(function* () {
     const config = yield* LictorConfig;
@@ -774,23 +819,62 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
     );
     const startupTime = yield* Clock.currentTimeMillis;
     const ownerId = randomUUID();
+    const displaced = yield* attempt(
+      'read daemon ownership',
+      () =>
+        database
+          .query(
+            `SELECT owner_id AS ownerId, pid, heartbeat_at AS heartbeatAt, expires_at AS expiresAt
+             FROM daemon_owner WHERE singleton = 1`,
+          )
+          .get() as OwnerRow | null,
+    );
+    /**
+     * Kills whatever agents a previous incarnation left running.
+     *
+     * Every row present at startup belongs to one: the claim above established
+     * that no other daemon may hold this database, and this one has spawned
+     * nothing yet.
+     *
+     * ! Strictly before those agents' jobs go back to the queue. Requeueing
+     * ! first is not a smaller version of this fix but a worse bug — it hands
+     * ! the work to a second agent sooner, while the first is likeliest to
+     * ! still be alive and writing to the same subject.
+     */
+    const reapOrphanedAgents = Effect.gen(function* () {
+      const orphans = yield* attempt(
+        'read orphaned agent processes',
+        () =>
+          database
+            .query('SELECT pgid, started_at AS startedAt FROM agent_processes WHERE owner_id != ?')
+            .all(ownerId) as readonly { readonly pgid: number; readonly startedAt: number }[],
+      );
+      if (orphans.length === 0) return;
+      const booted = bootedAt();
+      const live = orphans.filter((orphan) => orphan.startedAt >= booted);
+      const signalled = live.filter((orphan) => signalGroup(orphan.pgid, 'SIGTERM'));
+      yield* Effect.logWarning('Reaping agents a previous daemon left behind').pipe(
+        Effect.annotateLogs({
+          groups: orphans.length,
+          stale: orphans.length - live.length,
+          reached: signalled.length,
+        }),
+      );
+      if (signalled.length > 0) {
+        yield* Effect.sleep('2 seconds');
+        for (const orphan of signalled) signalGroup(orphan.pgid, 'SIGKILL');
+      }
+      yield* attempt('clear orphaned agent processes', () =>
+        database.query('DELETE FROM agent_processes WHERE owner_id != ?').run(ownerId),
+      );
+    });
     yield* Effect.acquireRelease(
       Effect.gen(function* () {
-        const owner = yield* attempt(
-          'read daemon ownership',
-          () =>
-            database
-              .query(
-                `SELECT owner_id AS ownerId, pid, heartbeat_at AS heartbeatAt, expires_at AS expiresAt
-                 FROM daemon_owner WHERE singleton = 1`,
-              )
-              .get() as OwnerRow | null,
-        );
-        if (owner !== null && ownerDeniesClaim(owner, startupTime)) {
+        if (displaced !== null && ownerDeniesClaim(displaced, startupTime)) {
           // Logged as well as failed: `QueueError` carries no message, so a
           // described cause names the statement and never the daemon holding
           // the directory — the one thing the operator has to act on.
-          yield* Effect.logFatal(ownershipRefusal(owner, startupTime));
+          yield* Effect.logFatal(ownershipRefusal(displaced, startupTime));
           return yield* new QueueError({
             operation: 'claim daemon ownership',
             cause: undefined,
@@ -799,6 +883,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         yield* attempt('claim daemon ownership', () =>
           claimOwnerRow(database, ownerId, startupTime),
         );
+        yield* reapOrphanedAgents;
       }),
       () =>
         attempt('release daemon ownership', () => {
@@ -819,27 +904,38 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                  WHERE status = 'running' AND worker_id = ?`,
               )
               .run(now, now, now, ownerId);
+            database.query('DELETE FROM agent_processes WHERE owner_id = ?').run(ownerId);
             database.query('DELETE FROM daemon_owner WHERE owner_id = ?').run(ownerId);
           })();
         }).pipe(Effect.orElseSucceed(() => undefined)),
     );
+    /**
+     * The lease is not the only thing that strands a `running` row: a reload
+     * displaces an owner whose leases are all still live, and waiting them out
+     * leaves the job to `recoverStale` a minute later. Matched by worker
+     * instead, which `worker_id = NULL` makes inert when there was nothing to
+     * displace.
+     */
+    const strandedJobs = "status = 'running' AND (lease_expires_at < ? OR worker_id = ?)";
     const startupRecovered = yield* attempt('recover startup jobs', () =>
       database.transaction(() => {
         database
           .query(
             `UPDATE attempts SET status = 'interrupted', finished_at = ?, error = 'process restarted'
              WHERE status = 'running' AND job_id IN
-               (SELECT id FROM jobs WHERE status = 'running' AND lease_expires_at < ?)`,
+               (SELECT id FROM jobs WHERE ${strandedJobs})`,
           )
-          .run(startupTime, startupTime);
+          .run(startupTime, startupTime, displaced?.ownerId ?? null);
         return database
           .query(
             `UPDATE jobs
              SET status = 'interrupted', available_at = ?, claimed_at = NULL,
+                 worker_id = NULL, lease_expires_at = NULL,
                  interrupted_at = ?, last_error = 'process restarted', updated_at = ?
-             WHERE status = 'running' AND lease_expires_at < ?`,
+             WHERE ${strandedJobs}`,
           )
-          .run(startupTime, startupTime, startupTime, startupTime).changes;
+          .run(startupTime, startupTime, startupTime, startupTime, displaced?.ownerId ?? null)
+          .changes;
       })(),
     );
     if (Number(startupRecovered) > 0) {
@@ -1536,6 +1632,33 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               ).changes === 1,
         );
       });
+
+    /**
+     * Records a spawned agent's process group against this owner.
+     *
+     * Written before the agent can outlive the incarnation that started it, and
+     * read only by the next incarnation's takeover. A row that is never removed
+     * costs a signal to a group that is already gone; one that is never written
+     * costs an agent nothing can reach.
+     */
+    const registerAgentProcess = (pgid: number) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        yield* attempt('register agent process', () =>
+          database
+            .query(
+              `INSERT INTO agent_processes (pgid, owner_id, started_at) VALUES (?, ?, ?)
+               ON CONFLICT(pgid) DO UPDATE SET owner_id = excluded.owner_id,
+                 started_at = excluded.started_at`,
+            )
+            .run(pgid, ownerId, now),
+        );
+      });
+
+    const forgetAgentProcess = (pgid: number) =>
+      attempt('forget agent process', () =>
+        database.query('DELETE FROM agent_processes WHERE pgid = ?').run(pgid),
+      );
 
     const heartbeatDaemon = Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
@@ -2432,6 +2555,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       recordNarrowing,
       heartbeat,
       heartbeatDaemon,
+      registerAgentProcess,
+      forgetAgentProcess,
       complete,
       fail,
       park,

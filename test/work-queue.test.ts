@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { describe, expect, it } from 'bun:test';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir, uptime } from 'node:os';
 import { join } from 'node:path';
 import {
   Cause,
@@ -2084,7 +2084,7 @@ describe('WorkQueue', () => {
       const after = new Database(path);
       expect(
         (after.query('PRAGMA user_version').get() as { user_version: number }).user_version,
-      ).toBe(15);
+      ).toBe(16);
       after.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -2335,7 +2335,7 @@ describe('WorkQueue', () => {
       ).toContain('grant');
       expect(
         (after.query('PRAGMA user_version').get() as { user_version: number }).user_version,
-      ).toBe(15);
+      ).toBe(16);
       after.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -2383,8 +2383,9 @@ describe('WorkQueue', () => {
       repaired.close();
 
       expect(columns).toContain('narrowing');
-      // Diagnostic column, so a daemon rolled back past it still starts.
-      expect(stamp).toBe(15);
+      // Diagnostic column, so a daemon rolled back past it still starts. The
+      // stamp is the current one, which `agent_processes` moved to 16.
+      expect(stamp).toBe(16);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -2394,7 +2395,7 @@ describe('WorkQueue', () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
     const database = new Database(path, { create: true });
-    database.exec('PRAGMA user_version = 16');
+    database.exec('PRAGMA user_version = 17');
     database.close();
 
     try {
@@ -2414,7 +2415,7 @@ describe('WorkQueue', () => {
       // stamp into the migration body would die on an ALTER against a table it
       // never created, reading as a corrupt database rather than a newer one.
       expect(exit._tag === 'Failure' ? wrappedMessage(exit.cause) : '').toContain(
-        'Unsupported queue schema version 16',
+        'Unsupported queue schema version 17',
       );
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -2477,6 +2478,16 @@ describe('WorkQueue', () => {
       .get() as { readonly ownerId: string; readonly pid: number | null } | null;
     database.close();
     return row;
+  };
+
+  /** The process groups recorded in a database, read through its own handle. */
+  const readGroups = (path: string): number[] => {
+    const database = new Database(path);
+    const rows = database.query('SELECT pgid FROM agent_processes ORDER BY pgid').all() as {
+      readonly pgid: number;
+    }[];
+    database.close();
+    return rows.map((row) => row.pgid);
   };
 
   /**
@@ -2625,10 +2636,10 @@ describe('WorkQueue', () => {
   });
 
   /**
-   * The takeover grace, and the moment the claim reads as its `now`. The
-   * fixtures below are offsets from that moment, which is the only way to sit a
-   * row exactly on a boundary: the claim reads `Clock.currentTimeMillis`, so a
-   * fixture built from `Date.now()` lands a few milliseconds off it and both
+   * The takeover grace, and the moment the claim reads as its `now`. The fixtures
+   * below are offsets from that moment, which is the only way to sit a row
+   * exactly on a boundary: the claim reads `Clock.currentTimeMillis`, so a
+   * fixture built from `Date.now()` lands a few milliseconds off it, and both
    * comparisons survive being flipped.
    */
   const graceMs = 10 * 60_000;
@@ -2782,6 +2793,308 @@ describe('WorkQueue', () => {
 
     expect(exit._tag).toBe('Failure');
     expect(logged.join('\n')).toContain('pid 1,');
+  });
+
+  /**
+   * Leaves the state a `bun --watch` reload leaves: the row this pid claimed is
+   * still there with a live lease, and so is the job it was running, because
+   * nothing ran a finalizer. Written through a second handle rather than by
+   * releasing a scope, which is exactly the cleanup that does not happen.
+   */
+  const stranded = (path: string, setUp: (database: Database) => void) => {
+    const database = new Database(path);
+    database
+      .query(
+        `INSERT INTO daemon_owner (singleton, owner_id, heartbeat_at, expires_at, pid)
+         VALUES (1, 'previous-daemon', ?, ?, ?)`,
+      )
+      .run(Date.now(), Date.now() + 30_000, process.pid);
+    setUp(database);
+    database.close();
+  };
+
+  it('reclaims the displaced owner’s running jobs while their leases are still live', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-owner-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* queue.enqueue(work('stranded'));
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+      stranded(path, (database) => {
+        database
+          .query(
+            `UPDATE jobs SET status = 'running', attempts = 1, worker_id = 'previous-daemon',
+               claimed_at = ?, lease_expires_at = ? WHERE id = 1`,
+          )
+          .run(Date.now(), Date.now() + 60_000);
+      });
+
+      const job = await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(WorkQueue, (queue) => queue.job(1)).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      // Without the worker arm this row waits out its live lease and only
+      // `recoverStale` frees it, a minute into a daemon that is already serving.
+      expect(job?.status).toBe('interrupted');
+      expect(job?.workerId).toBeUndefined();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  /** Polls until a pid names nothing, or the deadline passes. */
+  const awaitGone = async (pid: number, budgetMs = 5000): Promise<boolean> => {
+    const deadline = Date.now() + budgetMs;
+    while (Date.now() < deadline) {
+      if (!processAlive(pid)) return true;
+      await Bun.sleep(25);
+    }
+    return false;
+  };
+
+  /**
+   * A detached shell holding a `sleep` of its own, and the grandchild's pid.
+   *
+   * ! The grandchild is what makes this a test of the signal's *group*. A lone
+   * ! detached child leads a group whose only member is itself, so a bare-pid
+   * ! kill reaches it identically and the distinction the reap rests on goes
+   * ! unmeasured. Signal the group and both die; signal the pid and the
+   * ! grandchild is orphaned and runs on — which is the production failure.
+   */
+  const orphanedGroup = async (directory: string) => {
+    const marker = join(directory, 'grandchild.pid');
+    const leader = Bun.spawn(['sh', '-c', `sleep 30 & echo $! > ${marker}; wait`], {
+      detached: true,
+      stdout: 'ignore',
+      stderr: 'ignore',
+    });
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && !existsSync(marker)) await Bun.sleep(25);
+    const grandchild = Number(readFileSync(marker, 'utf8').trim());
+    expect(grandchild).toBeGreaterThan(1);
+    return { leader, grandchild };
+  };
+
+  it('kills the agent process groups a displaced owner left recorded', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-owner-'));
+    const path = join(directory, 'queue.sqlite');
+    const { leader, grandchild } = await orphanedGroup(directory);
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))));
+      stranded(path, (database) => {
+        database
+          .query('INSERT INTO agent_processes (pgid, owner_id, started_at) VALUES (?, ?, ?)')
+          .run(leader.pid, 'previous-daemon', Date.now());
+      });
+
+      await Effect.runPromise(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))));
+
+      const leaderGone = await awaitGone(leader.pid);
+      const grandchildGone = await awaitGone(grandchild);
+      const remaining = readGroups(path);
+
+      expect(leaderGone).toBe(true);
+      expect(grandchildGone).toBe(true);
+      expect(remaining).toEqual([]);
+    } finally {
+      leader.kill('SIGKILL');
+      try {
+        process.kill(grandchild, 'SIGKILL');
+      } catch {
+        // Already reaped, which is what the assertions above expect.
+      }
+      rmSync(directory, { recursive: true, force: true });
+    }
+    // The reap's SIGTERM grace is a real two seconds against bun's 5s default.
+  }, 20_000);
+
+  /**
+   * A record older than the boot names nothing this daemon started, so the
+   * bystander must survive untouched. See `bootedAt` for why.
+   */
+  it('deletes a recorded group predating the boot instead of signalling it', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-owner-'));
+    const path = join(directory, 'queue.sqlite');
+    const bystander = Bun.spawn(['sleep', '30'], { detached: true, stdout: 'ignore' });
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))));
+      stranded(path, (database) => {
+        database
+          .query('INSERT INTO agent_processes (pgid, owner_id, started_at) VALUES (?, ?, ?)')
+          // One second before this machine booted, which no record written by a
+          // daemon running on it can be.
+          .run(bystander.pid, 'previous-daemon', Date.now() - uptime() * 1000 - 1000);
+      });
+
+      await Effect.runPromise(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))));
+
+      expect(processAlive(bystander.pid)).toBe(true);
+      expect(readGroups(path)).toEqual([]);
+    } finally {
+      bystander.kill('SIGKILL');
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The daemon surviving a row that names its own pid — deleted, not signalled.
+   *
+   * Asserts the outcome, not the guard: `kill(-pid)` reaches a group only
+   * where the daemon leads one, which a test runner does not, so the guard and
+   * its absence both end in `ESRCH` here. Kept because the self-kill was
+   * measured on a process that did lead its group, and reproducing that needs
+   * `setsid` — Linux-only, so pinning it would cost the macOS run.
+   */
+  it('deletes a recorded group holding the daemon’s own pid rather than signalling it', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-owner-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))));
+      stranded(path, (database) => {
+        database
+          .query('INSERT INTO agent_processes (pgid, owner_id, started_at) VALUES (?, ?, ?)')
+          .run(process.pid, 'previous-daemon', Date.now());
+      });
+
+      const exit = await Effect.runPromise(
+        Effect.exit(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path)))),
+      );
+
+      // Alive to assert it at all, which is the point: the mutant dies here.
+      expect(processAlive(process.pid)).toBe(true);
+      expect(exit._tag).toBe('Success');
+      expect(readGroups(path)).toEqual([]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The second pgid is never forgotten, so it is the only thing that proves
+   * the release clears what this owner still holds.
+   */
+  it('records and forgets an agent process group against the running owner', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-owner-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      const seen = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* queue.registerAgentProcess(4242);
+            yield* queue.registerAgentProcess(4243);
+            const recorded = readGroups(path);
+            yield* queue.forgetAgentProcess(4242);
+            return { recorded, afterForget: readGroups(path) };
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(seen.recorded).toEqual([4242, 4243]);
+      expect(seen.afterForget).toEqual([4243]);
+      // Past the scope: the release owes the table the rows this owner kept.
+      expect(readGroups(path)).toEqual([]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The log order is what pins the reap-before-requeue rule; see
+   * `reapOrphanedAgents` for why that order is the fix rather than a detail.
+   */
+  it('kills the orphaned agents before returning their jobs to the queue', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-owner-'));
+    const path = join(directory, 'queue.sqlite');
+    const logged: string[] = [];
+    const orphan = Bun.spawn(['sleep', '30'], { detached: true, stdout: 'ignore' });
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            yield* queue.enqueue(work('ordered'));
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+      stranded(path, (database) => {
+        database
+          .query(
+            `UPDATE jobs SET status = 'running', attempts = 1, worker_id = 'previous-daemon',
+               claimed_at = ?, lease_expires_at = ? WHERE id = 1`,
+          )
+          .run(Date.now(), Date.now() + 60_000);
+        database
+          .query('INSERT INTO agent_processes (pgid, owner_id, started_at) VALUES (?, ?, ?)')
+          .run(orphan.pid, 'previous-daemon', Date.now());
+      });
+
+      await Effect.runPromise(
+        Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))).pipe(
+          Effect.provide(
+            Logger.replace(
+              Logger.defaultLogger,
+              Logger.make<unknown, void>(({ message }) => {
+                logged.push(String(message));
+              }),
+            ),
+          ),
+        ),
+      );
+
+      const killed = logged.indexOf('Reaping agents a previous daemon left behind');
+      const recovered = logged.indexOf('Recovered interrupted work');
+
+      expect(killed).toBeGreaterThanOrEqual(0);
+      expect(recovered).toBeGreaterThanOrEqual(0);
+      expect(killed).toBeLessThan(recovered);
+    } finally {
+      orphan.kill('SIGKILL');
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  // The v14 fast path returns before the migration body, so a deployed database
+  // reaches a table added after it only if the guard names that table too.
+  it('adds the agent process table to a database already stamped version 14', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))));
+      const stripped = new Database(path);
+      stripped.exec('DROP TABLE agent_processes');
+      stripped.exec('PRAGMA user_version = 14');
+      stripped.close();
+
+      const exit = await Effect.runPromise(
+        Effect.exit(Effect.scoped(Effect.provide(WorkQueue, queueLayer(path)))),
+      );
+
+      const repaired = new Database(path);
+      const tables = (
+        repaired.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as {
+          name: string;
+        }[]
+      ).map((table) => table.name);
+      const stamp = (repaired.query('PRAGMA user_version').get() as { user_version: number })
+        .user_version;
+      repaired.close();
+
+      expect(exit._tag).toBe('Success');
+      expect(tables).toContain('agent_processes');
+      // Re-stamped as well as repaired: a migration that creates the table and
+      // leaves the stamp behind runs its whole body again on every open.
+      expect(stamp).toBe(16);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('dead-letters an expired claim at the attempt limit', async () => {

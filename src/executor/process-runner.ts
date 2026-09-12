@@ -13,6 +13,19 @@ export type ProcessRequest = {
    */
   readonly stderrRetention: 'head' | 'tail';
   readonly env?: Readonly<Record<string, string>>;
+  /**
+   * Durable record of the child's process group, kept for as long as the child
+   * runs. Supplied only where a child can outlive the process that started it:
+   * this one spawns detached and is killed from a finalizer, and a `bun --watch`
+   * reload reaches neither.
+   */
+  readonly register?: ProcessGroupRecord;
+};
+
+export type ProcessGroupRecord = {
+  readonly record: (pgid: number) => Effect.Effect<void, ProcessError>;
+  /** Unfailing: a row left behind costs one signal to a group already gone. */
+  readonly forget: (pgid: number) => Effect.Effect<void>;
 };
 
 export type ProcessResult = {
@@ -119,6 +132,27 @@ const capture = (
   return read;
 };
 
+/**
+ * Signals the child's whole process group, reporting whether anything there
+ * received it. Falls back to the child alone where the spawn produced no group
+ * of its own to signal.
+ */
+const sweep = (child: Bun.Subprocess, signal: 'SIGTERM' | 'SIGKILL'): boolean => {
+  try {
+    process.kill(-child.pid, signal);
+    return true;
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code !== 'ESRCH') return true;
+    if (child.exitCode !== null) return false;
+    try {
+      child.kill(signal);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+};
+
 export class ProcessRunner extends Effect.Service<ProcessRunner>()('ProcessRunner', {
   effect: Effect.succeed({
     run: (request: ProcessRequest) =>
@@ -135,55 +169,55 @@ export class ProcessRunner extends Effect.Service<ProcessRunner>()('ProcessRunne
             }),
           catch: (cause) => new ProcessError({ message: 'Could not start process', cause }),
         }),
-        (process) =>
-          Effect.all(
-            {
-              exitCode: Effect.tryPromise({
-                try: () => process.exited,
-                catch: (cause) => new ProcessError({ message: 'Process wait failed', cause }),
+        (child) =>
+          // Recorded here rather than in the acquire, so a record that fails
+          // still reaches the release that kills what it could not record.
+          Effect.zipRight(
+            request.register?.record(child.pid) ?? Effect.void,
+            Effect.all(
+              {
+                exitCode: Effect.tryPromise({
+                  try: () => child.exited,
+                  catch: (cause) => new ProcessError({ message: 'Process wait failed', cause }),
+                }),
+                // Drained, not read: no caller parses stdout any more, but an
+                // unread pipe fills and blocks the child until the timeout.
+                stdout: capture(child.stdout, request.outputLimitBytes, 'head'),
+                stderr: capture(child.stderr, request.outputLimitBytes, request.stderrRetention),
+              },
+              { concurrency: 'unbounded' },
+            ).pipe(
+              Effect.timeoutFail({
+                duration: request.timeoutMs,
+                onTimeout: () =>
+                  new ProcessError({ message: `Process timed out after ${request.timeoutMs}ms` }),
               }),
-              // Drained, not read: no caller parses stdout any more, but an
-              // unread pipe fills and blocks the child until the timeout.
-              stdout: capture(process.stdout, request.outputLimitBytes, 'head'),
-              stderr: capture(process.stderr, request.outputLimitBytes, request.stderrRetention),
-            },
-            { concurrency: 'unbounded' },
-          ).pipe(
-            Effect.timeoutFail({
-              duration: request.timeoutMs,
-              onTimeout: () =>
-                new ProcessError({ message: `Process timed out after ${request.timeoutMs}ms` }),
-            }),
-            Effect.map(({ exitCode, stdout, stderr }) => ({
-              exitCode,
-              stdout: stdout.text,
-              stderr: stderr.text,
-              stdoutTruncated: stdout.truncated,
-              stderrTruncated: stderr.truncated,
-            })),
+              Effect.map(({ exitCode, stdout, stderr }) => ({
+                exitCode,
+                stdout: stdout.text,
+                stderr: stderr.text,
+                stdoutTruncated: stdout.truncated,
+                stderrTruncated: stderr.truncated,
+              })),
+            ),
           ),
         (child) =>
-          child.exitCode !== null
-            ? Effect.void
-            : Effect.sync(() => {
-                try {
-                  process.kill(-child.pid, 'SIGTERM');
-                } catch {
-                  child.kill('SIGTERM');
-                }
-              }).pipe(
-                Effect.zipRight(Effect.sleep('2 seconds')),
-                Effect.zipRight(
-                  Effect.sync(() => {
-                    if (child.exitCode !== null) return;
-                    try {
-                      process.kill(-child.pid, 'SIGKILL');
-                    } catch {
-                      child.kill('SIGKILL');
-                    }
-                  }),
-                ),
-              ),
+          // ! Swept whether the child exited or survived, and forgotten only
+          // ! after. A process group outlives its leader, so a descendant runs
+          // ! on while `exitCode` reports success and this row is the last
+          // ! durable way to reach it; a release that dies between the two then
+          // ! leaves a stale row rather than an agent nothing can find. An empty
+          // ! group is `ESRCH`, so an ordinary run pays one syscall and no grace.
+          Effect.zipRight(
+            Effect.suspend(() =>
+              sweep(child, 'SIGTERM')
+                ? Effect.sleep('2 seconds').pipe(
+                    Effect.zipRight(Effect.sync(() => sweep(child, 'SIGKILL'))),
+                  )
+                : Effect.void,
+            ),
+            request.register?.forget(child.pid) ?? Effect.void,
+          ),
       ),
   }),
 }) {}

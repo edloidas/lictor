@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'bun:test';
 import { Effect } from 'effect';
-import { ProcessRunner } from '../src/executor/process-runner.ts';
+import { ProcessError, ProcessRunner } from '../src/executor/process-runner.ts';
+
+/** The errno a signalling call raised, or `undefined` if it raised nothing. */
+const errnoOf = (attempt: () => void): string | undefined => {
+  try {
+    attempt();
+    return undefined;
+  } catch (cause) {
+    return (cause as NodeJS.ErrnoException).code;
+  }
+};
 
 describe('ProcessRunner', () => {
   it('captures only the configured number of bytes while draining the process', async () => {
@@ -321,4 +331,125 @@ describe('ProcessRunner', () => {
     expect(tail.stderrTruncated).toBe(true);
     expect(Buffer.byteLength(tail.stderr)).toBeLessThanOrEqual(4096);
   });
+
+  /**
+   * ! The child reports its process *group*, never its pid. They are equal only
+   * ! because `detached: true` makes it a group leader, which is the premise the
+   * ! registry rests on — drop the flag and the recorded number names a group
+   * ! holding the daemon itself. A child printing `process.pid` reads the same
+   * ! either way and measures none of it.
+   */
+  it('records the spawned child’s own process group, not the daemon’s', async () => {
+    const events: string[] = [];
+    let spawned = 0;
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runner = yield* ProcessRunner;
+        return yield* runner.run({
+          command: ['sh', '-c', 'ps -o pgid= -p $$'],
+          cwd: process.cwd(),
+          input: '',
+          timeoutMs: 5000,
+          outputLimitBytes: 64,
+          stderrRetention: 'head',
+          register: {
+            record: (pgid) =>
+              Effect.sync(() => {
+                spawned = pgid;
+                events.push('record');
+              }),
+            forget: (pgid) =>
+              Effect.sync(() => {
+                events.push(pgid === spawned ? 'forget' : 'forget-other');
+              }),
+          },
+        });
+      }).pipe(Effect.provide(ProcessRunner.Default)),
+    );
+
+    expect(Number(result.stdout.trim())).toBe(spawned);
+    expect(spawned).not.toBe(process.pid);
+    expect(events).toEqual(['record', 'forget']);
+  });
+
+  // Codex exiting cleanly while a command it started runs on is a success by
+  // `exitCode` and a live writer in the workspace in fact. See the release in
+  // `process-runner.ts` for why the sweep cannot be conditional on the leader.
+  it('sweeps a group that outlived its leader before forgetting it', async () => {
+    let pgid = 0;
+    let survivor = 0;
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const runner = yield* ProcessRunner;
+        return yield* runner.run({
+          // Exits 0 at once, leaving `sleep` behind in its group. The
+          // grandchild's output is redirected so it does not hold the pipe the
+          // runner drains — otherwise the run waits out its timeout instead of
+          // reaching the clean-exit case this pins.
+          command: ['sh', '-c', 'sleep 30 >/dev/null 2>&1 & echo $!; exit 0'],
+          cwd: process.cwd(),
+          input: '',
+          timeoutMs: 10_000,
+          outputLimitBytes: 64,
+          stderrRetention: 'head',
+          register: {
+            record: (recorded) =>
+              Effect.sync(() => {
+                pgid = recorded;
+              }),
+            forget: () => Effect.void,
+          },
+        });
+      }).pipe(Effect.provide(ProcessRunner.Default)),
+    );
+    survivor = Number(result.stdout.trim());
+
+    expect(result.exitCode).toBe(0);
+    expect(pgid).toBeGreaterThan(1);
+    expect(survivor).toBeGreaterThan(1);
+    expect(errnoOf(() => process.kill(survivor, 0))).toBe('ESRCH');
+  }, 20_000);
+
+  // The record is taken inside `use`, not the acquire, for exactly this: a
+  // child the daemon cannot write down is one it could never kill later, so the
+  // failure has to reach the release that kills it now.
+  it('kills a child it could not record, rather than leaving it unrecorded', async () => {
+    let pgid = 0;
+    // `flip`, not `exit`: a run that succeeded here would be the defect, and
+    // the message distinguishes this failure from a spawn error or a timeout,
+    // which reach the same `Failure` tag by a different route.
+    const error = await Effect.runPromise(
+      Effect.flip(
+        Effect.gen(function* () {
+          const runner = yield* ProcessRunner;
+          return yield* runner.run({
+            command: ['sleep', '30'],
+            cwd: process.cwd(),
+            input: '',
+            timeoutMs: 30_000,
+            outputLimitBytes: 64,
+            stderrRetention: 'head',
+            register: {
+              record: (recorded) =>
+                Effect.zipRight(
+                  Effect.sync(() => {
+                    pgid = recorded;
+                  }),
+                  Effect.fail(new ProcessError({ message: 'Could not record it' })),
+                ),
+              forget: () => Effect.void,
+            },
+          });
+        }).pipe(Effect.provide(ProcessRunner.Default)),
+      ),
+    );
+
+    expect(error.message).toBe('Could not record it');
+    expect(pgid).toBeGreaterThan(1);
+    // ESRCH, not merely a throw: EPERM would mean the group is alive and this
+    // user may not signal it, which is the opposite of what is claimed.
+    expect(errnoOf(() => process.kill(-pgid, 0))).toBe('ESRCH');
+  }, 20_000);
 });
