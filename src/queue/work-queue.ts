@@ -739,6 +739,33 @@ const ownerDeniesClaim = (owner: OwnerRow, now: number): boolean => {
 const ownershipRefusal = (owner: OwnerRow, now: number): string =>
   `Another Lictor daemon owns this database: ${owner.pid === null ? 'pid unrecorded' : `pid ${owner.pid}`}, last heartbeat ${Math.round((now - owner.heartbeatAt) / 1000)}s ago. Stop it, or point LICTOR_DATABASE_PATH at a different state directory.`;
 
+/**
+ * Takes the ownership row, or throws if the row moved under the read that
+ * allowed it.
+ *
+ * Separate from that read so the mismatch is reachable at all: every row the
+ * read admits satisfies this `WHERE` — its two arms are the read's two against
+ * the same `now` — so only a write landing between the two makes the count
+ * zero, which a caller can arrange here and cannot there.
+ */
+export const claimOwnerRow = (database: Database, ownerId: string, now: number): void => {
+  const result = database
+    .query(
+      `INSERT INTO daemon_owner (singleton, owner_id, heartbeat_at, expires_at, pid)
+       VALUES (1, ?, ?, ?, ?)
+       ON CONFLICT(singleton) DO UPDATE SET owner_id = excluded.owner_id,
+         heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at,
+         pid = excluded.pid
+       WHERE daemon_owner.expires_at < ? OR daemon_owner.pid = ?`,
+    )
+    .run(ownerId, now, now + DAEMON_LEASE_MS, process.pid, now, process.pid);
+  // The predicate decides, not the read above: two starters that both find the
+  // owner gone reach here, and only one matches a lapsed lease. The pid arm
+  // does not widen that — two starters are two processes, so only one of them
+  // can match its own number.
+  if (result.changes !== 1) throw new Error('Another Lictor daemon claimed this database first');
+};
+
 export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
   scoped: Effect.gen(function* () {
     const config = yield* LictorConfig;
@@ -769,31 +796,9 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             cause: undefined,
           });
         }
-        yield* attempt('claim daemon ownership', () => {
-          const result = database
-            .query(
-              `INSERT INTO daemon_owner (singleton, owner_id, heartbeat_at, expires_at, pid)
-               VALUES (1, ?, ?, ?, ?)
-               ON CONFLICT(singleton) DO UPDATE SET owner_id = excluded.owner_id,
-                 heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at,
-                 pid = excluded.pid
-               WHERE daemon_owner.expires_at < ? OR daemon_owner.pid = ?`,
-            )
-            .run(
-              ownerId,
-              startupTime,
-              startupTime + DAEMON_LEASE_MS,
-              process.pid,
-              startupTime,
-              process.pid,
-            );
-          // The predicate decides, not the read above: two starters that both
-          // find the owner gone reach here, and only one matches a lapsed lease.
-          // The pid arm does not widen that — two starters are two processes,
-          // so only one of them can match its own number.
-          if (result.changes !== 1)
-            throw new Error('Another Lictor daemon claimed this database first');
-        });
+        yield* attempt('claim daemon ownership', () =>
+          claimOwnerRow(database, ownerId, startupTime),
+        );
       }),
       () =>
         attempt('release daemon ownership', () => {
