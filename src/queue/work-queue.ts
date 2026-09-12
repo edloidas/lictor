@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { Clock, Data, Effect, Schema } from 'effect';
 import { LictorConfig } from '../config.ts';
+import { type Grant, GrantSchema } from '../github/grant.ts';
 import { processAlive } from '../process-liveness.ts';
 import { type WorkItem, WorkItemSchema } from '../work-item.ts';
 
@@ -193,6 +194,19 @@ export type QueuedJob = {
   readonly questionId?: string;
   /** Logins allowed to answer that question, fixed when it was asked. */
   readonly questionAnswerers?: readonly string[];
+  /**
+   * What the daemon authorized when it admitted this job. Absent on a row
+   * written before grants were recorded, which falls back to live policy.
+   */
+  readonly grant?: Grant;
+  /**
+   * ! A grant is recorded and will not decode. Not the same as none recorded:
+   * ! absent means no ceiling exists and live policy is the authority the job
+   * ! already had; unreadable means a ceiling exists, and reading it as absent
+   * ! would silently widen it — on every row a newer grant version wrote, if a
+   * ! daemon is rolled back past one. The worker refuses such a row.
+   */
+  readonly grantUnreadable?: true;
 };
 
 export type QueueCounts = Readonly<Record<JobStatus, number>>;
@@ -220,6 +234,7 @@ type JobRow = {
   readonly questionAnswerers?: string | null;
   readonly workerId?: string | null;
   readonly leaseExpiresAt?: number | null;
+  readonly grant?: string | null;
 };
 
 type OutboxRow = {
@@ -323,6 +338,7 @@ const migrate = (database: Database) => {
     hasColumn('jobs', 'hold_expires_at') &&
     hasColumn('jobs', 'question_id') &&
     hasColumn('jobs', 'question_answerers') &&
+    hasColumn('jobs', 'grant') &&
     hasTable('notification_cursors') &&
     hasTable('poller_state') &&
     hasTable('subject_branches') &&
@@ -332,7 +348,7 @@ const migrate = (database: Database) => {
     hasColumn('outbox', 'lease_expires_at')
   )
     return;
-  if (version.user_version > 14) {
+  if (version.user_version > 15) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -485,6 +501,9 @@ const migrate = (database: Database) => {
     if (!hasColumn('jobs', 'question_answerers')) {
       database.exec('ALTER TABLE jobs ADD COLUMN question_answerers TEXT');
     }
+    if (!hasColumn('jobs', 'grant')) {
+      database.exec('ALTER TABLE jobs ADD COLUMN grant TEXT');
+    }
     database.exec(`
       CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs(status, available_at, id);
       CREATE TABLE IF NOT EXISTS daemon_owner (
@@ -559,7 +578,7 @@ const migrate = (database: Database) => {
         last_error TEXT
       );
       CREATE INDEX IF NOT EXISTS outbox_claimable ON outbox(status, available_at, id);
-      PRAGMA user_version = 14;
+      PRAGMA user_version = 15;
     `);
     // Ordered after the CREATE TABLE above, like the `deliveries` and `jobs`
     // ALTERs: a fresh table is created complete, and only one predating the
@@ -616,6 +635,16 @@ const decodeAnswerers = (stored: string | null | undefined): readonly string[] =
   }
 };
 
+/** Never throws, for the reason `decodeAnswerers` does not. */
+const grantOf = (stored: string | null | undefined): { grant?: Grant; grantUnreadable?: true } => {
+  if (stored == null) return {};
+  try {
+    return { grant: Schema.decodeUnknownSync(GrantSchema)(JSON.parse(stored)) };
+  } catch {
+    return { grantUnreadable: true };
+  }
+};
+
 const decodeJob = (row: JobRow): QueuedJob => ({
   id: row.id,
   work: Schema.decodeUnknownSync(WorkItemSchema)(JSON.parse(row.payload)),
@@ -635,6 +664,7 @@ const decodeJob = (row: JobRow): QueuedJob => ({
       }),
   ...(row.workerId == null ? {} : { workerId: row.workerId }),
   ...(row.leaseExpiresAt == null ? {} : { leaseExpiresAt: row.leaseExpiresAt }),
+  ...grantOf(row.grant),
 });
 
 type OwnerRow = {
@@ -1331,7 +1361,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               const row = database
                 .query(
                   `SELECT id, payload, status, attempts, created_at AS createdAt,
-                      ready_at AS readyAt
+                      ready_at AS readyAt, grant
                FROM jobs
                WHERE status IN ('pending', 'retry', 'interrupted') AND available_at <= ?
                  AND question_id IS NULL
@@ -1409,6 +1439,33 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           if (result.changes !== 1)
             throw new Error(`Job ${jobId} attempt ${attemptNumber} is stale`);
         });
+      });
+
+    /**
+     * ! `grant IS NULL` is what makes the mint once: a later attempt writing a
+     * ! grant derived from policy edited since would replace the ceiling with
+     * ! the widening it exists to block. A lost race is not an error — the row
+     * ! already holds a grant, read back on the next claim.
+     */
+    const recordGrant = (
+      jobId: number,
+      attemptNumber: number,
+      workerId: string,
+      grant: Grant,
+    ): Effect.Effect<boolean, QueueError> =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        return yield* attempt(
+          'record job grant',
+          () =>
+            database
+              .query(
+                `UPDATE jobs SET grant = ?, updated_at = ?
+               WHERE id = ? AND status = 'running' AND attempts = ? AND worker_id = ?
+                 AND grant IS NULL`,
+              )
+              .run(JSON.stringify(grant), now, jobId, attemptNumber, workerId).changes === 1,
+        );
       });
 
     const heartbeatDaemon = Effect.gen(function* () {
@@ -2029,7 +2086,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       attempt('list jobs', () => {
         const rows = database
           .query(
-            `SELECT id, payload, status, attempts, last_error AS lastError,
+            `SELECT id, payload, status, attempts, last_error AS lastError, grant,
                created_at AS createdAt, updated_at AS updatedAt,
                ready_at AS readyAt, outcome, hold_expires_at AS holdExpiresAt,
                question_id AS questionId, question_answerers AS questionAnswerers
@@ -2078,7 +2135,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       attempt('inspect job', () => {
         const row = database
           .query(
-            `SELECT id, payload, status, attempts, last_error AS lastError,
+            `SELECT id, payload, status, attempts, last_error AS lastError, grant,
                created_at AS createdAt, updated_at AS updatedAt,
                ready_at AS readyAt, outcome, hold_expires_at AS holdExpiresAt,
                question_id AS questionId, question_answerers AS questionAnswerers,
@@ -2289,6 +2346,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       enqueue,
       claim,
       claimFor,
+      recordGrant,
       heartbeat,
       heartbeatDaemon,
       complete,
