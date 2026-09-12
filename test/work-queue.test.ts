@@ -2167,11 +2167,24 @@ describe('WorkQueue', () => {
     const path = join(directory, 'queue.sqlite');
     const logged: string[] = [];
     try {
-      const exit = await Effect.runPromise(
+      const { claimedPid, exit } = await Effect.runPromise(
         Effect.scoped(
           Effect.gen(function* () {
             yield* WorkQueue;
-            return yield* Effect.exit(
+            // Re-pointed at a foreign live pid rather than stamped from
+            // nothing, so the row under test is one the claim path really
+            // wrote — read before the overwrite, since a claim recording no pid
+            // would otherwise refuse on the number this test just supplied.
+            const claimedPid = yield* Effect.sync(() => {
+              const database = new Database(path);
+              const row = database
+                .query('SELECT pid FROM daemon_owner WHERE singleton = 1')
+                .get() as { readonly pid: number | null };
+              database.exec('UPDATE daemon_owner SET pid = 1 WHERE singleton = 1');
+              database.close();
+              return row.pid;
+            });
+            const exit = yield* Effect.exit(
               Effect.scoped(Effect.provide(WorkQueue, queueLayer(path))).pipe(
                 Effect.provide(
                   Logger.replace(
@@ -2183,14 +2196,15 @@ describe('WorkQueue', () => {
                 ),
               ),
             );
+            return { claimedPid, exit };
           }).pipe(Effect.provide(queueLayer(path))),
         ),
       );
+      expect(claimedPid).toBe(process.pid);
       expect(exit._tag).toBe('Failure');
       // The pid, not just the operation name: an operator who cannot see which
-      // process holds the directory has nothing to act on. This is the
-      // live-owner case, so the pid it names is this process's own.
-      expect(logged.join('\n')).toContain(`pid ${process.pid}`);
+      // process holds the directory has nothing to act on.
+      expect(logged.join('\n')).toContain('pid 1,');
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -2266,6 +2280,17 @@ describe('WorkQueue', () => {
     const { exit } = await claimAgainstOwner({
       pid: process.pid,
       expiresAt: Date.now() - 60_000,
+    });
+
+    expect(exit._tag).toBe('Success');
+  });
+
+  // The watch-mode reload: `bun --watch` re-executes the image in place, so no
+  // finalizer releases the row and the lease it left behind is still live.
+  it('takes over a record that holds its own pid before the lease lapses', async () => {
+    const { exit } = await claimAgainstOwner({
+      pid: process.pid,
+      expiresAt: Date.now() + 30_000,
     });
 
     expect(exit._tag).toBe('Success');
