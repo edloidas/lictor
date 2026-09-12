@@ -17,7 +17,11 @@ import { type ProcessRequest, ProcessRunner } from '../src/executor/process-runn
 import { GitHubCredential } from '../src/github/credential.ts';
 import type { RepositoryPolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
-import { DiskStat, RepositoryWorkspace } from '../src/workspace/repository-workspace.ts';
+import {
+  DiskStat,
+  RepositoryWorkspace,
+  WorkspaceError,
+} from '../src/workspace/repository-workspace.ts';
 
 const job = { id: 10, repository: 'edloidas/lictor' };
 
@@ -122,6 +126,24 @@ const ok = () => ({
 type Acquire = InstanceType<typeof RepositoryWorkspace>['acquire'];
 
 /** Builds (not runs) an `acquire`, so each test decides how to interpret it. */
+/**
+ * The `WorkspaceError` a failed acquire ended on.
+ *
+ * Read out of the cause rather than searched for in `String(exit)`: the
+ * stringified exit carries every nested message and any defect's stack, so a
+ * substring match passes on a code that merely appears somewhere in it, on a
+ * die where a typed failure was meant, and on one of the three other error
+ * types `acquire` can fail with.
+ */
+const failedWith = (exit: Exit.Exit<unknown, unknown>): WorkspaceError => {
+  expect(Exit.isFailure(exit)).toBe(true);
+  const failure = Exit.isFailure(exit) ? Cause.failureOption(exit.cause) : Option.none();
+  expect(Option.isSome(failure)).toBe(true);
+  const error = Option.getOrThrow(failure);
+  expect(error).toBeInstanceOf(WorkspaceError);
+  return error as WorkspaceError;
+};
+
 const acquiring = (
   home: string,
   run: InstanceType<typeof ProcessRunner>['run'],
@@ -267,7 +289,7 @@ describe('RepositoryWorkspace', () => {
         ),
       );
 
-      expect(String(exit)).toContain('WORKSPACE_REF_UNAVAILABLE');
+      expect(failedWith(exit).code).toBe('WORKSPACE_REF_UNAVAILABLE');
       // No silent fallback: a failed fetch must not be followed by anything.
       expect(calls.some((call) => call.command.includes('checkout'))).toBe(false);
     });
@@ -280,7 +302,7 @@ describe('RepositoryWorkspace', () => {
         const exit = await Effect.runPromiseExit(
           acquiring(home, () => Effect.die('git must not run'), { ...job, ref }),
         );
-        expect(String(exit)).toContain('WORKSPACE_REF_INVALID');
+        expect(failedWith(exit).code).toBe('WORKSPACE_REF_INVALID');
       });
     },
   );
@@ -334,7 +356,7 @@ describe('RepositoryWorkspace', () => {
         }).pipe(Effect.provide(service(home, () => Effect.die('git must not run')))),
       );
 
-      expect(String(exit)).toContain('WORKSPACE_CLONE_DENIED');
+      expect(failedWith(exit).code).toBe('WORKSPACE_CLONE_DENIED');
       expect(existsSync(sessions(home))).toBe(false);
       // Terminal, or every attempt pays these checks again before dying the
       // same death — a policy decision cannot change between attempts.
@@ -357,7 +379,7 @@ describe('RepositoryWorkspace', () => {
             return yield* manager.acquire({ ...job, repository }, policy('allowed'));
           }).pipe(Effect.provide(service(home, () => Effect.die('git must not run')))),
         );
-        expect(String(exit)).toContain('WORKSPACE_REPOSITORY_INVALID');
+        expect(failedWith(exit).code).toBe('WORKSPACE_REPOSITORY_INVALID');
       });
     },
   );
@@ -526,7 +548,7 @@ describe('RepositoryWorkspace', () => {
       const exit = await Effect.runPromiseExit(
         acquiring(home, () => Effect.succeed({ ...ok(), exitCode: 1, stderr })),
       );
-      expect(String(exit)).toContain(code);
+      expect(failedWith(exit).code).toBe(code);
     });
   });
 
@@ -719,7 +741,7 @@ describe('RepositoryWorkspace', () => {
         ),
       );
 
-      expect(String(exit)).toContain('WORKSPACE_REF_UNAVAILABLE');
+      expect(failedWith(exit).code).toBe('WORKSPACE_REF_UNAVAILABLE');
       expect(existsSync(sessionPath(home, 10))).toBe(false);
       expect(existsSync(join(sessions(home), 'job-10.failed-1', 'tree.txt'))).toBe(true);
       expect(
@@ -829,7 +851,7 @@ describe('RepositoryWorkspace', () => {
           ),
         );
 
-        expect(String(exit)).toContain('WORKSPACE_DISK_EXHAUSTED');
+        expect(failedWith(exit).code).toBe('WORKSPACE_DISK_EXHAUSTED');
         if (exit._tag !== 'Failure') return;
         const failure = Option.getOrUndefined(Cause.failureOption(exit.cause));
         expect(failure?._tag).toBe('WorkspaceError');
@@ -853,7 +875,7 @@ describe('RepositoryWorkspace', () => {
           ),
         );
 
-        expect(String(exit)).toContain('WORKSPACE_DISK_PROBE_FAILED');
+        expect(failedWith(exit).code).toBe('WORKSPACE_DISK_PROBE_FAILED');
         expect(String(exit)).not.toContain('WORKSPACE_DISK_EXHAUSTED');
       });
     });
