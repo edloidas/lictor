@@ -96,6 +96,14 @@ indistinguishable from a revoked token.
   more — parked rows by `limits.answerExpiryHours`, held rows by
   `limits.approvalExpiryHours` against the rate that arms them, a rate against a
   window rather than a depth
+- **A takeover kills the previous owner's recorded agent groups before it
+  requeues their jobs, never after.** A `bun --watch` reload keeps the pid, wipes
+  the heap milliseconds after SIGTERM, and so runs neither `ProcessRunner`'s
+  release nor the ownership one — the detached agent survives, and `agent_processes`
+  is the only thing that can still name it. Requeueing first is not a smaller
+  version of this: it hands the work to a second agent sooner, while the first is
+  most likely still alive. The record is signalled as a process *group*, so a
+  recycled pid that leads no group of its own is `ESRCH` rather than a stranger
 - The eyes reaction is strictly best-effort and goes through `GitHubClient`, not
   `CapabilityBroker`. The broker refuses anything that is not a `running` job with
   a live lease, and a just-enqueued job is `pending`

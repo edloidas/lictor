@@ -47,7 +47,7 @@ const AgentListenerLive = AgentListener.DefaultWithoutDependencies.pipe(
   Layer.provide(Layer.merge(ConfigLive, BrokerLive)),
 );
 const ExecutorLive = AgentExecutor.DefaultWithoutDependencies.pipe(
-  Layer.provide(Layer.mergeAll(ConfigLive, ProcessRunner.Default, AgentListenerLive)),
+  Layer.provide(Layer.mergeAll(ConfigLive, ProcessRunner.Default, AgentListenerLive, QueueLive)),
 );
 // The broker is reachable only from the agent's own listener. The operator plane
 // does not depend on it, so no operator command can route into a capability.
