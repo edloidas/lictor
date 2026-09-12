@@ -1,29 +1,19 @@
 import { HttpClientRequest } from '@effect/platform';
 import { Clock, Data, Effect } from 'effect';
 import { Policy } from '../policy.ts';
-import { WorkQueue } from '../queue/work-queue.ts';
+import { type QueuedJob, WorkQueue } from '../queue/work-queue.ts';
 import { GitHubClient } from './client.ts';
 import { CredentialHealth } from './credential-health.ts';
+import {
+  type BrokerTool,
+  type GrantCapabilities,
+  grantCapabilities,
+  grantedTools,
+  intersectCapabilities,
+  toolCapabilities,
+} from './grant.ts';
 import { GitHubIdentity } from './identity.ts';
 import { DEFAULT_THROTTLE_WAIT_MS, isSecondaryRateLimit, retryAfterMs } from './retry-after.ts';
-
-export type BrokerTool =
-  | 'create_branch'
-  | 'create_blob'
-  | 'create_comment'
-  | 'create_commit'
-  | 'create_issue'
-  | 'create_tree'
-  | 'create_pull_request'
-  | 'get_issue'
-  | 'get_pull_request'
-  | 'get_repository'
-  | 'list_comments'
-  | 'list_review_threads'
-  | 'list_review_comments'
-  | 'merge_pull_request'
-  | 'update_branch'
-  | 'update_issue';
 
 export class CapabilityError extends Data.TaggedError('CapabilityError')<{
   readonly code: string;
@@ -32,27 +22,6 @@ export class CapabilityError extends Data.TaggedError('CapabilityError')<{
   readonly retryAfterMs?: number;
   readonly cause?: unknown;
 }> {}
-
-const capabilities: Readonly<
-  Record<BrokerTool, keyof ReturnType<InstanceType<typeof Policy>['forRepository']>['capabilities']>
-> = {
-  get_issue: 'read',
-  get_pull_request: 'read',
-  get_repository: 'read',
-  list_comments: 'read',
-  list_review_threads: 'read',
-  list_review_comments: 'read',
-  create_comment: 'comment',
-  create_issue: 'issues',
-  update_issue: 'issues',
-  create_branch: 'branches',
-  create_blob: 'branches',
-  create_commit: 'branches',
-  create_tree: 'branches',
-  create_pull_request: 'pullRequests',
-  merge_pull_request: 'merge',
-  update_branch: 'branches',
-};
 
 const issueNumber = { type: 'integer', minimum: 1, description: 'Issue number.' } as const;
 const commentableNumber = {
@@ -456,6 +425,13 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
     const policy = yield* Policy;
     const queue = yield* WorkQueue;
 
+    const effectiveCapabilities = (job: QueuedJob): GrantCapabilities => {
+      const live = grantCapabilities(
+        policy.forRepository(job.work.repository.toLowerCase()).capabilities,
+      );
+      return job.grant === undefined ? live : intersectCapabilities(job.grant.capabilities, live);
+    };
+
     const callTool = (request: {
       readonly jobId: number;
       readonly attemptNumber: number;
@@ -511,23 +487,19 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
               message: 'Tool request targets another repository',
             });
           }
-          const repositoryPolicy = policy.forRepository(expectedRepository);
-          const capability = capabilities[request.name];
+          const effective = effectiveCapabilities(job);
+          const capability = toolCapabilities[request.name];
           // A continuation inherits its authority from the arming trigger: it
           // never reaches escalation capabilities however generous policy is.
           const narrowed = job.work.continuation === true;
           const forcePushDenied =
-            (request.name === 'update_branch' &&
-              request.input.force === true &&
-              repositoryPolicy.capabilities.forcePush !== true) ||
-            (narrowed && request.name === 'update_branch' && request.input.force === true);
+            request.name === 'update_branch' &&
+            request.input.force === true &&
+            (!effective.forcePush || narrowed);
           if (
-            !repositoryPolicy.accepted ||
-            repositoryPolicy.capabilities[capability] !== true ||
-            (narrowed &&
-              (capability === 'merge' ||
-                capability === 'forcePush' ||
-                capability === 'deleteBranches')) ||
+            !policy.forRepository(expectedRepository).accepted ||
+            !effective[capability] ||
+            (narrowed && capability === 'merge') ||
             forcePushDenied
           ) {
             return yield* new CapabilityError({
@@ -685,7 +657,7 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
         });
       });
 
-    const listTools = (Object.keys(capabilities) as BrokerTool[]).map((name) => {
+    const listTools = (Object.keys(toolCapabilities) as BrokerTool[]).map((name) => {
       const { description, properties, required } = toolSchemas[name];
       return {
         name,
@@ -696,7 +668,7 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
         // ! surface, not GitHub's — one repository, an enumerated operation set,
         // ! re-gated per call against the job's policy and lease.
         annotations: {
-          readOnlyHint: capabilities[name] === 'read',
+          readOnlyHint: toolCapabilities[name] === 'read',
           destructiveHint: false,
           openWorldHint: false,
         },
@@ -709,22 +681,12 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
       };
     });
 
-    // Discovery is scoped to the job's repository policy: offering a tool that
-    // could only ever fail invites attempts whose denial is the feature.
-    const visibleTools = (repository: string, narrowed: boolean) => {
-      const granted = policy.forRepository(repository.toLowerCase()).capabilities;
-      // Escalation capabilities stay invisible on continuations: denied means
-      // unseen, not merely refused at call time.
-      return listTools.filter(
-        (tool) =>
-          granted[capabilities[tool.name]] === true &&
-          !(
-            narrowed &&
-            (capabilities[tool.name] === 'merge' ||
-              capabilities[tool.name] === 'forcePush' ||
-              capabilities[tool.name] === 'deleteBranches')
-          ),
-      );
+    // Discovery is scoped to the job's own authority: offering a tool that could
+    // only ever fail invites attempts whose denial is the feature. Same function
+    // the prompt enumerates from, so the two cannot advertise different sets.
+    const visibleTools = (job: QueuedJob) => {
+      const granted = grantedTools(effectiveCapabilities(job), job.work.continuation === true);
+      return listTools.filter((tool) => granted.includes(tool.name));
     };
 
     const handleMcp = (
@@ -761,10 +723,7 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
             jsonrpc: '2.0' as const,
             id: request.id,
             result: {
-              tools:
-                job === undefined || job.status !== 'running'
-                  ? []
-                  : visibleTools(job.work.repository, job.work.continuation === true),
+              tools: job === undefined || job.status !== 'running' ? [] : visibleTools(job),
             },
           }),
         );
@@ -777,7 +736,7 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
         });
       }
       const name = request.params?.name;
-      if (typeof name !== 'string' || !(name in capabilities)) {
+      if (typeof name !== 'string' || !(name in toolCapabilities)) {
         return Effect.succeed({
           jsonrpc: '2.0' as const,
           id: request.id,

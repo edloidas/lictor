@@ -20,6 +20,7 @@ import {
   type ProcessResult,
   ProcessRunner,
 } from '../src/executor/process-runner.ts';
+import type { Grant, GrantCapabilities } from '../src/github/grant.ts';
 import type { WorkItem } from '../src/work-item.ts';
 
 const work: WorkItem = {
@@ -235,6 +236,30 @@ const metadataOf = (prompt: string) => {
   };
 };
 
+/** A grant over the default read-only policy, opened up per case. */
+const grant = (capabilities: Partial<GrantCapabilities> = {}): Grant => ({
+  version: 1,
+  repository: work.repository,
+  interactionId: work.interactionId,
+  decision: 'automatic',
+  continuation: false,
+  mintedAt: 1_700_000_000_000,
+  capabilities: {
+    read: true,
+    comment: false,
+    issues: false,
+    branches: false,
+    pullRequests: false,
+    merge: false,
+    forcePush: false,
+    deleteBranches: false,
+    ...capabilities,
+  },
+  maxAttempts: 3,
+  maxDurationMs: 30 * 60 * 1000,
+  fingerprint: 'abc123',
+});
+
 describe('buildPrompt', () => {
   it('contains bounded normalized metadata and explicit trust boundaries', () => {
     const prompt = buildPrompt({
@@ -404,6 +429,81 @@ describe('buildPrompt', () => {
 
   // Nobody on the thread can widen a grant, so parking for one spends the
   // answer window and posts `unanswered` on a question that had no answer.
+  // The daemon had authorized the work and this sentence told the agent to
+  // decline for want of authority. Adding beside it leaves the contradiction in.
+  it('no longer tells the agent to report when authority is absent', () => {
+    const prompt = buildPrompt(work, grant());
+
+    expect(prompt).not.toContain('requires authority not present in the interaction');
+    expect(prompt).not.toContain('carry out only work directly authorized by this interaction');
+    expect(prompt).toContain('do not mistake missing authority for that ambiguity');
+    expect(prompt).toContain('is settled above and is not yours to establish');
+  });
+
+  it('states the daemon decision as fact and enumerates what it granted', () => {
+    const prompt = buildPrompt(work, grant({ comment: true, issues: true }));
+
+    expect(prompt).toContain('This daemon accepted the recorded request and authorized this job');
+    expect(prompt).toContain('automatically under this repository’s policy');
+    expect(prompt).toContain('create_comment');
+    expect(prompt).toContain('update_issue');
+    expect(prompt).not.toContain('create_pull_request');
+  });
+
+  it('names an operator approval as the decision where one released the hold', () => {
+    const prompt = buildPrompt(work, { ...grant(), decision: 'approved' });
+
+    expect(prompt).toContain('on an operator’s approval');
+    expect(prompt).not.toContain('automatically under this repository’s policy');
+  });
+
+  // The set is a ceiling. Saying so is the whole difference between telling the
+  // agent what it may do and instructing it to do all of it.
+  it('says the granted set bounds rather than mandates', () => {
+    const prompt = buildPrompt(work, grant());
+
+    expect(prompt).toContain('bounds what you may do and mandates nothing');
+    expect(prompt).toContain('decided by the recorded request alone');
+  });
+
+  // The shipped example policy grants `branches` and denies `forcePush`; a bare
+  // `update_branch` there advertises a call that answers `CAPABILITY_DENIED`.
+  it('qualifies update_branch rather than advertising a force push it would deny', () => {
+    const prompt = buildPrompt(work, grant({ branches: true }));
+
+    expect(prompt).toContain('update_branch (never with force)');
+  });
+
+  // ! A continuation comes from a reply this daemon does not trust. It may see
+  // ! the tools, because they bound it — but telling it the daemon authorized
+  // ! *this* turn would hand any reply on a live thread the policy ceiling.
+  it('withholds the authorization sentence from a continuation, not the tool list', () => {
+    const prompt = buildPrompt(
+      { ...work, continuation: true },
+      grant({ comment: true, merge: true }),
+    );
+
+    expect(prompt).not.toContain('This daemon accepted the recorded request');
+    expect(prompt).toContain('continues work an earlier trusted request armed');
+    expect(prompt).toContain('no authority of its own');
+    expect(prompt).toContain('create_comment');
+    expect(prompt).not.toContain('merge_pull_request');
+  });
+
+  it('says nothing about authority for a run with no broker session', () => {
+    const prompt = buildPrompt(work);
+
+    expect(prompt).not.toContain('available to you here');
+    expect(prompt).not.toContain('This daemon accepted the recorded request');
+  });
+
+  it('says so plainly where the grant covers no operation at all', () => {
+    const prompt = buildPrompt(work, grant({ read: false }));
+
+    expect(prompt).toContain('No GitHub operation is available to you here.');
+    expect(prompt).not.toContain('get_issue');
+  });
+
   it('keeps missing capability out of the question path', () => {
     const prompt = buildPrompt(work);
 

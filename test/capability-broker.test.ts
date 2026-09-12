@@ -5,6 +5,7 @@ import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { CapabilityBroker } from '../src/github/capability-broker.ts';
 import { GitHubClient } from '../src/github/client.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
+import type { Grant, GrantCapabilities } from '../src/github/grant.ts';
 import { GitHubIdentity } from '../src/github/identity.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
@@ -191,6 +192,105 @@ describe('CapabilityBroker', () => {
     expect(result.value).toContain('create_comment');
     expect(result.value).not.toContain('create_branch');
     expect(result.value).not.toContain('merge_pull_request');
+  });
+
+  /** A grant over the work fixture's repository, opened up per case. */
+  const storedGrant = (capabilities: Partial<GrantCapabilities>): Grant => ({
+    version: 1,
+    repository: work.repository,
+    interactionId: work.interactionId,
+    decision: 'automatic',
+    continuation: false,
+    mintedAt: 1_700_000_000_000,
+    capabilities: {
+      read: true,
+      comment: false,
+      issues: false,
+      branches: false,
+      pullRequests: false,
+      merge: false,
+      forcePush: false,
+      deleteBranches: false,
+      ...capabilities,
+    },
+    maxAttempts: 3,
+    maxDurationMs: 30 * 60 * 1000,
+    fingerprint: 'minted',
+  });
+
+  /** Claims one job and stores `grant` against that attempt. */
+  const claimedWithGrant = (grant: Grant) =>
+    Effect.gen(function* () {
+      const queue = yield* WorkQueue;
+      const enqueued = yield* queue.enqueue(work);
+      const claimed = yield* queue.claim;
+      const attemptNumber = claimed?.attempts ?? 1;
+      const workerId = claimed?.workerId ?? '';
+      // Asserted here rather than left to the caller: a claim that did not take,
+      // or a record that did not write, otherwise surfaces two tests later as a
+      // missing tool — which reads as the rule under test having held.
+      expect(yield* queue.recordGrant(enqueued.jobId, attemptNumber, workerId, grant)).toBe(true);
+      return { jobId: enqueued.jobId, attemptNumber, workerId };
+    });
+
+  const toolNamesFor = (jobId: number) =>
+    Effect.gen(function* () {
+      const broker = yield* CapabilityBroker;
+      const response = yield* broker.handleMcp(jobId, work, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/list',
+      });
+      if (!('result' in response) || !('tools' in response.result))
+        throw new Error('tools/list failed');
+      return response.result.tools.map((tool: { readonly name: string }) => tool.name);
+    });
+
+  // ! The rule the record exists for. Policy edited after the job was admitted
+  // ! may take authority away and may never add any, so a job that outlived a
+  // ! restart under a loosened policy still runs at the width it was accepted at.
+  it('does not let policy widened after the mint raise the stored ceiling', async () => {
+    const result = await run(
+      Effect.flatMap(claimedWithGrant(storedGrant({})), ({ jobId }) => toolNamesFor(jobId)),
+      '[defaults.capabilities]\nread = true\ncomment = true\nissues = true',
+    );
+
+    expect(result.value).toContain('get_issue');
+    expect(result.value).not.toContain('create_comment');
+    expect(result.value).not.toContain('update_issue');
+  });
+
+  it('applies a policy tightened after the mint straight away', async () => {
+    const result = await run(
+      Effect.flatMap(claimedWithGrant(storedGrant({ comment: true })), ({ jobId }) =>
+        toolNamesFor(jobId),
+      ),
+      '[defaults.capabilities]\nread = true',
+    );
+
+    expect(result.value).toContain('get_issue');
+    expect(result.value).not.toContain('create_comment');
+  });
+
+  // Discovery and enforcement read one function over one record, so a tool the
+  // prompt and `tools/list` withhold cannot be reachable by naming it anyway.
+  it('denies a call the stored grant withholds even where policy allows it', async () => {
+    const result = await run(
+      Effect.flatMap(claimedWithGrant(storedGrant({})), (session) =>
+        Effect.flatMap(CapabilityBroker, (broker) =>
+          Effect.flip(
+            broker.callTool({
+              ...session,
+              name: 'create_comment',
+              input: { number: 13, body: 'hi' },
+            }),
+          ),
+        ),
+      ),
+      '[defaults.capabilities]\nread = true\ncomment = true',
+    );
+
+    expect(result.value).toMatchObject({ _tag: 'CapabilityError', code: 'CAPABILITY_DENIED' });
   });
 
   it('exposes no tools to discovery without an active job session', async () => {

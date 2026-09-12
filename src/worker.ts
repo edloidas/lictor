@@ -2,6 +2,7 @@ import { Clock, Effect, Exit, PartitionedSemaphore, Ref } from 'effect';
 import { LictorConfig } from './config.ts';
 import { AgentExecutor, ExecutorError } from './executor/agent-executor.ts';
 import { CredentialHealth } from './github/credential-health.ts';
+import { grantedTools, intersectGrant, mintGrant } from './github/grant.ts';
 import { canonicalRepository, Policy, policyRefusal } from './policy.ts';
 import { WorkQueue } from './queue/work-queue.ts';
 import { RepositoryWorkspace, WorkspaceError } from './workspace/repository-workspace.ts';
@@ -81,8 +82,17 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         ref = `refs/pull/${job.work.subject.number}/head`;
       }
       const policyTime = yield* Clock.currentTimeMillis;
+      // Runs before the intersection below exists, so the attempt budget has to
+      // read the stored ceiling here as well.
+      const bounded =
+        job.grant === undefined
+          ? repositoryPolicy
+          : {
+              ...repositoryPolicy,
+              maxAttempts: Math.min(repositoryPolicy.maxAttempts, job.grant.maxAttempts),
+            };
       const refusal = policyRefusal({
-        repository: repositoryPolicy,
+        repository: bounded,
         attempts: job.attempts,
         readyAt: job.readyAt,
         approvalRequired: job.work.approvalRequired,
@@ -106,12 +116,70 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         return true;
       }
 
+      // ! Fail closed: an unreadable ceiling is not an absent one, and
+      // ! `recordGrant` will not overwrite it, so the row cannot heal on its own.
+      if (job.grantUnreadable === true) {
+        const unreadableAt = yield* Clock.currentTimeMillis;
+        const reason = 'Recorded authorization for this job could not be read';
+        yield* queue.fail(job.id, job.attempts, reason, undefined, 'rejected', {
+          repository: job.work.repository,
+          subjectNumber: job.work.subject.number,
+          outcome: 'rejected',
+        });
+        yield* Effect.logError('Refused queued work carrying an unreadable grant').pipe(
+          Effect.annotateLogs({
+            job: job.id,
+            attempt: job.attempts,
+            durationMs: unreadableAt - claimedAt,
+          }),
+        );
+        return true;
+      }
+
+      const live = mintGrant(repositoryPolicy, job.work, policyTime);
+      const grant = job.grant === undefined ? live : intersectGrant(job.grant, live);
+      // An agent holding no GitHub operation can neither do the work nor say so
+      // on the thread. Denied before `recordGrant`: an empty ceiling once
+      // written is never overwritten, and correcting the policy could not
+      // release the row.
+      // ! The reason stays out of `note`, which publishes as a quotation
+      // ! attributed to an agent that never ran.
+      if (grantedTools(grant.capabilities, job.work.continuation === true).length === 0) {
+        const deniedAt = yield* Clock.currentTimeMillis;
+        const reason = 'Repository policy leaves this job no capability to act with';
+        yield* queue.fail(job.id, job.attempts, reason, undefined, 'rejected', {
+          repository: job.work.repository,
+          subjectNumber: job.work.subject.number,
+          outcome: 'rejected',
+        });
+        yield* Effect.logWarning('Denied queued work left without any capability').pipe(
+          Effect.annotateLogs({
+            job: job.id,
+            attempt: job.attempts,
+            durationMs: deniedAt - claimedAt,
+          }),
+        );
+        return true;
+      }
+
+      if (job.grant === undefined) {
+        yield* queue.recordGrant(job.id, job.attempts, job.workerId ?? queue.ownerId, live);
+      } else if (job.grant.fingerprint !== live.fingerprint) {
+        yield* Effect.logWarning('Running under a grant older than current policy').pipe(
+          Effect.annotateLogs({
+            job: job.id,
+            attempt: job.attempts,
+            grantFingerprint: job.grant.fingerprint,
+            policyFingerprint: live.fingerprint,
+          }),
+        );
+      }
+
       // Parking spends no attempt but restores none, so a question asked with
       // the budget already gone parks a row the next claim dead-letters on
       // sight — the thread would read: I need an answer, answered, this did
       // not finish. Finish now and say so instead.
-      const attemptsLeft =
-        job.attempts < Math.min(repositoryPolicy.maxAttempts, config.workerMaxAttempts);
+      const attemptsLeft = job.attempts < Math.min(grant.maxAttempts, config.workerMaxAttempts);
 
       // ! Before the workspace is acquired, so a request the record could not
       // ! hold never reaches the agent at all. Truncated instructions read as
@@ -177,10 +245,11 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
                 .execute(
                   job.work,
                   workspace.path,
-                  repositoryPolicy.maxDurationMs,
+                  grant.maxDurationMs,
                   job.id,
                   job.attempts,
                   job.workerId,
+                  grant,
                 )
                 .pipe(
                   // Quarantined for the post-mortem, not for a rerun: a retry

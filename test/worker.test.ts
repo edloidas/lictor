@@ -3,7 +3,8 @@ import { Effect, Layer, Logger, type LogLevel, Redacted, TestClock, TestContext 
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { AgentExecutor, ExecutorError } from '../src/executor/agent-executor.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
-import { Policy, type RepositoryPolicy } from '../src/policy.ts';
+import type { Grant } from '../src/github/grant.ts';
+import { type Capabilities, Policy, type RepositoryPolicy } from '../src/policy.ts';
 import { WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
 import { Worker } from '../src/worker.ts';
@@ -174,6 +175,245 @@ const run = <A, E>(
     ),
   );
 };
+
+const readAndComment: Capabilities = {
+  read: true,
+  comment: true,
+  issues: false,
+  branches: false,
+  pullRequests: false,
+  merge: false,
+  forcePush: false,
+  deleteBranches: false,
+  scripts: [],
+};
+
+const readOnly: Capabilities = { ...readAndComment, comment: false };
+
+describe('Worker.runOnce grants', () => {
+  /**
+   * Runs `attempts` claims over one job, recording the grant each one carried.
+   * Each attempt ends `failed` so an operator `retry` can re-queue the same row —
+   * the only way one job reaches the worker more than once.
+   */
+  const grantsOver = (attempts: number, policyOverrides: PolicyOverrides = {}) => {
+    const seen: (Grant | undefined)[] = [];
+    return run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        for (let index = 0; index < attempts; index += 1) {
+          yield* worker.runOnce;
+          if (index + 1 < attempts) yield* queue.retry(jobId, 0);
+        }
+        return { seen, stored: (yield* queue.job(jobId))?.grant };
+      }),
+      (_work, _dir, _timeout, _job, _attempt, _worker, grant) => {
+        seen.push(grant);
+        return Effect.succeed({ status: 'failed', summary: 'nope' });
+      },
+      5,
+      true,
+      undefined,
+      policyOverrides,
+    );
+  };
+
+  /**
+   * Runs two claims over one job, swapping the repository's capabilities in
+   * between. `forRepository` spreads the override object per call, so mutating
+   * it stands in for the policy file being edited across a daemon restart.
+   */
+  const acrossPolicyChange = (before: Capabilities, after: Capabilities) => {
+    const seen: (Grant | undefined)[] = [];
+    const repository: { capabilities: Capabilities } = { capabilities: before };
+    return run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        repository.capabilities = after;
+        yield* queue.retry(jobId, 0);
+        yield* worker.runOnce;
+        return { seen, stored: (yield* queue.job(jobId))?.grant };
+      }),
+      (_work, _dir, _timeout, _job, _attempt, _worker, grant) => {
+        seen.push(grant);
+        return Effect.succeed({ status: 'failed', summary: 'nope' });
+      },
+      5,
+      true,
+      undefined,
+      { repository },
+    );
+  };
+
+  // The tightening half: the stored grant handed over unchanged would advertise
+  // a tool the broker now denies.
+  it('hands the executor a grant narrowed by a policy tightened since the mint', async () => {
+    const result = await acrossPolicyChange(readAndComment, readOnly);
+
+    expect(result.seen[0]?.capabilities.comment).toBe(true);
+    expect(result.seen[1]?.capabilities.comment).toBe(false);
+    // The record still says what was authorized; only what may run now narrowed.
+    expect(result.stored?.capabilities.comment).toBe(true);
+  });
+
+  it('does not let a policy widened since the mint raise what the executor gets', async () => {
+    const result = await acrossPolicyChange(readOnly, readAndComment);
+
+    expect(result.seen[0]?.capabilities.comment).toBe(false);
+    expect(result.seen[1]?.capabilities.comment).toBe(false);
+    expect(result.stored?.capabilities.comment).toBe(false);
+  });
+
+  // The grant records budgets, so it has to bound them.
+  it('runs under the recorded duration budget when policy has since raised it', async () => {
+    const timeouts: number[] = [];
+    const repository: { maxDurationMs: number } = { maxDurationMs: 60_000 };
+    await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        repository.maxDurationMs = 600_000;
+        yield* queue.retry(jobId, 0);
+        yield* worker.runOnce;
+      }),
+      (_work, _dir, timeoutMs) => {
+        timeouts.push(timeoutMs ?? -1);
+        return Effect.succeed({ status: 'failed', summary: 'nope' });
+      },
+      5,
+      true,
+      undefined,
+      { repository },
+    );
+
+    expect(timeouts).toEqual([60_000, 60_000]);
+  });
+
+  // Running the agent would spend a Codex run to reach a refusal the daemon
+  // already knows.
+  it('denies a job a tightening left with no capability at all', async () => {
+    let ran = false;
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        yield* (yield* Worker).runOnce;
+        return { job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
+      }),
+      () => {
+        ran = true;
+        return Effect.succeed({ status: 'completed', summary: 'done' });
+      },
+      5,
+      true,
+      undefined,
+      { repository: { capabilities: { ...readOnly, read: false } } },
+    );
+
+    expect(ran).toBe(false);
+    expect(result.job?.outcome).toBe('rejected');
+    // ! The reason is the daemon's, and `note` publishes as a quotation
+    // ! attributed to the agent — which never ran.
+    expect(result.messages[0]?.note).toBeUndefined();
+    // Nothing recorded: `recordGrant` never overwrites, so an empty grant stored
+    // here could never be released by correcting the policy.
+    expect(result.job?.grant).toBeUndefined();
+  });
+
+  // The recovery path the gate must not destroy.
+  it('runs a denied job once the policy that left it nothing is corrected', async () => {
+    let ran = false;
+    const repository: { capabilities: Capabilities } = {
+      capabilities: { ...readOnly, read: false },
+    };
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        repository.capabilities = readAndComment;
+        yield* queue.retry(jobId, 0);
+        yield* worker.runOnce;
+        return yield* queue.job(jobId);
+      }),
+      () => {
+        ran = true;
+        return Effect.succeed({ status: 'completed', summary: 'done' });
+      },
+      5,
+      true,
+      undefined,
+      { repository },
+    );
+
+    expect(ran).toBe(true);
+    expect(result?.outcome).toBe('completed');
+    expect(result?.grant?.capabilities.comment).toBe(true);
+  });
+
+  // ! Fail closed. A recorded ceiling nobody can read is not an absent one, and
+  // ! running on live policy instead widens every such row silently — which is
+  // ! what a rollback past a future grant version would do to all of them.
+  it('refuses a job whose recorded grant cannot be read rather than running it', async () => {
+    let ran = false;
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        yield* queue.recordGrant(jobId, claimed?.attempts ?? 1, claimed?.workerId ?? '', {
+          version: 1,
+          nonsense: true,
+        } as unknown as Grant);
+        yield* queue.fail(jobId, claimed?.attempts ?? 1, 'reset', undefined, 'failed', {
+          repository: work.repository,
+          subjectNumber: work.subject.number,
+          outcome: 'failed',
+        });
+        yield* queue.retry(jobId, 0);
+        yield* (yield* Worker).runOnce;
+        return { job: yield* queue.job(jobId), messages: yield* queue.outboxFor(jobId) };
+      }),
+      () => {
+        ran = true;
+        return Effect.succeed({ status: 'completed', summary: 'done' });
+      },
+      5,
+    );
+
+    expect(ran).toBe(false);
+    expect(result.job?.outcome).toBe('rejected');
+    expect(result.messages.at(-1)?.note).toBeUndefined();
+  });
+
+  it('records what the job was admitted under on the first claim', async () => {
+    const result = await grantsOver(1, { repository: { capabilities: readAndComment } });
+
+    expect(result.seen[0]?.decision).toBe('automatic');
+    expect(result.seen[0]?.capabilities.comment).toBe(true);
+    expect(result.seen[0]?.capabilities.merge).toBe(false);
+    expect(result.stored?.fingerprint).toBe(result.seen[0]?.fingerprint);
+  });
+
+  // ! Once per job, not per attempt: re-minting on an operator `retry` would take
+  // ! whatever policy says by then — a widening arriving through "run it again".
+  it('reuses the stored grant across an operator retry instead of minting again', async () => {
+    const result = await grantsOver(3);
+
+    expect(result.seen).toHaveLength(3);
+    expect(result.seen[1]?.mintedAt).toBe(result.seen[0]?.mintedAt as number);
+    expect(result.seen[2]?.mintedAt).toBe(result.seen[0]?.mintedAt as number);
+    expect(result.stored?.mintedAt).toBe(result.seen[0]?.mintedAt as number);
+  });
+});
 
 describe('Worker.runOnce', () => {
   it('completes a queued job after successful execution', async () => {

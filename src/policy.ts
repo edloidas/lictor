@@ -65,7 +65,7 @@ const PolicyDocument = Schema.Struct({
 });
 
 type PolicyDocument = Schema.Schema.Type<typeof PolicyDocument>;
-type Capabilities = Required<Schema.Schema.Type<typeof Capabilities>>;
+export type Capabilities = Required<Schema.Schema.Type<typeof Capabilities>>;
 
 export type RepositoryPolicy = {
   readonly repository: string;

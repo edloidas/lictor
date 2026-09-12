@@ -15,6 +15,7 @@ import {
   TestContext,
 } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
+import type { Grant } from '../src/github/grant.ts';
 import { QueueFull, WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
 
@@ -2082,7 +2083,7 @@ describe('WorkQueue', () => {
       const after = new Database(path);
       expect(
         (after.query('PRAGMA user_version').get() as { user_version: number }).user_version,
-      ).toBe(14);
+      ).toBe(15);
       after.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -2131,11 +2132,167 @@ describe('WorkQueue', () => {
     }
   });
 
+  const grant = (fingerprint: string): Grant => ({
+    version: 1,
+    repository: 'edloidas/lictor',
+    interactionId: 'interaction-granted',
+    decision: 'automatic',
+    continuation: false,
+    mintedAt: 1_700_000_000_000,
+    capabilities: {
+      read: true,
+      comment: false,
+      issues: false,
+      branches: false,
+      pullRequests: false,
+      merge: false,
+      forcePush: false,
+      deleteBranches: false,
+    },
+    maxAttempts: 3,
+    maxDurationMs: 1000,
+    fingerprint,
+  });
+
+  // ! The `AND grant IS NULL` clause is what makes the mint once. Without it a
+  // ! later attempt could replace the ceiling with a grant derived from policy
+  // ! edited since — the widening the record exists to block.
+  it('records a grant once and refuses to replace it', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('granted'));
+        const claimed = yield* queue.claim;
+        const attemptNumber = claimed?.attempts ?? 1;
+        const workerId = claimed?.workerId ?? '';
+        const first = yield* queue.recordGrant(jobId, attemptNumber, workerId, grant('first'));
+        const second = yield* queue.recordGrant(jobId, attemptNumber, workerId, grant('second'));
+        return { first, second, stored: (yield* queue.job(jobId))?.grant };
+      }),
+    );
+
+    expect(result.first).toBe(true);
+    expect(result.second).toBe(false);
+    expect(result.stored?.fingerprint).toBe('first');
+  });
+
+  it('refuses a grant offered against a stale attempt or another worker', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('granted'));
+        const claimed = yield* queue.claim;
+        const attemptNumber = claimed?.attempts ?? 1;
+        const workerId = claimed?.workerId ?? '';
+        return {
+          staleAttempt: yield* queue.recordGrant(
+            jobId,
+            attemptNumber + 1,
+            workerId,
+            grant('stale'),
+          ),
+          otherWorker: yield* queue.recordGrant(
+            jobId,
+            attemptNumber,
+            'someone-else',
+            grant('other'),
+          ),
+          stored: (yield* queue.job(jobId))?.grant,
+        };
+      }),
+    );
+
+    expect(result.staleAttempt).toBe(false);
+    expect(result.otherWorker).toBe(false);
+    expect(result.stored).toBeUndefined();
+  });
+
+  // Not dead-lettered: the row still claims, flagged for the worker to refuse.
+  it('marks a job whose stored grant cannot be decoded rather than reading it as absent', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.enqueue(work('undecodable'));
+        }).pipe(Effect.provide(queueLayer(path))),
+      ),
+    );
+    const database = new Database(path);
+    database.query('UPDATE jobs SET grant = ? WHERE id = 1').run('{"version":99,"nope":true}');
+    database.close();
+
+    try {
+      const claimed = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            return yield* queue.claim;
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(claimed?.work.deliveryId).toBe('undecodable');
+      expect(claimed?.grant).toBeUndefined();
+      expect(claimed?.grantUnreadable).toBe(true);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  // The v14 fast path returns before the migration body, so a deployed database
+  // reaches the new column only if the guard names it. Miss that and nothing
+  // fails on upgrade: the daemon starts, and every statement naming `grant`
+  // dies afterwards.
+  it('adds the grant column to a database already stamped version 14', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.enqueue(work('carried'));
+        }).pipe(Effect.provide(queueLayer(path))),
+      ),
+    );
+    const database = new Database(path);
+    database.exec('ALTER TABLE jobs DROP COLUMN grant');
+    database.exec('PRAGMA user_version = 14');
+    database.close();
+
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            return yield* queue.job(1);
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(result?.work.deliveryId).toBe('carried');
+      expect(result?.grant).toBeUndefined();
+      const after = new Database(path);
+      expect(
+        (after.query('PRAGMA table_info(jobs)').all() as { name: string }[]).map(
+          (column) => column.name,
+        ),
+      ).toContain('grant');
+      expect(
+        (after.query('PRAGMA user_version').get() as { user_version: number }).user_version,
+      ).toBe(15);
+      after.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('refuses a database created by a newer queue schema', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
     const database = new Database(path, { create: true });
-    database.exec('PRAGMA user_version = 15');
+    database.exec('PRAGMA user_version = 16');
     database.close();
 
     try {
@@ -2155,7 +2312,7 @@ describe('WorkQueue', () => {
       // stamp into the migration body would die on an ALTER against a table it
       // never created, reading as a corrupt database rather than a newer one.
       expect(exit._tag === 'Failure' ? wrappedMessage(exit.cause) : '').toContain(
-        'Unsupported queue schema version 15',
+        'Unsupported queue schema version 16',
       );
     } finally {
       rmSync(directory, { recursive: true, force: true });
