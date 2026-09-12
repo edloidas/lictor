@@ -27,6 +27,48 @@ const work: WorkItem = {
   },
 };
 
+const config = (controlSocketPath: string) =>
+  LictorConfig.make({
+    githubToken: Redacted.make('test-token'),
+    expectedLogin: 'adiutriel',
+    trustedSenders: [],
+    autoAcceptInviters: [],
+    databasePath: ':memory:',
+    stateDir: stateDirOf(':memory:'),
+    policyPath: 'unused',
+    controlSocketPath,
+    deliveryMaxBytes: 1024,
+    executor: 'disabled',
+    codexModel: 'gpt-5.6-luna',
+    codexHome: '',
+    agentWorkdir: '.',
+    executorTimeoutMs: 1000,
+    executorOutputBytes: 1024,
+    executorResultBytes: 1024,
+    gitTimeoutMs: 180_000,
+    workerPollMs: 10,
+    workerMaxAttempts: 3,
+    workerRetryBaseMs: 100,
+    notificationPollMs: 60_000,
+  });
+
+/** One plane over its own in-memory queue, under the given policy document. */
+const planeUnder = (policySource: string, socketPath: string) => {
+  const ConfigLive = Layer.succeed(LictorConfig, config(socketPath));
+  const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
+  const PlaneLive = ControlPlane.DefaultWithoutDependencies.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        ConfigLive,
+        Layer.effect(Policy, parsePolicy(policySource).pipe(Effect.map(Policy.make))),
+        QueueLive,
+        CredentialHealth.Default,
+      ),
+    ),
+  );
+  return Layer.merge(PlaneLive, QueueLive);
+};
+
 const call = (path: string, request: ControlRequest) =>
   Effect.async<string, Error>((resume) => {
     let output = '';
@@ -244,6 +286,84 @@ describe('local control plane', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  // ! The approval is the authorization decision. Minting at the first claim
+  // ! instead let a daemon restart in between record the policy loaded
+  // ! afterwards as the scope the operator released.
+  it('records the approved scope when the operator approves, not at the first claim', async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const plane = yield* ControlPlane;
+          const { jobId } = yield* queue.enqueue(work);
+          const held = yield* queue.job(jobId);
+          yield* plane.execute({ command: 'job.approve', args: [String(jobId)] });
+          return { held, approved: yield* queue.job(jobId) };
+        }).pipe(
+          Effect.provide(
+            planeUnder('[defaults]\nexecution = "approval"', '/tmp/lictor-approve.sock'),
+          ),
+        ),
+      ),
+    );
+
+    expect(result.held?.grant).toBeUndefined();
+    expect(result.approved?.grant?.decision).toBe('approved');
+    // The third-party tier the repository falls into, recorded as it stood when
+    // the operator released the hold.
+    expect(result.approved?.grant?.capabilities.comment).toBe(true);
+    expect(result.approved?.grant?.capabilities.merge).toBe(false);
+    expect(result.approved?.work.approvalRequired).toBe(false);
+  });
+
+  // ! An empty ceiling is never overwritten once recorded, so approving into one
+  // ! would leave the row unrunnable and no policy correction could release it.
+  it('refuses an approval that would record a grant with no capability at all', async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const plane = yield* ControlPlane;
+          const { jobId } = yield* queue.enqueue(work);
+          const refused = yield* Effect.either(
+            plane.execute({ command: 'job.approve', args: [String(jobId)] }),
+          );
+          // Same locked-down repository, but a job that was never held.
+          const { jobId: automatic } = yield* queue.enqueue({
+            ...work,
+            deliveryId: 'control-automatic',
+            interactionId: 'interaction-automatic',
+            approvalRequired: false,
+          });
+          const notHeld = yield* plane.execute({
+            command: 'job.approve',
+            args: [String(automatic)],
+          });
+          return { refused, notHeld, job: yield* queue.job(jobId) };
+        }).pipe(
+          Effect.provide(
+            planeUnder(
+              '[defaults]\nexecution = "approval"\n\n[defaults.capabilities]\nread = false\n\n[repositories]\nallow = ["edloidas/lictor"]',
+              '/tmp/lictor-nocap.sock',
+            ),
+          ),
+        ),
+      ),
+    );
+
+    // ! Gated on the state `approve` acts from, not on the verb. Approving a job
+    // ! that is not held has always been an inert `no_change`, and a repository
+    // ! locked down to nothing must not turn every such call into an error.
+    expect(result.notHeld).toMatchObject({ changed: false });
+    expect(result.refused._tag).toBe('Left');
+    expect((result.refused as { left: { code: string } }).left.code).toBe(
+      'CONTROL_APPROVAL_WITHOUT_CAPABILITY',
+    );
+    // Still held, and still approvable once the policy is corrected.
+    expect(result.job?.grant).toBeUndefined();
+    expect(result.job?.work.approvalRequired).toBe(true);
   });
 
   it('answers a parked question, and refuses a job that is not waiting on one', async () => {

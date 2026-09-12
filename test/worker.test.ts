@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { Effect, Layer, Logger, type LogLevel, Redacted, TestClock, TestContext } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
+import { ControlPlane } from '../src/control/control-plane.ts';
 import { AgentExecutor, ExecutorError } from '../src/executor/agent-executor.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
 import type { Grant } from '../src/github/grant.ts';
@@ -105,7 +106,7 @@ type PolicyOverrides = {
 };
 
 const run = <A, E>(
-  effect: Effect.Effect<A, E, Worker | WorkQueue | CredentialHealth>,
+  effect: Effect.Effect<A, E, Worker | WorkQueue | CredentialHealth | ControlPlane>,
   execute: InstanceType<typeof AgentExecutor>['execute'],
   maxAttempts = 3,
   enabled = true,
@@ -162,6 +163,11 @@ const run = <A, E>(
       Layer.mergeAll(ConfigLive, QueueLive, ExecutorLive, PolicyLive, WorkspaceLive, HealthLive),
     ),
   );
+  // The operator's side of the same queue, so a test can approve a job and then
+  // run it under a policy edited in between.
+  const PlaneLive = ControlPlane.DefaultWithoutDependencies.pipe(
+    Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, PolicyLive, HealthLive)),
+  );
 
   return Effect.runPromise(
     Effect.scoped(
@@ -169,7 +175,7 @@ const run = <A, E>(
         // Health merged outside too, so the test body and the worker share
         // one latch instance — suspending in the test must be visible to the
         // loop under test.
-        Effect.provide(Layer.mergeAll(QueueLive, WorkerLive, HealthLive)),
+        Effect.provide(Layer.mergeAll(QueueLive, WorkerLive, HealthLive, PlaneLive)),
         Effect.provide(ConfigLive),
       ),
     ),
@@ -392,6 +398,45 @@ describe('Worker.runOnce grants', () => {
     expect(ran).toBe(false);
     expect(result.job?.outcome).toBe('rejected');
     expect(result.messages.at(-1)?.note).toBeUndefined();
+  });
+
+  // ! The window the approval-time mint closes, end to end. Minting at the first
+  // ! claim instead recorded whatever policy a restart in between had loaded, and
+  // ! labelled it `approved` — a scope the operator was never shown and may never
+  // ! have released.
+  it('keeps the approved scope across a policy edited before the first claim', async () => {
+    const seen: (Grant | undefined)[] = [];
+    const repository: { capabilities: Capabilities; execution: 'approval' } = {
+      capabilities: readAndComment,
+      execution: 'approval',
+    };
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const plane = yield* ControlPlane;
+        const { jobId } = yield* queue.enqueue({ ...work, approvalRequired: true });
+        yield* plane.execute({ command: 'job.approve', args: [String(jobId)] });
+        // Stands in for the restart: policy is read once at layer construction,
+        // so an edit only reaches a running daemon through one.
+        repository.capabilities = readOnly;
+        yield* (yield* Worker).runOnce;
+        return yield* queue.job(jobId);
+      }),
+      (_work, _dir, _timeout, _job, _attempt, _worker, grant) => {
+        seen.push(grant);
+        return Effect.succeed({ status: 'failed', summary: 'nope' });
+      },
+      5,
+      true,
+      undefined,
+      { repository },
+    );
+
+    // What the operator released, not what the daemon loaded afterwards.
+    expect(result?.grant?.decision).toBe('approved');
+    expect(result?.grant?.capabilities.comment).toBe(true);
+    // The tightening still bites on what actually ran.
+    expect(seen[0]?.capabilities.comment).toBe(false);
   });
 
   // The gate reads the grant's ceiling, so a policy that raised `maxAttempts`

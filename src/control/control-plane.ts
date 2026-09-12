@@ -3,6 +3,7 @@ import { dirname } from 'node:path';
 import { Clock, Data, Effect } from 'effect';
 import { LictorConfig } from '../config.ts';
 import { CredentialHealth } from '../github/credential-health.ts';
+import { grantedTools, mintGrant } from '../github/grant.ts';
 import { Policy } from '../policy.ts';
 import { WorkQueue } from '../queue/work-queue.ts';
 
@@ -59,12 +60,43 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
             code: 'CONTROL_JOB_NOT_FOUND',
             message: `Job ${id} was not found`,
           });
-        // Retry re-parks a job still awaiting approval, so it needs the window
-        // to date the new hold from.
-        const changed =
-          action === 'retry'
-            ? yield* queue.retry(id, policy.approvalExpiryMs)
-            : yield* queue[action](id);
+        // The approval is the authorization decision, so the scope is minted
+        // against policy as it stands now and recorded with it. Minting at the
+        // first claim instead would record whatever policy a restart in between
+        // loaded, labelled as the scope the operator released.
+        //
+        // Gated on the same state `mutateJob` approves from, not on the verb: an
+        // `approve` the row will no-op is inert and audited as `no_change`, and
+        // refusing it below would make it an error instead.
+        const now = yield* Clock.currentTimeMillis;
+        const authorized =
+          action === 'approve' &&
+          before.work.approvalRequired === true &&
+          before.status === 'pending'
+            ? mintGrant(
+                policy.forRepository(before.work.repository),
+                { ...before.work, approvalRequired: false },
+                now,
+              )
+            : undefined;
+        // ! An empty ceiling is never overwritten once written, so recording one
+        // ! here would leave the row unrunnable and unreleasable by any policy
+        // ! correction. Refuse the approval instead; the operator still holds it.
+        if (
+          authorized !== undefined &&
+          grantedTools(authorized.capabilities, before.work.continuation === true).length === 0
+        )
+          return yield* new ControlError({
+            code: 'CONTROL_APPROVAL_WITHOUT_CAPABILITY',
+            message: `Repository policy leaves job ${id} no capability to act with`,
+          });
+        const changed = yield* {
+          approve: () => queue.approve(id, authorized),
+          // Retry re-parks a job still awaiting approval, so it needs the window
+          // to date the new hold from.
+          retry: () => queue.retry(id, policy.approvalExpiryMs),
+          cancel: () => queue.cancel(id),
+        }[action]();
         yield* queue.recordAudit({
           jobId: id,
           repository: before.work.repository,
