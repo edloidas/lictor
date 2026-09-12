@@ -82,17 +82,30 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         ref = `refs/pull/${job.work.subject.number}/head`;
       }
       const policyTime = yield* Clock.currentTimeMillis;
-      // Runs before the intersection below exists, so the attempt budget has to
-      // read the stored ceiling here as well.
-      const bounded =
-        job.grant === undefined
-          ? repositoryPolicy
-          : {
-              ...repositoryPolicy,
-              maxAttempts: Math.min(repositoryPolicy.maxAttempts, job.grant.maxAttempts),
-            };
+
+      // ! Fail closed: an unreadable ceiling is not an absent one, and
+      // ! `recordGrant` will not overwrite it, so the row cannot heal on its own.
+      if (job.grantUnreadable === true) {
+        const reason = 'Recorded authorization for this job could not be read';
+        yield* queue.fail(job.id, job.attempts, reason, undefined, 'rejected', {
+          repository: job.work.repository,
+          subjectNumber: job.work.subject.number,
+          outcome: 'rejected',
+        });
+        yield* Effect.logError('Refused queued work carrying an unreadable grant').pipe(
+          Effect.annotateLogs({
+            job: job.id,
+            attempt: job.attempts,
+            durationMs: policyTime - claimedAt,
+          }),
+        );
+        return true;
+      }
+
+      const live = mintGrant(repositoryPolicy, job.work, policyTime);
+      const grant = job.grant === undefined ? live : intersectGrant(job.grant, live);
       const refusal = policyRefusal({
-        repository: bounded,
+        repository: { ...repositoryPolicy, maxAttempts: grant.maxAttempts },
         attempts: job.attempts,
         readyAt: job.readyAt,
         approvalRequired: job.work.approvalRequired,
@@ -116,28 +129,6 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         return true;
       }
 
-      // ! Fail closed: an unreadable ceiling is not an absent one, and
-      // ! `recordGrant` will not overwrite it, so the row cannot heal on its own.
-      if (job.grantUnreadable === true) {
-        const unreadableAt = yield* Clock.currentTimeMillis;
-        const reason = 'Recorded authorization for this job could not be read';
-        yield* queue.fail(job.id, job.attempts, reason, undefined, 'rejected', {
-          repository: job.work.repository,
-          subjectNumber: job.work.subject.number,
-          outcome: 'rejected',
-        });
-        yield* Effect.logError('Refused queued work carrying an unreadable grant').pipe(
-          Effect.annotateLogs({
-            job: job.id,
-            attempt: job.attempts,
-            durationMs: unreadableAt - claimedAt,
-          }),
-        );
-        return true;
-      }
-
-      const live = mintGrant(repositoryPolicy, job.work, policyTime);
-      const grant = job.grant === undefined ? live : intersectGrant(job.grant, live);
       // An agent holding no GitHub operation can neither do the work nor say so
       // on the thread. Denied before `recordGrant`: an empty ceiling once
       // written is never overwritten, and correcting the policy could not
