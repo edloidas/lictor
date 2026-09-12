@@ -39,13 +39,15 @@ export class GitHubStatusError extends Data.TaggedError('GitHubStatusError')<{
   readonly retryAfterMs?: number;
 }> {}
 
-const CreatedComment = Schema.Struct({ html_url: Schema.optional(Schema.String) });
-const CommentPage = Schema.Array(
-  Schema.Struct({ body: Schema.optional(Schema.String), html_url: Schema.optional(Schema.String) }),
-);
+const CreatedReaction = Schema.Struct({ id: Schema.optional(Schema.Number) });
 
-/** One posted comment, as much of it as a caller needs to record. */
-export type PostedComment = { readonly url?: string };
+/**
+ * The reactions this daemon uses to say where a job got to.
+ *
+ * `eyes` is the acknowledgement the delivery worker places; the rest are the
+ * terminal states the outbox reconciles it to.
+ */
+export type ReactionContent = 'eyes' | 'rocket' | 'confused';
 
 /**
  * An `HttpClient` pointed at `api.github.com` and carrying the daemon's
@@ -77,38 +79,6 @@ export class GitHubClient extends Effect.Service<GitHubClient>()('GitHubClient',
         ),
       ),
     );
-
-    /**
-     * Acknowledges a triggering comment or body with a reaction.
-     *
-     * Deliberately on the client rather than behind `CapabilityBroker`. The
-     * broker refuses anything that is not a `running` job holding a live lease,
-     * and a just-enqueued job is `pending` — loosening that fencing to admit a
-     * daemon-side call would weaken the only thing the broker exists for. If the
-     * *agent* should ever react, that becomes a normal policy-gated broker tool
-     * and the two paths stay distinct.
-     *
-     * GitHub's reactions endpoints are idempotent per user, content, and target,
-     * so a repeated call is a no-op rather than a duplicate.
-     */
-    const addReaction = (repository: string, target: ContextRef, content: 'eyes') =>
-      Effect.gen(function* () {
-        const path = reactionPath(repository, target);
-        const authorized = yield* authenticated;
-        const response = yield* authorized
-          .execute(HttpClientRequest.bodyUnsafeJson(HttpClientRequest.post(path), { content }))
-          .pipe(
-            Effect.mapError(
-              (cause) => new GitHubRequestError({ message: `Could not POST ${path}`, cause }),
-            ),
-          );
-        // 200 as well as 201: already-present reaction, normal on a replay.
-        if (response.status !== 200 && response.status !== 201) {
-          return yield* new GitHubRequestError({
-            message: `Reacting to ${target.kind} returned status ${response.status}`,
-          });
-        }
-      });
 
     /**
      * Why GitHub refused, expressed as something a delivery loop can act on.
@@ -156,46 +126,80 @@ export class GitHubClient extends Effect.Service<GitHubClient>()('GitHubClient',
       });
 
     /**
-     * Posts a comment on an issue or pull request as the daemon.
+     * Acknowledges a triggering comment or body with a reaction, and answers
+     * with that reaction's id.
      *
-     * On `GitHubClient` rather than `CapabilityBroker` for the same reason
-     * `addReaction` is: the broker admits only a `running` job holding a live
-     * lease, and an outcome is posted once the job is terminal.
+     * On the client rather than behind `CapabilityBroker`: the broker admits
+     * only a `running` job holding a live lease, and a just-enqueued job is
+     * `pending`.
+     *
+     * GitHub's reactions endpoints are idempotent per user, content and target.
+     * A repeat is not merely a no-op: it answers 200 with the reaction that is
+     * already there, which is the only way to learn an id nothing recorded.
      */
-    const createComment = (repository: string, number: number, body: string) =>
+    const addReaction = (repository: string, target: ContextRef, content: ReactionContent) =>
       Effect.gen(function* () {
-        const path = `/repos/${repository}/issues/${number}/comments`;
+        const path = reactionPath(repository, target);
         const response = yield* send(
-          HttpClientRequest.bodyUnsafeJson(HttpClientRequest.post(path), { body }),
+          HttpClientRequest.bodyUnsafeJson(HttpClientRequest.post(path), { content }),
           path,
         );
-        const decoded = yield* Schema.decodeUnknown(CreatedComment)(yield* response.json).pipe(
-          Effect.orElseSucceed(() => ({ html_url: undefined })),
+        const decoded = yield* Schema.decodeUnknown(CreatedReaction)(yield* response.json).pipe(
+          Effect.orElseSucceed(() => ({ id: undefined })),
         );
-        return {
-          ...(decoded.html_url === undefined ? {} : { url: decoded.html_url }),
-        } satisfies PostedComment;
+        return decoded.id;
       });
+
+    const removeReaction = (repository: string, target: ContextRef, id: number) => {
+      const path = `${reactionPath(repository, target)}/${id}`;
+      // A reaction already gone is the state this call wanted. Only the delete
+      // tolerates 404 — on the add it means the target itself is gone.
+      return send(HttpClientRequest.del(path), path).pipe(
+        Effect.catchIf(
+          (error) => error._tag === 'GitHubStatusError' && error.status === 404,
+          () => Effect.void,
+        ),
+        Effect.asVoid,
+      );
+    };
 
     /**
-     * One page of an issue's comments, newest activity first, for recognising a
-     * comment this daemon may already have posted. `since` bounds the scan to
-     * the window the message could have landed in.
+     * Leaves this account holding exactly `content` on the target.
+     *
+     * Add before remove. A crash between the two shows both reactions until a
+     * retry converges; the other order shows none, and a thread that lost its
+     * acknowledgement reads as work the daemon never saw.
+     *
+     * Each stale content is cleared by posting it and deleting what comes back,
+     * rather than by searching a listing for this account. The listing is
+     * everyone's, so finding this account in it is unbounded work on a popular
+     * target — a scan that can run out of pages either dead-letters the outcome
+     * or leaves a contradictory reaction standing forever, and re-reading the
+     * same prefix on retry makes neither converge. Posting costs one request
+     * against a known id and converges whatever anyone else has reacted.
+     *
+     * It also touches nothing but this daemon's own vocabulary: a reaction the
+     * operator left by hand on the same comment is never a candidate.
      */
-    const listComments = (repository: string, number: number, sinceMs: number, page: number) =>
+    const reconcileReaction = (
+      repository: string,
+      target: ContextRef,
+      content: ReactionContent,
+      stale: readonly ReactionContent[],
+    ) =>
       Effect.gen(function* () {
-        const since = new Date(sinceMs).toISOString();
-        const path = `/repos/${repository}/issues/${number}/comments?per_page=100&page=${page}&since=${since}`;
-        const response = yield* send(HttpClientRequest.get(path), path);
-        return yield* Schema.decodeUnknown(CommentPage)(yield* response.json).pipe(
-          Effect.mapError(
-            (cause) =>
-              new GitHubRequestError({ message: `${path} returned an unexpected body`, cause }),
-          ),
-        );
+        yield* addReaction(repository, target, content);
+        for (const other of stale) {
+          if (other === content) continue;
+          // 200 means this account held it and the id is the stale reaction's;
+          // 201 means the post created one this account did not have. The
+          // delete is right either way, and the end state is the same.
+          const id = yield* addReaction(repository, target, other);
+          if (id !== undefined) yield* removeReaction(repository, target, id);
+        }
       });
 
-    return { authenticated, addReaction, createComment, listComments };
+    return { authenticated, addReaction, reconcileReaction };
   }),
   dependencies: [GitHubCredential.Default, FetchHttpClient.layer],
 }) {}

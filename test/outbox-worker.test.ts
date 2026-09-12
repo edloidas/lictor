@@ -5,6 +5,7 @@ import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { GitHubClient } from '../src/github/client.ts';
 import { GitHubCredential } from '../src/github/credential.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
+import { GitHubIdentity } from '../src/github/identity.ts';
 import { OutboxWorker } from '../src/outbox-worker.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
 import { type OutcomeDelivery, WorkQueue } from '../src/queue/work-queue.ts';
@@ -49,7 +50,7 @@ const work: WorkItem = {
   },
 };
 
-const COMMENT_POLICY = `[defaults]
+const ACCEPTED_POLICY = `[defaults]
 execution = "automatic"
 
 [defaults.capabilities]
@@ -60,6 +61,7 @@ comment = true
 allow = ["edloidas/lictor"]
 `;
 
+/** Commenting withheld, admission intact: a reaction must still land. */
 const NO_COMMENT_POLICY = `[defaults]
 execution = "automatic"
 
@@ -70,7 +72,19 @@ read = true
 allow = ["edloidas/lictor"]
 `;
 
-const COMMENTS_URL = 'https://api.github.com/repos/edloidas/lictor/issues/17/comments';
+const DENIED_POLICY = `[defaults]
+execution = "automatic"
+
+[defaults.capabilities]
+read = true
+
+[repositories]
+allow = ["edloidas/lictor"]
+deny = ["edloidas/lictor"]
+`;
+
+const SUBJECT_URL = 'https://api.github.com/repos/edloidas/lictor/issues/17/reactions';
+const COMMENT_URL = 'https://api.github.com/repos/edloidas/lictor/issues/comments/99/reactions';
 
 type Reply = {
   readonly status: number;
@@ -84,11 +98,8 @@ type Reply = {
  *
  * The real `GitHubClient` sits over the stub rather than being replaced by one,
  * so the status classification the worker branches on is the client's own. The
- * latch is built outside the worker's layer so a test can read it.
- *
- * `{{marker}}` in a reply body becomes the row's real marker, so a fixture can
- * only claim a comment is already on the thread by carrying the identity that
- * row was actually given.
+ * identity is stubbed instead: `verified` would otherwise spend a request of its
+ * own, and the login it yields is all the reconciliation reads.
  */
 const deliverOnce = (options: {
   /** Omit to run the loop against an empty outbox. */
@@ -105,9 +116,8 @@ const deliverOnce = (options: {
   const requests: string[] = [];
   const bodies: string[] = [];
   let call = 0;
-  let marker = '';
-  // Runs from inside the stub, between the reconciliation answering and the
-  // POST — the window an operator retry actually lands in.
+  // Runs from the policy read, which is the last thing the worker does before
+  // re-reading its claim — the window an operator retry actually lands in.
   let supersede: () => void = () => undefined;
   const stub = HttpClient.make((request) => {
     requests.push(`${request.method} ${request.url}`);
@@ -115,11 +125,10 @@ const deliverOnce = (options: {
     bodies.push(payload.body instanceof Uint8Array ? new TextDecoder().decode(payload.body) : '');
     const reply = options.replies[Math.min(call, options.replies.length - 1)];
     call += 1;
-    if (options.supersedeBeforeSend === true) supersede();
     return Effect.succeed(
       HttpClientResponse.fromWeb(
         request,
-        new Response(JSON.stringify(reply?.body ?? {}).replaceAll('{{marker}}', marker), {
+        new Response(JSON.stringify(reply?.body ?? {}), {
           status: reply?.status ?? 201,
           headers: { 'content-type': 'application/json', ...reply?.headers },
         }),
@@ -130,9 +139,28 @@ const deliverOnce = (options: {
   const ConfigLive = Layer.succeed(LictorConfig, config);
   const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
   const HealthLive = CredentialHealth.Default;
+  const IdentityLive = Layer.succeed(
+    GitHubIdentity,
+    GitHubIdentity.make({
+      verified: Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }),
+    }),
+  );
   const PolicyLive = Layer.effect(
     Policy,
-    parsePolicy(options.policy ?? COMMENT_POLICY, ['edloidas']).pipe(Effect.map(Policy.make)),
+    parsePolicy(options.policy ?? ACCEPTED_POLICY, ['edloidas']).pipe(
+      Effect.map((parsed) => {
+        const made = Policy.make(parsed);
+        return options.supersedeBeforeSend === true
+          ? Policy.make({
+              ...parsed,
+              forRepository: (repository: string) => {
+                supersede();
+                return made.forRepository(repository);
+              },
+            })
+          : made;
+      }),
+    ),
   );
   const ClientLive = GitHubClient.DefaultWithoutDependencies.pipe(
     Layer.provide(
@@ -143,7 +171,9 @@ const deliverOnce = (options: {
     ),
   );
   const WorkerLive = OutboxWorker.DefaultWithoutDependencies.pipe(
-    Layer.provide(Layer.mergeAll(ConfigLive, QueueLive, ClientLive, PolicyLive, HealthLive)),
+    Layer.provide(
+      Layer.mergeAll(ConfigLive, QueueLive, ClientLive, PolicyLive, HealthLive, IdentityLive),
+    ),
   );
 
   return Effect.runPromise(
@@ -169,8 +199,6 @@ const deliverOnce = (options: {
             yield* queue.claimOutbox;
             yield* queue.recoverStaleOutbox(Number.MAX_SAFE_INTEGER);
           }
-          const [owed] = yield* queue.outboxFor(jobId);
-          marker = `<!-- lictor:${owed?.messageId ?? ''} -->`;
         }
         const runtime = yield* Effect.runtime<never>();
         supersede = () => {
@@ -180,13 +208,14 @@ const deliverOnce = (options: {
         const startedAt = yield* Clock.currentTimeMillis;
         const worked = yield* worker.runOnce;
         const [message] = yield* queue.outboxFor(1);
+        const audit = yield* queue.auditLog(1);
         return {
           worked,
           message,
-          marker,
           startedAt,
           requests,
           bodies,
+          audit,
           rejected: yield* health.isRejected,
         };
       }).pipe(
@@ -204,34 +233,158 @@ const completed: OutcomeDelivery = {
   note: 'Opened the pull request.',
 };
 
-const since = (createdAt: number | undefined) =>
-  `GET ${COMMENTS_URL}?per_page=100&page=1&since=${new Date(createdAt ?? 0).toISOString()}`;
-
 describe('OutboxWorker', () => {
-  it('posts the outcome to the thread and records the comment', async () => {
+  it('resolves the acknowledgement to the outcome reaction', async () => {
     const result = await deliverOnce({
       delivery: completed,
-      replies: [{ status: 201, body: { html_url: 'https://github.com/c/1' } }],
+      // The rocket, then the eyes answered as already present, then its removal.
+      replies: [
+        { status: 201, body: { id: 1 } },
+        { status: 200, body: { id: 7 } },
+        { status: 204 },
+      ],
     });
 
     expect(result.worked).toBe(true);
-    expect(result.requests).toEqual([`POST ${COMMENTS_URL}`]);
-    expect(result.message).toMatchObject({
-      status: 'delivered',
-      commentUrl: 'https://github.com/c/1',
-    });
-    expect(result.bodies[0]).toContain('Done.');
-    expect(result.bodies[0]).toContain(result.marker);
-    // The fixture carries a note, and a `completed` outcome does not publish
-    // one — asserted through the delivered body, not the renderer, so the whole
-    // path is pinned rather than the one function that decides it.
-    expect(result.bodies[0]).not.toContain('Opened the pull request.');
+    expect(result.requests).toEqual([
+      `POST ${SUBJECT_URL}`,
+      `POST ${SUBJECT_URL}`,
+      `DELETE ${SUBJECT_URL}/7`,
+    ]);
+    expect(result.bodies.slice(0, 2)).toEqual([
+      JSON.stringify({ content: 'rocket' }),
+      JSON.stringify({ content: 'eyes' }),
+    ]);
+    expect(result.message?.status).toBe('delivered');
   });
 
-  it('records the outcome locally and posts nothing when policy forbids commenting', async () => {
+  it('leaves a hand-placed reaction of the operator alone', async () => {
+    // The daemon authenticates as the operator's own account, so a listing
+    // filtered to "this account" cannot tell the two apart. Posting only the
+    // contents the daemon itself uses never names anything else.
+    const result = await deliverOnce({
+      delivery: completed,
+      replies: [
+        { status: 201, body: { id: 1 } },
+        { status: 200, body: { id: 7 } },
+        { status: 204 },
+      ],
+    });
+
+    expect(result.bodies.every((body) => !body.includes('+1'))).toBe(true);
+    expect(result.requests.filter((request) => request.startsWith('DELETE'))).toEqual([
+      `DELETE ${SUBJECT_URL}/7`,
+    ]);
+  });
+
+  // Every arm, and the content itself: driving only `completed` leaves the
+  // other six free to be deleted from the table with the suite still green.
+  it.each([
+    ['completed', 'rocket'],
+    ['canceled', 'confused'],
+    ['clipped', 'confused'],
+    ['expired', 'confused'],
+    ['failed', 'confused'],
+    ['rejected', 'confused'],
+    ['unanswered', 'confused'],
+  ])('resolves %s to %s', async (outcome, content) => {
+    const result = await deliverOnce({
+      delivery: { repository: 'edloidas/lictor', subjectNumber: 17, outcome } as OutcomeDelivery,
+      replies: [{ status: 201 }, { status: 200, body: [] }],
+    });
+
+    expect(result.requests[0]).toBe(`POST ${SUBJECT_URL}`);
+    expect(result.bodies[0]).toBe(JSON.stringify({ content }));
+    expect(result.message?.status).toBe('delivered');
+  });
+
+  it('reacts on the triggering comment when the row carries one', async () => {
+    const result = await deliverOnce({
+      delivery: { ...completed, context: { kind: 'issue_comment', id: 99 } },
+      replies: [{ status: 201 }, { status: 200, body: [] }],
+    });
+
+    expect(result.requests[0]).toBe(`POST ${COMMENT_URL}`);
+    expect(result.message?.status).toBe('delivered');
+  });
+
+  it('leaves another account’s reactions alone', async () => {
+    const result = await deliverOnce({
+      delivery: completed,
+      replies: [
+        { status: 201 },
+        { status: 200, body: [{ id: 8, content: 'eyes', user: { login: 'edloidas' } }] },
+      ],
+    });
+
+    expect(result.requests.some((request) => request.startsWith('DELETE'))).toBe(false);
+    expect(result.message?.status).toBe('delivered');
+  });
+
+  it('clears a previous attempt\u2019s reaction as well as the acknowledgement', async () => {
+    // What a retried job leaves: an earlier attempt's terminal reaction still
+    // standing beside the acknowledgement. Probed only past the first attempt,
+    // so an ordinary delivery never posts a wrong outcome to look for one.
+    const result = await deliverOnce({
+      delivery: completed,
+      priorAttempts: 1,
+      replies: [
+        { status: 201, body: { id: 1 } },
+        { status: 200, body: { id: 7 } },
+        { status: 204 },
+        { status: 200, body: { id: 9 } },
+        { status: 204 },
+      ],
+    });
+
+    expect(result.bodies.filter((body) => body !== '')).toEqual([
+      JSON.stringify({ content: 'rocket' }),
+      JSON.stringify({ content: 'eyes' }),
+      JSON.stringify({ content: 'confused' }),
+    ]);
+    expect(result.requests).toContain(`DELETE ${SUBJECT_URL}/7`);
+    expect(result.requests).toContain(`DELETE ${SUBJECT_URL}/9`);
+  });
+
+  it('treats a reaction already gone as converged', async () => {
+    const result = await deliverOnce({
+      delivery: completed,
+      replies: [
+        { status: 201, body: { id: 1 } },
+        { status: 200, body: { id: 7 } },
+        { status: 404 },
+      ],
+    });
+
+    expect(result.message?.status).toBe('delivered');
+  });
+
+  it('records the reaction in the capability audit', async () => {
+    const result = await deliverOnce({
+      delivery: completed,
+      replies: [{ status: 201 }, { status: 200, body: [] }],
+    });
+
+    expect(result.audit).toContainEqual(
+      expect.objectContaining({ capability: 'react', outcome: 'ok', actor: 'daemon' }),
+    );
+  });
+
+  it('signals an outcome on a repository that withholds commenting', async () => {
     const result = await deliverOnce({
       delivery: completed,
       policy: NO_COMMENT_POLICY,
+      replies: [{ status: 201 }, { status: 200, body: [] }],
+    });
+
+    expect(result.requests[0]).toBe(`POST ${SUBJECT_URL}`);
+    expect(result.message?.status).toBe('delivered');
+  });
+
+  it('records the outcome locally and reacts nothing when the repository is denied', async () => {
+    const result = await deliverOnce({
+      delivery: completed,
+      policy: DENIED_POLICY,
       replies: [{ status: 201 }],
     });
 
@@ -244,112 +397,26 @@ describe('OutboxWorker', () => {
     });
   });
 
-  it('recognises its own comment instead of posting a second one', async () => {
-    // What a crash between the POST and the row recording it leaves behind.
+  it('leaves the acknowledgement in place for an outcome with nothing to signal', async () => {
     const result = await deliverOnce({
-      delivery: completed,
-      priorAttempts: 1,
-      replies: [
-        {
-          status: 200,
-          body: [
-            // A Lictor comment belonging to a different message. Matching the
-            // prefix rather than the identity reconciles against this one and
-            // drops the message this row still owes the thread.
-            { body: 'an earlier outcome <!-- lictor:some-other-message -->' },
-            { body: 'done {{marker}}', html_url: 'https://github.com/c/9' },
-          ],
-        },
-      ],
+      delivery: { repository: 'edloidas/lictor', subjectNumber: 17, outcome: 'needs_input' },
+      replies: [{ status: 201 }],
     });
 
-    expect(result.requests).toEqual([since(result.message?.createdAt)]);
-    expect(result.message).toMatchObject({
-      status: 'delivered',
-      commentUrl: 'https://github.com/c/9',
-    });
-  });
-
-  it('reads past a full page that does not carry the marker', async () => {
-    const result = await deliverOnce({
-      delivery: completed,
-      priorAttempts: 1,
-      replies: [
-        { status: 200, body: [{ body: 'unrelated chatter' }] },
-        { status: 200, body: [{ body: 'done {{marker}}', html_url: 'https://github.com/c/8' }] },
-      ],
-    });
-
-    expect(result.requests).toHaveLength(2);
-    expect(result.requests[1]).toContain('page=2');
-    expect(result.message?.commentUrl).toBe('https://github.com/c/8');
-  });
-
-  it('posts once a reconciliation proves nothing landed', async () => {
-    const result = await deliverOnce({
-      delivery: completed,
-      priorAttempts: 1,
-      replies: [
-        { status: 200, body: [] },
-        { status: 201, body: { html_url: 'https://github.com/c/2' } },
-      ],
-    });
-
-    expect(result.requests).toEqual([since(result.message?.createdAt), `POST ${COMMENTS_URL}`]);
+    expect(result.requests).toEqual([]);
     expect(result.message?.status).toBe('delivered');
   });
 
-  it('does not post when the reconciliation ran out of pages', async () => {
-    // Every page full and no marker means the thread outran the scan, which is
-    // not the same answer as the comment not being there.
+  it('does not react for a message the operator superseded while it was sending', async () => {
     const result = await deliverOnce({
       delivery: completed,
       priorAttempts: 1,
-      replies: [{ status: 200, body: [{ body: 'busy thread' }] }],
-    });
-
-    expect(result.requests).toHaveLength(10);
-    expect(result.requests.every((request) => request.startsWith('GET'))).toBe(true);
-    expect(result.message?.status).toBe('pending');
-  });
-
-  it('does not post a message the operator superseded while it was sending', async () => {
-    const result = await deliverOnce({
-      delivery: completed,
-      priorAttempts: 1,
-      // The reconciliation comes back empty, so without the re-read the next
-      // step is a POST of an outcome the operator has already replaced.
-      replies: [{ status: 200, body: [] }],
+      replies: [{ status: 201 }],
       supersedeBeforeSend: true,
     });
 
-    expect(result.requests).toHaveLength(1);
-    expect(result.requests[0]).toContain('GET');
+    expect(result.requests).toEqual([]);
     expect(result.message?.status).toBe('canceled');
-  });
-
-  it('does not post when the reconciliation itself failed', async () => {
-    const result = await deliverOnce({
-      delivery: completed,
-      priorAttempts: 1,
-      replies: [{ status: 500 }],
-    });
-
-    expect(result.requests).toHaveLength(1);
-    expect(result.message?.status).toBe('pending');
-  });
-
-  it('does not post when the reconciliation answered something it cannot read', async () => {
-    // A body no schema accepts leaves the loop's last recovery branch to catch
-    // it — the branch a defect would otherwise take the whole worker down past.
-    const result = await deliverOnce({
-      delivery: completed,
-      priorAttempts: 1,
-      replies: [{ status: 200, body: { not: 'an array' } }],
-    });
-
-    expect(result.requests).toHaveLength(1);
-    expect(result.message).toMatchObject({ status: 'pending', attempts: 2 });
   });
 
   it('waits as long as GitHub asked when it throttles', async () => {
@@ -375,7 +442,7 @@ describe('OutboxWorker', () => {
     expect(waited).toBeLessThan(1_000);
   });
 
-  it.each([404, 410])('gives up on a subject that answered %i', async (status) => {
+  it.each([404, 410])('gives up on a target that answered %i', async (status) => {
     const result = await deliverOnce({ delivery: completed, replies: [{ status }] });
 
     expect(result.message?.status).toBe('failed');
@@ -400,16 +467,6 @@ describe('OutboxWorker', () => {
     expect(result.worked).toBe(false);
     expect(result.requests).toEqual([]);
     expect(result.message).toMatchObject({ status: 'pending', attempts: 0 });
-  });
-
-  it('publishes no note for an outcome the daemon reached on its own', async () => {
-    const result = await deliverOnce({
-      delivery: { repository: 'edloidas/lictor', subjectNumber: 17, outcome: 'failed' },
-      replies: [{ status: 201 }],
-    });
-
-    expect(result.bodies[0]).not.toContain("agent's own summary");
-    expect(result.bodies[0]).toContain('This did not finish.');
   });
 
   it('reports no work when nothing is owed', async () => {

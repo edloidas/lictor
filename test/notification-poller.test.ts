@@ -128,6 +128,7 @@ const run = (
             subjectNumber: 17,
             question: 'which branch?',
             answerers: ['edloidas'],
+            askedAt: Date.now(),
             expiresAt: Date.now() + 3_600_000,
           });
         }
@@ -229,8 +230,7 @@ const run = (
             const GitHubLive = Layer.succeed(
               GitHubClient,
               GitHubClient.make({
-                createComment: () => Effect.succeed({}),
-                listComments: () => Effect.succeed([]),
+                reconcileReaction: () => Effect.void,
                 authenticated: Effect.succeed(
                   client.pipe(
                     HttpClient.mapRequest(HttpClientRequest.prependUrl('https://api.github.test')),

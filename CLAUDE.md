@@ -104,23 +104,37 @@ indistinguishable from a revoked token.
   version of this: it hands the work to a second agent sooner, while the first is
   most likely still alive. The record is signalled as a process *group*, so a
   recycled pid that leads no group of its own is `ESRCH` rather than a stranger
-- The eyes reaction is strictly best-effort and goes through `GitHubClient`, not
-  `CapabilityBroker`. The broker refuses anything that is not a `running` job with
-  a live lease, and a just-enqueued job is `pending`
-- **The closing comment goes through `GitHubClient` too, for a different reason:
-  the job is terminal by delivery time, so the broker refuses it again.** Do not
-  read across from the reaction beyond that — a reaction rides GitHub's per-user
-  idempotency and a comment POST has none, so a send that may repeat reconciles
-  against the thread by the message's marker first
+- **The daemon publishes no prose. It reacts.** The eyes acknowledgement and the
+  terminal reaction that resolves it both go through `GitHubClient`, not
+  `CapabilityBroker` — the broker refuses anything that is not a `running` job
+  with a live lease, and a job is `pending` at one end and terminal at the other.
+  The acknowledgement is best-effort; the resolution is durable
 - **A terminal outcome owes its thread one `outbox` row, inserted in the same
   transaction that records the outcome.** The row stores raw fields and the
-  comment is rendered at send time: rendering inside that transaction lets one
-  throw roll the outcome back, lapse the lease, and rerun an agent whose side
-  effects already landed. `fail` inserts nothing while it is scheduling a retry
-- **Only `ExecutorResult.summary` may be published.** Every other string a
-  terminal write holds — an `ExecutorError` message, a `WorkspaceError` message,
-  a policy refusal code — is a diagnostic, and the first two carry whatever the
-  repository made Codex or git say
+  reaction is chosen at send time, so nothing in that transaction can throw,
+  roll the outcome back, lapse the lease, and rerun an agent whose side effects
+  already landed. `fail` inserts nothing while it is scheduling a retry
+- **The sender clears a stale reaction by posting it, never by searching for
+  it.** A reaction POST is idempotent per user, content and target, so a repeat
+  answers 200 with the reaction already there — which is how an id nothing
+  recorded is learned. The listing is everyone's reactions, so finding this
+  account in it is unbounded work on a popular target: a bounded scan either
+  dead-letters the outcome or leaves a contradictory reaction standing, and
+  re-reading the same prefix on retry converges to neither. Add before remove: a
+  crash between them shows two reactions, and the other order shows none. Only
+  the daemon's own vocabulary is ever posted, so a reaction the operator left by
+  hand is never a candidate — and a terminal content is probed only past the
+  first attempt, or an ordinary delivery would post a wrong outcome to look for
+  one
+- **`needs_input` publishes nothing and parks only where the agent already
+  spoke.** `park` takes `askedAt` from the agent's own `create_comment` audit
+  row, and a job that returned `needs_input` without posting one is terminal
+  instead. A parked job consumes the next trusted reply on its thread as the
+  answer — arming that for a question nobody was shown would swallow unrelated
+  work
+- **No string a terminal write holds reaches GitHub.** The agent's `summary`,
+  an `ExecutorError` message, a `WorkspaceError` message, a policy refusal code:
+  all of them stay in the row and the log, where `job.show` reads them
 - A throw inside `Effect.gen` is a defect, not a failure: `catchAll` never sees
   it, so the recovery branches in the delivery worker are all bypassed and the
   loop dies. Wrap anything that throws — `JSON.parse` above all — in `Effect.try`

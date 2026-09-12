@@ -1,5 +1,6 @@
 import { HttpClientRequest } from '@effect/platform';
 import { Clock, Data, Effect } from 'effect';
+import { bounded } from '../bounded.ts';
 import { Policy } from '../policy.ts';
 import { type QueuedJob, WorkQueue } from '../queue/work-queue.ts';
 import { GitHubClient } from './client.ts';
@@ -376,17 +377,33 @@ const quotaNote = (headers: Record<string, string | undefined>): string | undefi
   return remaining === undefined ? undefined : `remaining quota ${remaining}`;
 };
 
+/** What one audited string field may contribute, so the whole row stays small. */
+const AUDIT_FIELD_BYTES = 512;
+const AUDIT_ROW_BYTES = 4096;
+
+/**
+ * The call as the audit records it: secrets masked, long prose cut.
+ *
+ * Bounded per field, never by cutting the encoded row: a cut landing inside a
+ * string stores JSON nothing can parse, and these rows are read back as
+ * evidence, not only written.
+ */
 const sanitized = (input: Readonly<Record<string, unknown>>): string => {
+  const auditValue = (key: string, value: unknown): unknown => {
+    if (/token|secret|authorization|private.?key/i.test(key)) return '[REDACTED]';
+    return typeof value === 'string' ? bounded(value, AUDIT_FIELD_BYTES) : value;
+  };
   const clean = Object.fromEntries(
-    Object.entries(input).map(([key, value]) => [
-      key,
-      /token|secret|authorization|private.?key/i.test(key) ? '[REDACTED]' : value,
-    ]),
+    Object.entries(input).map(([key, value]) => [key, auditValue(key, value)]),
   );
-  return Buffer.from(JSON.stringify(clean))
-    .subarray(0, 4096)
-    .toString('utf8')
-    .replace(/\uFFFD$/u, '');
+  const encoded = JSON.stringify(clean);
+  if (Buffer.byteLength(encoded) <= AUDIT_ROW_BYTES) return encoded;
+  // Enough fields to overrun even bounded. Keep the scalars the audit is
+  // queried on and say the rest was dropped, rather than store a fragment.
+  const scalars = Object.fromEntries(
+    Object.entries(clean).filter(([, value]) => typeof value !== 'string'),
+  );
+  return JSON.stringify({ ...scalars, truncated: true });
 };
 
 const boundedJson = (value: unknown): unknown => {

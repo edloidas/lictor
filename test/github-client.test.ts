@@ -99,10 +99,16 @@ describe('GitHubClient.addReaction', () => {
     expect(result._tag).toBe('Right');
   });
 
-  it('fails with GitHubRequestError on a refusal', async () => {
+  it('classifies a refusal as a status the delivery loop can act on', async () => {
     const { result } = await react({ kind: 'issue_comment', id: 99 }, 403);
 
     expect(result._tag).toBe('Left');
-    expect(String(result)).toContain('GitHubRequestError');
+    // The status itself, not the tag: the worker latches on 401, abandons on
+    // 404, and honours a throttle, so a `GitHubStatusError` carrying 0 would
+    // satisfy a tag-only assertion and route to none of them.
+    expect(result._tag === 'Left' ? result.left : undefined).toMatchObject({
+      _tag: 'GitHubStatusError',
+      status: 403,
+    });
   });
 });

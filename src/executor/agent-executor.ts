@@ -264,7 +264,7 @@ Every GitHub action goes through the \`lictor\` MCP server, which is the only Gi
 Report the outcome as one status:
 - \`completed\` — you carried out what this interaction authorized. Part of the request falling outside your capabilities does not change that: do the rest, and say in \`summary\` what you did not do and why.
 - \`rejected\` — you carried out none of it, because you lacked the authority or you decline. Say why. Answering a question counts as carrying something out.
-- \`needs_input\` — you cannot continue without information only this thread can supply, and \`summary\` is that question. Never ask for capability: no reply widens what this job may do.
+- \`needs_input\` — exceptional, and the last thing to reach for. Whoever wrote the request is waiting for a result, not a question, so returning this is closer to a soft rejection than to a pause: use it only where no reasonable reading of the request lets you finish any of it. Before returning it you must post the report yourself, with \`create_comment\` — nothing else publishes it, and a question nobody can see is never answered. Write that comment as an account of work that stopped short: what you did establish, what blocked you, and what the reader should do next. Put the same question in \`summary\` for the record. Never ask for capability: no reply widens what this job may do.
 - \`failed\` — something broke that you could not work around. This run is the last one either way, so \`summary\` has to carry what broke. Never for a capability you were not granted.`;
 };
 
@@ -429,7 +429,7 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                   .filter(Boolean)
                   .join(
                     '\n\n',
-                  )}\n\nReturn only the result object described by the output schema you were given. Keep \`summary\` under 4000 bytes; it is the only field published, and a longer one is cut.`,
+                  )}\n\nReturn only the result object described by the output schema you were given. Keep \`summary\` under 4000 bytes; it is recorded for the operator, not posted, and a longer one is cut.`,
                 timeoutMs: budgetMs,
                 outputLimitBytes: config.executorOutputBytes,
                 // `codex exec` writes its whole transcript here and names a
