@@ -165,14 +165,18 @@ Read and comment let her investigate and reply; `branches` and `pullRequests`
 let her ship code changes — branch, commit, open a pull request, continue on a
 branch she already started for that subject. Assignment and review-request
 notifications are acted on when the assigner or requester is a trusted sender;
-grant `issues` for closing, labelling, and editing, and `merge` where the
-repository's policy allows it. `forcePush` and `deleteBranches` stay denied
-unless a specific repository asks for them.
+grant `issues` for closing, labelling, and editing, `review` for the pull
+request review surface — reviewing a diff line by line, holding a review pending
+for a person to finish, replying inside a thread, resolving one — and `merge`
+where the repository's policy allows it. `forcePush` and `deleteBranches` stay
+denied unless a specific repository asks for them.
 
 A trusted trigger opens its thread's live window (`[limits].livenessHours`,
 default 24): while it is open — and the subject remains open — replies from any
 participant continue the work as *continuation turns*, which never reach
-`merge`, `forcePush`, or `deleteBranches` even where policy grants them.
+`merge`, `forcePush`, or `deleteBranches` even where policy grants them, and
+never submit `APPROVE` or `REQUEST_CHANGES` on a review. Neither verdict is
+available on a pull request the daemon account opened either, whatever the turn.
 Commits always carry the daemon account's identity: agent-supplied
 `author`/`committer` fields are stripped, and every git subprocess invocation
 is audited beside the broker calls, so the credential has no unaudited use.

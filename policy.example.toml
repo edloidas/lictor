@@ -3,8 +3,8 @@ execution = "automatic"
 clone = "allowed"
 
 # Investigate, reply, and ship code changes as branches and pull requests.
-# `issues`, `merge`, `forcePush`, and `deleteBranches` stay denied until a
-# later phase earns them.
+# `issues`, `review`, `merge`, `forcePush`, and `deleteBranches` stay denied
+# until a later phase earns them.
 [defaults.capabilities]
 read = true
 comment = true

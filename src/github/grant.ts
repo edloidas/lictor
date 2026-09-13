@@ -9,15 +9,22 @@ export type BrokerTool =
   | 'create_comment'
   | 'create_commit'
   | 'create_issue'
+  | 'create_review'
   | 'create_tree'
   | 'create_pull_request'
+  | 'delete_pending_review'
   | 'get_issue'
   | 'get_pull_request'
   | 'get_repository'
   | 'list_comments'
+  | 'list_reviews'
   | 'list_review_threads'
   | 'list_review_comments'
   | 'merge_pull_request'
+  | 'reply_review_comment'
+  | 'resolve_review_thread'
+  | 'submit_review'
+  | 'unresolve_review_thread'
   | 'update_branch'
   | 'update_issue';
 
@@ -27,13 +34,21 @@ export type BrokerTool =
  * deletes a branch). Widening it lets a comparison against either compile, and
  * it can only ever be false.
  */
-export type ToolCapability = 'read' | 'comment' | 'issues' | 'branches' | 'pullRequests' | 'merge';
+export type ToolCapability =
+  | 'read'
+  | 'comment'
+  | 'issues'
+  | 'branches'
+  | 'pullRequests'
+  | 'review'
+  | 'merge';
 
 export const toolCapabilities: Readonly<Record<BrokerTool, ToolCapability>> = {
   get_issue: 'read',
   get_pull_request: 'read',
   get_repository: 'read',
   list_comments: 'read',
+  list_reviews: 'read',
   list_review_threads: 'read',
   list_review_comments: 'read',
   create_comment: 'comment',
@@ -44,6 +59,12 @@ export const toolCapabilities: Readonly<Record<BrokerTool, ToolCapability>> = {
   create_commit: 'branches',
   create_tree: 'branches',
   create_pull_request: 'pullRequests',
+  create_review: 'review',
+  submit_review: 'review',
+  delete_pending_review: 'review',
+  reply_review_comment: 'review',
+  resolve_review_thread: 'review',
+  unresolve_review_thread: 'review',
   merge_pull_request: 'merge',
   update_branch: 'branches',
 };
@@ -58,6 +79,7 @@ export type GrantCapabilities = {
   readonly issues: boolean;
   readonly branches: boolean;
   readonly pullRequests: boolean;
+  readonly review: boolean;
   readonly merge: boolean;
   readonly forcePush: boolean;
   readonly deleteBranches: boolean;
@@ -96,12 +118,22 @@ const GrantCapabilitiesSchema = Schema.Struct({
   issues: Schema.Boolean,
   branches: Schema.Boolean,
   pullRequests: Schema.Boolean,
+  // ! Defaulted, never required: a grant minted before this field existed would
+  // ! otherwise make the whole stored row unreadable, which the worker refuses
+  // ! the job over rather than heals. Absent is what that mint authorized.
+  review: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   merge: Schema.Boolean,
   forcePush: Schema.Boolean,
   deleteBranches: Schema.Boolean,
 });
 
-export const GrantSchema: Schema.Schema<Grant> = Schema.Struct({
+type StoredGrant = Omit<Grant, 'capabilities'> & {
+  readonly capabilities: Omit<GrantCapabilities, 'review'> & {
+    readonly review?: boolean | undefined;
+  };
+};
+
+export const GrantSchema: Schema.Schema<Grant, StoredGrant> = Schema.Struct({
   version: Schema.Literal(1),
   repository: Schema.String,
   interactionId: Schema.String,
@@ -120,6 +152,7 @@ const capabilityKeys = [
   'issues',
   'branches',
   'pullRequests',
+  'review',
   'merge',
   'forcePush',
   'deleteBranches',
@@ -161,6 +194,7 @@ export const grantCapabilities = (capabilities: Capabilities): GrantCapabilities
   issues: capabilities.issues === true,
   branches: capabilities.branches === true,
   pullRequests: capabilities.pullRequests === true,
+  review: capabilities.review === true,
   merge: capabilities.merge === true,
   forcePush: capabilities.forcePush === true,
   deleteBranches: capabilities.deleteBranches === true,
@@ -204,6 +238,7 @@ export const intersectCapabilities = (
   issues: stored.issues && live.issues,
   branches: stored.branches && live.branches,
   pullRequests: stored.pullRequests && live.pullRequests,
+  review: stored.review && live.review,
   merge: stored.merge && live.merge,
   forcePush: stored.forcePush && live.forcePush,
   deleteBranches: stored.deleteBranches && live.deleteBranches,
@@ -253,17 +288,22 @@ export const grantedTools = (
   });
 
 /**
- * The granted tools as the prompt names them. The force gate is on an argument,
- * not the tool, so a bare `update_branch` under a policy that grants `branches`
- * and denies `forcePush` — the shipped default — would advertise a call that
- * answers `CAPABILITY_DENIED`. A continuation is never allowed force at all.
+ * The granted tools as the prompt names them. Force and a review verdict are
+ * gated on an argument rather than the tool, so a bare name would advertise a
+ * call that answers `CAPABILITY_DENIED` — `update_branch` under the shipped
+ * default, which grants `branches` and denies `forcePush`, and a review on a
+ * continuation. A continuation is allowed neither.
  */
 export const describeGrantedTools = (
   capabilities: GrantCapabilities,
   narrowed: boolean,
 ): readonly string[] =>
-  grantedTools(capabilities, narrowed).map((tool) =>
-    tool === 'update_branch' && (!capabilities.forcePush || narrowed)
-      ? `${tool} (never with force)`
-      : tool,
-  );
+  grantedTools(capabilities, narrowed).map((tool) => {
+    if (tool === 'update_branch' && (!capabilities.forcePush || narrowed)) {
+      return `${tool} (never with force)`;
+    }
+    if (narrowed && (tool === 'create_review' || tool === 'submit_review')) {
+      return `${tool} (never APPROVE or REQUEST_CHANGES)`;
+    }
+    return tool;
+  });
