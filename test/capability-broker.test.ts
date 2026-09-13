@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'bun:test';
-import { HttpClient, HttpClientRequest, HttpClientResponse } from '@effect/platform';
-import { Effect, Layer, Redacted, Ref } from 'effect';
+import {
+  HttpClient,
+  HttpClientError,
+  HttpClientRequest,
+  HttpClientResponse,
+} from '@effect/platform';
+import { Effect, Exit, Layer, Redacted, Ref } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { CapabilityBroker } from '../src/github/capability-broker.ts';
 import { GitHubClient } from '../src/github/client.ts';
@@ -69,19 +74,28 @@ const ConfigLive = Layer.succeed(
   }),
 );
 
+/** Statuses `Response` refuses a body on, and so must the stub — or the broker's own 204 guard is never reached. */
+const nullBodyStatus = new Set([204, 205, 304]);
+
 const readBody = (request: { readonly body: unknown }): string => {
   const body = request.body as { readonly body?: unknown };
   return body.body instanceof Uint8Array ? new TextDecoder().decode(body.body) : '';
 };
 
+type Reply = {
+  readonly status?: number;
+  readonly headers?: Record<string, string>;
+  readonly body?: unknown;
+  /** Answer nothing at all, the way an unreachable GitHub does. */
+  readonly transportFails?: boolean;
+};
+
 const run = <A, E>(
   effect: Effect.Effect<A, E, CapabilityBroker | WorkQueue>,
   source: string,
-  reply: {
-    readonly status?: number;
-    readonly headers?: Record<string, string>;
-    readonly body?: unknown;
-  } = {},
+  // A flow that makes two requests — a probe and the write it gates — must be
+  // able to answer them differently, or neither answer proves which was read.
+  reply: Reply | ((body: string) => Reply) = {},
 ) =>
   Effect.runPromise(
     Effect.scoped(
@@ -89,21 +103,34 @@ const run = <A, E>(
         const requests = yield* Ref.make<string[]>([]);
         const methods = yield* Ref.make<string[]>([]);
         const bodies = yield* Ref.make<string[]>([]);
-        const client = HttpClient.make((request) =>
-          Ref.update(requests, (items) => [...items, request.url]).pipe(
+        const client = HttpClient.make((request) => {
+          const sent = readBody(request);
+          const answer = typeof reply === 'function' ? reply(sent) : reply;
+          return Ref.update(requests, (items) => [...items, request.url]).pipe(
             Effect.zipRight(Ref.update(methods, (items) => [...items, request.method])),
-            Effect.zipRight(Ref.update(bodies, (items) => [...items, readBody(request)])),
-            Effect.as(
-              HttpClientResponse.fromWeb(
-                request,
-                new Response(JSON.stringify(reply.body ?? { ok: true, token: undefined }), {
-                  status: reply.status ?? 200,
-                  headers: { 'content-type': 'application/json', ...reply.headers },
-                }),
-              ),
+            Effect.zipRight(Ref.update(bodies, (items) => [...items, sent])),
+            Effect.zipRight(
+              answer.transportFails === true
+                ? Effect.fail(
+                    new HttpClientError.RequestError({ request, reason: 'Transport', cause: 'no' }),
+                  )
+                : Effect.succeed(
+                    HttpClientResponse.fromWeb(
+                      request,
+                      new Response(
+                        nullBodyStatus.has(answer.status ?? 200)
+                          ? null
+                          : JSON.stringify(answer.body ?? { ok: true, token: undefined }),
+                        {
+                          status: answer.status ?? 200,
+                          headers: { 'content-type': 'application/json', ...answer.headers },
+                        },
+                      ),
+                    ),
+                  ),
             ),
-          ),
-        );
+          );
+        });
         const scopedClient = client.pipe(
           HttpClient.mapRequest(HttpClientRequest.prependUrl('https://api.github.test')),
         );
@@ -207,6 +234,7 @@ describe('CapabilityBroker', () => {
       issues: false,
       branches: false,
       pullRequests: false,
+      review: false,
       merge: false,
       forcePush: false,
       deleteBranches: false,
@@ -323,7 +351,7 @@ describe('CapabilityBroker', () => {
           throw new Error('tools/list failed');
         return response.result.tools as readonly AdvertisedTool[];
       }),
-      '[defaults.capabilities]\nread = true\ncomment = true\nissues = true\nbranches = true\npullRequests = true\nmerge = true',
+      '[defaults.capabilities]\nread = true\ncomment = true\nissues = true\nbranches = true\npullRequests = true\nreview = true\nmerge = true',
     );
     return result.value;
   };
@@ -339,6 +367,7 @@ describe('CapabilityBroker', () => {
       'get_pull_request',
       'get_repository',
       'list_comments',
+      'list_reviews',
       'list_review_threads',
       'list_review_comments',
     ];
@@ -355,6 +384,12 @@ describe('CapabilityBroker', () => {
         'create_commit',
         'create_tree',
         'create_pull_request',
+        'create_review',
+        'submit_review',
+        'delete_pending_review',
+        'reply_review_comment',
+        'resolve_review_thread',
+        'unresolve_review_thread',
         'merge_pull_request',
         'update_branch',
       ].sort(),
@@ -384,6 +419,14 @@ describe('CapabilityBroker', () => {
     expect(required.create_commit).toEqual(['message', 'parents', 'tree']);
     expect(required.create_pull_request).toEqual(['base', 'head', 'title']);
     expect(required.merge_pull_request).toEqual(['number']);
+    // No `event` — omitting it is what leaves the review pending.
+    expect(required.create_review).toEqual(['number']);
+    expect(required.submit_review).toEqual(['event', 'number', 'review_id']);
+    expect(required.delete_pending_review).toEqual(['number', 'review_id']);
+    expect(required.reply_review_comment).toEqual(['body', 'comment_id', 'number']);
+    // No `number` — a thread node id addresses the thread on its own.
+    expect(required.resolve_review_thread).toEqual(['thread_id']);
+    expect(required.unresolve_review_thread).toEqual(['thread_id']);
   });
 
   it('describes every property it makes required', async () => {
@@ -453,18 +496,18 @@ describe('CapabilityBroker', () => {
     expect(update.test('refs/heads/issue-118')).toBe(false);
   });
 
-  it('advertises the page parameter only on the two routes that read it', async () => {
+  it('advertises the page parameter only on the routes that read it', async () => {
     const tools = await advertisedTools();
     const paged = tools
       .filter((tool) => 'page' in tool.inputSchema.properties)
       .map((tool) => tool.name)
       .sort();
-    expect(paged).toEqual(['list_comments', 'list_review_comments']);
+    expect(paged).toEqual(['list_comments', 'list_review_comments', 'list_reviews']);
   });
 
   it('gives every tool an input shape and a description of its own', async () => {
     const tools = await advertisedTools();
-    expect(tools).toHaveLength(16);
+    expect(tools).toHaveLength(23);
     // The guard reads `input.repository` by that name and skips silently when it
     // is absent, so a renamed key turns a refusal into an unaudited redirect.
     for (const tool of tools)
@@ -673,6 +716,321 @@ describe('CapabilityBroker', () => {
     );
     expect(String(result.value.exit)).toContain('CAPABILITY_DENIED');
     expect(result.requests).toHaveLength(0);
+  });
+
+  /** Claims a job under a policy granting `review`, then makes one call. */
+  const reviewCall = (
+    name:
+      | 'create_review'
+      | 'submit_review'
+      | 'delete_pending_review'
+      | 'reply_review_comment'
+      | 'resolve_review_thread'
+      | 'unresolve_review_thread'
+      | 'list_reviews'
+      | 'list_review_threads',
+    input: Readonly<Record<string, unknown>>,
+    options: {
+      readonly continuation?: boolean;
+      readonly reply?: Parameters<typeof run>[2];
+    } = {},
+  ) =>
+    run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(
+          options.continuation === true ? { ...work, continuation: true } : work,
+        );
+        const claimed = yield* queue.claim;
+        const exit = yield* Effect.exit(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name,
+            input,
+          }),
+        );
+        return { exit, audit: yield* queue.auditLog(enqueued.jobId) };
+      }),
+      '[defaults.capabilities]\nread = true\nreview = true',
+      options.reply ?? {},
+    );
+
+  it('routes each review write to the endpoint that performs it', async () => {
+    const created = await reviewCall('create_review', { number: 13, body: 'looks fine' });
+    expect(created.methods).toEqual(['POST']);
+    expect(created.requests[0]).toContain('/repos/edloidas/lictor/pulls/13/reviews');
+
+    const submitted = await reviewCall('submit_review', {
+      number: 13,
+      review_id: 99,
+      event: 'COMMENT',
+    });
+    expect(submitted.methods).toEqual(['POST']);
+    expect(submitted.requests[0]).toContain('/repos/edloidas/lictor/pulls/13/reviews/99/events');
+
+    const replied = await reviewCall('reply_review_comment', {
+      number: 13,
+      comment_id: 42,
+      body: 'done',
+    });
+    expect(replied.methods).toEqual(['POST']);
+    expect(replied.requests[0]).toContain('/repos/edloidas/lictor/pulls/13/comments/42/replies');
+
+    const listed = await reviewCall('list_reviews', { number: 13 });
+    expect(listed.methods).toEqual(['GET']);
+    expect(listed.requests[0]).toContain(
+      '/repos/edloidas/lictor/pulls/13/reviews?per_page=3&page=1',
+    );
+  });
+
+  // GitHub answers 422 to a DELETE carrying JSON, so this body must stay empty.
+  it('discards a pending review with a bodiless DELETE', async () => {
+    const result = await reviewCall('delete_pending_review', { number: 13, review_id: 99 });
+
+    expect(result.methods).toEqual(['DELETE']);
+    expect(result.requests[0]).toContain('/repos/edloidas/lictor/pulls/13/reviews/99');
+    expect(result.bodies[0]).toBe('');
+    expect(result.value.audit.at(-1)).toMatchObject({
+      capability: 'delete_pending_review',
+      outcome: 'ok',
+    });
+  });
+
+  it('reads a bodiless 204 as a result rather than a malformed body', async () => {
+    const result = await reviewCall(
+      'delete_pending_review',
+      { number: 13, review_id: 99 },
+      { reply: { status: 204 } },
+    );
+
+    expect(result.value.exit).toStrictEqual(Exit.succeed({}));
+    expect(result.value.audit.at(-1)).toMatchObject({ outcome: 'ok' });
+  });
+
+  it('asks the thread query for the ids and flags a decision needs', async () => {
+    const result = await reviewCall('list_review_threads', { number: 13 });
+
+    for (const field of [
+      'databaseId',
+      'originalLine',
+      'viewerCanUpdate',
+      'isOutdated',
+      'subjectType',
+      'diffSide',
+      'authorAssociation',
+      'viewerDidAuthor',
+      'diffHunk',
+      '__typename',
+    ]) {
+      expect(result.bodies[0]).toContain(field);
+    }
+  });
+
+  /**
+   * Answers the ownership probe with `owner` and everything else with `mutation`,
+   * told apart by the query each carries so neither can stand in for the other.
+   */
+  const ownedBy =
+    (owner: string | undefined, mutation: Reply = {}) =>
+    (sent: string) =>
+      sent.includes('PullRequestReviewThread')
+        ? {
+            body: {
+              data: {
+                node:
+                  owner === undefined
+                    ? null
+                    : { pullRequest: { repository: { nameWithOwner: owner } } },
+              },
+            },
+          }
+        : mutation;
+
+  it('resolves and unresolves a thread by node id through GraphQL', async () => {
+    const resolved = await reviewCall(
+      'resolve_review_thread',
+      { thread_id: 'PRRT_node' },
+      { reply: ownedBy('edloidas/lictor') },
+    );
+    expect(resolved.requests[1]).toContain('/graphql');
+    expect(resolved.bodies[1]).toContain('resolveReviewThread');
+    expect(resolved.bodies[1]).toContain('PRRT_node');
+
+    const reopened = await reviewCall(
+      'unresolve_review_thread',
+      { thread_id: 'PRRT_node' },
+      { reply: ownedBy('edloidas/lictor') },
+    );
+    expect(reopened.bodies[1]).toContain('unresolveReviewThread');
+  });
+
+  it('refuses a thread belonging to another repository', async () => {
+    for (const owner of ['other/repository', undefined]) {
+      const result = await reviewCall(
+        'resolve_review_thread',
+        { thread_id: 'PRRT_elsewhere' },
+        { reply: ownedBy(owner) },
+      );
+
+      expect(String(result.value.exit)).toContain('CAPABILITY_REPOSITORY_DENIED');
+      // The probe went out; the mutation did not.
+      expect(result.bodies).toHaveLength(1);
+      expect(result.bodies[0]).toContain('PullRequestReviewThread');
+    }
+  });
+
+  // Only an owner GitHub named and that differs is a denial.
+  it('reports a failed ownership probe as the failure it was', async () => {
+    const refused = await reviewCall(
+      'resolve_review_thread',
+      { thread_id: 'PRRT_node' },
+      { reply: { status: 401 } },
+    );
+    expect(String(refused.value.exit)).toContain('CAPABILITY_CREDENTIAL_REJECTED');
+
+    const throttled = await reviewCall(
+      'resolve_review_thread',
+      { thread_id: 'PRRT_node' },
+      { reply: { status: 429, headers: { 'retry-after': '30' } } },
+    );
+    expect(String(throttled.value.exit)).toContain('CAPABILITY_RATE_LIMITED');
+    expect(String(throttled.value.exit)).toContain('30');
+
+    const unreachable = await reviewCall(
+      'resolve_review_thread',
+      { thread_id: 'PRRT_node' },
+      { reply: { transportFails: true } },
+    );
+    expect(String(unreachable.value.exit)).not.toContain('CAPABILITY_REPOSITORY_DENIED');
+
+    // None of the three reached the mutation.
+    for (const result of [refused, throttled, unreachable]) expect(result.bodies).toHaveLength(1);
+  });
+
+  it('refuses a thread id that names nothing', async () => {
+    const result = await reviewCall('resolve_review_thread', { thread_id: '' });
+
+    expect(String(result.value.exit)).toContain('CAPABILITY_INPUT_INVALID');
+    expect(result.requests).toHaveLength(0);
+  });
+
+  // Passing that through would audit `ok` for a thread that is still open.
+  it('fails a GraphQL mutation GitHub answered 200 and refused', async () => {
+    const result = await reviewCall(
+      'resolve_review_thread',
+      { thread_id: 'PRRT_node' },
+      {
+        reply: ownedBy('edloidas/lictor', {
+          body: {
+            data: { resolveReviewThread: null },
+            errors: [{ message: 'Resource not accessible' }],
+          },
+        }),
+      },
+    );
+
+    expect(String(result.value.exit)).toContain('CAPABILITY_GITHUB_FAILED');
+    expect(result.value.audit.at(-1)).toMatchObject({ outcome: 'CAPABILITY_GITHUB_FAILED' });
+  });
+
+  // The read keeps its behaviour: a partial GraphQL read still carries data.
+  it('leaves a thread listing carrying errors as a result', async () => {
+    const result = await reviewCall(
+      'list_review_threads',
+      { number: 13 },
+      { reply: { body: { data: { repository: null }, errors: [{ message: 'nope' }] } } },
+    );
+
+    expect(String(result.value.exit)).not.toContain('CAPABILITY');
+  });
+
+  it('withholds a verdict from a continuation while leaving COMMENT', async () => {
+    const approved = await reviewCall(
+      'create_review',
+      { number: 13, event: 'APPROVE' },
+      { continuation: true },
+    );
+    expect(String(approved.value.exit)).toContain('CAPABILITY_DENIED');
+    expect(approved.requests).toHaveLength(0);
+
+    const commented = await reviewCall(
+      'create_review',
+      { number: 13, event: 'COMMENT' },
+      { continuation: true },
+    );
+    expect(commented.methods).toEqual(['POST']);
+  });
+
+  it('withholds a verdict on a pull request this account opened', async () => {
+    const result = await reviewCall(
+      'submit_review',
+      { number: 13, review_id: 99, event: 'REQUEST_CHANGES' },
+      { reply: { body: { user: { login: 'Adiutriel' } } } },
+    );
+
+    expect(String(result.value.exit)).toContain('CAPABILITY_DENIED');
+    // The author probe ran; the review never did.
+    expect(result.methods).toEqual(['GET']);
+  });
+
+  it('lets a verdict through on a pull request someone else opened', async () => {
+    const result = await reviewCall(
+      'create_review',
+      { number: 13, event: 'APPROVE' },
+      { reply: { body: { user: { login: 'edloidas' } } } },
+    );
+
+    expect(result.methods).toEqual(['GET', 'POST']);
+    expect(result.value.audit.at(-1)).toMatchObject({ capability: 'create_review', outcome: 'ok' });
+  });
+
+  it('proceeds with a verdict when the author probe never answers', async () => {
+    const result = await reviewCall(
+      'create_review',
+      { number: 13, event: 'APPROVE' },
+      { reply: { transportFails: true } },
+    );
+
+    expect(result.methods).toEqual(['GET', 'POST']);
+  });
+
+  it('reads no author out of a failed probe response', async () => {
+    const result = await reviewCall(
+      'create_review',
+      { number: 13, event: 'APPROVE' },
+      { reply: { status: 500, body: { user: { login: 'adiutriel' } } } },
+    );
+
+    expect(result.methods).toEqual(['GET', 'POST']);
+    expect(String(result.value.exit)).not.toContain('CAPABILITY_DENIED');
+  });
+
+  it('hides the review tools where policy withholds the capability', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        yield* queue.claim;
+        const response = yield* broker.handleMcp(enqueued.jobId, work, {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/list',
+        });
+        if (!('result' in response) || !('tools' in response.result))
+          throw new Error('tools/list failed');
+        return response.result.tools.map((tool: { readonly name: string }) => tool.name);
+      }),
+      '[defaults.capabilities]\nread = true\npullRequests = true',
+    );
+
+    expect(result.value).toContain('list_reviews');
+    expect(result.value).toContain('create_pull_request');
+    expect(result.value).not.toContain('create_review');
+    expect(result.value).not.toContain('resolve_review_thread');
   });
 
   it('rejects attempts to address another repository', async () => {

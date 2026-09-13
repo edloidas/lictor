@@ -2123,6 +2123,7 @@ describe('WorkQueue', () => {
       issues: false,
       branches: false,
       pullRequests: false,
+      review: false,
       merge: false,
       forcePush: false,
       deleteBranches: false,

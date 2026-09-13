@@ -20,6 +20,7 @@ const capabilities = (overrides: Partial<Capabilities> = {}): Capabilities => ({
   issues: false,
   branches: false,
   pullRequests: false,
+  review: false,
   merge: false,
   forcePush: false,
   deleteBranches: false,
@@ -59,6 +60,7 @@ const everything = capabilities({
   issues: true,
   branches: true,
   pullRequests: true,
+  review: true,
   merge: true,
   forcePush: true,
   deleteBranches: true,
@@ -86,6 +88,7 @@ describe('grantCapabilities', () => {
       issues: false,
       branches: false,
       pullRequests: false,
+      review: false,
       merge: false,
       forcePush: false,
       deleteBranches: false,
@@ -105,6 +108,17 @@ describe('mintGrant', () => {
     expect(grant.maxAttempts).toBe(3);
     expect(grant.mintedAt).toBe(1_700_000_000_000);
     expect(Schema.is(GrantSchema)(grant)).toBe(true);
+  });
+
+  it('reads a stored grant predating a capability as withholding it', () => {
+    const stored = mintGrant(policy({ capabilities: everything }), work, 0);
+    const { review: _review, ...older } = stored.capabilities;
+
+    const decoded = Schema.decodeUnknownSync(GrantSchema)({ ...stored, capabilities: older });
+
+    expect(decoded.capabilities.review).toBe(false);
+    expect(decoded.capabilities.merge).toBe(true);
+    expect(grantedTools(decoded.capabilities, false)).not.toContain('create_review');
   });
 
   // Only `approve` writes the literal `false`; an automatic repository leaves the
@@ -192,6 +206,7 @@ describe('grantNarrowing', () => {
       'issues',
       'branches',
       'pullRequests',
+      'review',
       'merge',
       'forcePush',
       'deleteBranches',
@@ -274,5 +289,23 @@ describe('describeGrantedTools', () => {
 
     expect(described).toContain('update_branch (never with force)');
     expect(described).not.toContain('update_branch');
+  });
+
+  it('qualifies the review tools a continuation may not submit a verdict through', () => {
+    const described = describeGrantedTools(grantCapabilities(everything), true);
+
+    expect(described).toContain('create_review (never APPROVE or REQUEST_CHANGES)');
+    expect(described).toContain('submit_review (never APPROVE or REQUEST_CHANGES)');
+    expect(described).not.toContain('create_review');
+    // Nothing else under `review` narrows, so those stay bare.
+    expect(described).toContain('resolve_review_thread');
+    expect(described).toContain('reply_review_comment');
+  });
+
+  it('leaves them unqualified on an ordinary turn', () => {
+    const described = describeGrantedTools(grantCapabilities(everything), false);
+
+    expect(described).toContain('create_review');
+    expect(described).not.toContain('create_review (never APPROVE or REQUEST_CHANGES)');
   });
 });

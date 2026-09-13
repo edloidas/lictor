@@ -1,3 +1,4 @@
+import type { HttpClient, HttpClientResponse } from '@effect/platform';
 import { HttpClientRequest } from '@effect/platform';
 import { Clock, Data, Effect } from 'effect';
 import { bounded } from '../bounded.ts';
@@ -41,6 +42,21 @@ const repositoryProperty = {
   description:
     'Optional `owner/name`. It must match the repository the job was created for; any other value is denied.',
 } as const;
+const reviewId = {
+  type: 'integer',
+  minimum: 1,
+  description: 'Review id, from `list_reviews`.',
+} as const;
+const reviewEvent = {
+  type: 'string',
+  enum: ['APPROVE', 'REQUEST_CHANGES', 'COMMENT'],
+  description:
+    'Verdict to submit. `APPROVE` and `REQUEST_CHANGES` are denied on a pull request this account opened, and on a turn that continues earlier work; `COMMENT` always stands.',
+} as const;
+const threadId = {
+  type: 'string',
+  description: 'Thread node id — the `id` of a thread from `list_review_threads`.',
+} as const;
 
 /**
  * The whole input object becomes the request body, so a property this table
@@ -82,7 +98,7 @@ const toolSchemas: Readonly<
   },
   list_review_threads: {
     description:
-      'List review threads on a pull request with their comments and resolution state, ten per page.',
+      'List review threads on a pull request, ten per page: per thread its node id, resolution, whether it is outdated and where it points; per comment its node id, its `databaseId` — which is what `reply_review_comment` takes — its author and the diff hunk it hangs on. The pull request carries its own author and `viewerCanUpdate`, which says whether resolving is permitted here at all.',
     properties: {
       number: pullNumber,
       after: {
@@ -91,6 +107,12 @@ const toolSchemas: Readonly<
           'Cursor from the previous page, `pageInfo.endCursor`. Omit for the first page.',
       },
     },
+    required: ['number'],
+  },
+  list_reviews: {
+    description:
+      "List reviews on a pull request, three per page: id, state — `PENDING`, `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED` or `DISMISSED` — body, author and the commit reviewed. Read it before reviewing or replying: this account's own `PENDING` review holds a reply invisible until it is submitted, and a review an earlier attempt created is found here rather than posted a second time.",
+    properties: { number: pullNumber, page: pageNumber },
     required: ['number'],
   },
   list_review_comments: {
@@ -240,6 +262,90 @@ const toolSchemas: Readonly<
     },
     required: ['title', 'head', 'base'],
   },
+  create_review: {
+    description:
+      'Open one review on a pull request, optionally with comments anchored to lines of the diff. Omitting `event` leaves the review `PENDING`, which is how a review is held for a person to finish; giving one submits it outright. Not idempotent: an attempt that landed and then failed leaves a review `list_reviews` shows, and that is where a retry looks instead of posting a second one.',
+    properties: {
+      number: pullNumber,
+      body: { type: 'string', description: 'Review summary, GitHub-flavored markdown.' },
+      event: reviewEvent,
+      comments: {
+        type: 'array',
+        description: 'Comments anchored to lines of the diff.',
+        items: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path, as the diff names it.' },
+            line: {
+              type: 'integer',
+              minimum: 1,
+              description: 'Line the comment ends on, in the file as `side` sees it.',
+            },
+            side: {
+              type: 'string',
+              enum: ['LEFT', 'RIGHT'],
+              description: '`RIGHT` is the head of the diff, `LEFT` the base. Defaults to `RIGHT`.',
+            },
+            start_line: {
+              type: 'integer',
+              minimum: 1,
+              description: 'First line of a multi-line comment.',
+            },
+            start_side: { type: 'string', enum: ['LEFT', 'RIGHT'] },
+            body: { type: 'string', description: 'Comment text, GitHub-flavored markdown.' },
+          },
+          required: ['path', 'body'],
+        },
+      },
+      commit_id: {
+        type: 'string',
+        description: 'Head SHA the review is against. Defaults to the latest commit.',
+      },
+    },
+    required: ['number'],
+  },
+  submit_review: {
+    description: 'Submit a review `create_review` left pending.',
+    properties: {
+      number: pullNumber,
+      review_id: reviewId,
+      event: reviewEvent,
+      body: { type: 'string', description: 'Review summary, GitHub-flavored markdown.' },
+    },
+    required: ['number', 'review_id', 'event'],
+  },
+  delete_pending_review: {
+    description:
+      'Discard a pending review. GitHub allows one per account per pull request and refuses a second, so this is the only way past a pending review an earlier attempt left behind. A submitted review cannot be deleted.',
+    properties: { number: pullNumber, review_id: reviewId },
+    required: ['number', 'review_id'],
+  },
+  reply_review_comment: {
+    description:
+      'Reply inside a review thread, addressed by the `databaseId` of a comment in it — the numeric one, not the node `id`. A reply posted while this account holds a pending review on the pull request is attached to that review and stays invisible until it is submitted, so read `list_reviews` first. To post on the pull request itself rather than in a thread, use `create_comment`.',
+    properties: {
+      number: pullNumber,
+      comment_id: {
+        type: 'integer',
+        minimum: 1,
+        description:
+          'The `databaseId` of the thread’s **first** comment, from `list_review_threads`. GitHub takes only a top-level review comment here; the id of a reply already in the thread is refused.',
+      },
+      body: { type: 'string', description: 'Reply text, GitHub-flavored markdown.' },
+    },
+    required: ['number', 'comment_id', 'body'],
+  },
+  resolve_review_thread: {
+    description:
+      'Mark a review thread resolved. Needs write access on the repository, which `list_review_threads` reports as the pull request’s `viewerCanUpdate`.',
+    properties: { thread_id: threadId },
+    required: ['thread_id'],
+  },
+  unresolve_review_thread: {
+    description: 'Reopen a resolved review thread. Needs the access `resolve_review_thread` does.',
+    properties: { thread_id: threadId },
+    required: ['thread_id'],
+  },
   merge_pull_request: {
     description: 'Merge a pull request.',
     properties: {
@@ -323,6 +429,130 @@ const pinCommitIdentity = (
   return rest;
 };
 
+const REVIEW_THREADS_QUERY =
+  'query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){author{login} viewerCanUpdate reviewThreads(first:10,after:$after){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated path line originalLine diffSide subjectType comments(first:10){pageInfo{hasNextPage endCursor} nodes{id databaseId body author{login __typename} authorAssociation viewerDidAuthor createdAt diffHunk url}}}}}}}';
+
+/** Thread resolution is a GraphQL mutation in both directions; REST has no equivalent. */
+const THREAD_RESOLUTION = {
+  resolve_review_thread:
+    'mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}',
+  unresolve_review_thread:
+    'mutation($threadId:ID!){unresolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}',
+} as const;
+
+const isGraphqlMutation = (tool: BrokerTool): tool is keyof typeof THREAD_RESOLUTION =>
+  tool in THREAD_RESOLUTION;
+
+const reviewThreadId = (input: Readonly<Record<string, unknown>>): string => {
+  const value = input.thread_id;
+  if (typeof value !== 'string' || value === '') {
+    throw new CapabilityError({
+      code: 'CAPABILITY_INPUT_INVALID',
+      message: 'thread_id must name a review thread',
+    });
+  }
+  return value;
+};
+
+const graphqlBody = (
+  repository: string,
+  tool: BrokerTool,
+  input: Readonly<Record<string, unknown>>,
+) => {
+  if (isGraphqlMutation(tool)) {
+    return { query: THREAD_RESOLUTION[tool], variables: { threadId: reviewThreadId(input) } };
+  }
+  if (tool !== 'list_review_threads') return undefined;
+  const [owner, name] = repository.split('/');
+  return {
+    query: REVIEW_THREADS_QUERY,
+    variables: {
+      owner,
+      name,
+      number: number(input, 'number'),
+      after: typeof input.after === 'string' ? input.after : null,
+    },
+  };
+};
+
+/**
+ * GraphQL answers 200 whatever it did, so a mutation it refused is told from one
+ * it performed only by the envelope — and the audit row would otherwise record
+ * an outcome the call never had.
+ */
+const graphqlRefusal = (payload: unknown): string | undefined => {
+  const errors = (payload as { readonly errors?: unknown } | null)?.errors;
+  if (!Array.isArray(errors) || errors.length === 0) return undefined;
+  const message = (errors[0] as { readonly message?: unknown }).message;
+  return typeof message === 'string' ? message : 'the mutation was refused';
+};
+
+const THREAD_OWNER_QUERY =
+  'query($id:ID!){node(id:$id){... on PullRequestReviewThread{pullRequest{repository{nameWithOwner}}}}}';
+
+/**
+ * The repository a review thread belongs to, lowercased, or `undefined` where
+ * GitHub would not say.
+ *
+ * ! A node id is global, so the two thread mutations are the only tools whose
+ * ! target the broker does not pin by building the path — nothing in their input
+ * ! names a repository for the guard to compare. This is why they ask, and why
+ * ! it fails closed: GitHub would resolve a thread in any repository the
+ * ! credential reaches.
+ */
+const reviewThreadRepository = <E, R>(client: HttpClient.HttpClient.With<E, R>, thread: string) =>
+  Effect.gen(function* () {
+    const response = yield* client.execute(
+      HttpClientRequest.bodyUnsafeJson(HttpClientRequest.post('/graphql'), {
+        query: THREAD_OWNER_QUERY,
+        variables: { id: thread },
+      }),
+    );
+    // Handed back unclassified rather than collapsed into "no owner": a revoked
+    // credential answering here would otherwise read as another repository.
+    if (response.status < 200 || response.status >= 300) return { failed: response };
+    const body = (yield* response.json) as {
+      readonly data?: {
+        readonly node?: {
+          readonly pullRequest?: { readonly repository?: { readonly nameWithOwner?: unknown } };
+        } | null;
+      } | null;
+    } | null;
+    const owner = body?.data?.node?.pullRequest?.repository?.nameWithOwner;
+    return { owner: typeof owner === 'string' ? owner.trim().toLowerCase() : undefined };
+  });
+
+/** The verdict a call would publish, or `undefined` — a `COMMENT` publishes none. */
+const reviewVerdict = (
+  tool: BrokerTool,
+  input: Readonly<Record<string, unknown>>,
+): 'APPROVE' | 'REQUEST_CHANGES' | undefined => {
+  if (tool !== 'create_review' && tool !== 'submit_review') return undefined;
+  const event = input.event;
+  return event === 'APPROVE' || event === 'REQUEST_CHANGES' ? event : undefined;
+};
+
+/**
+ * Who opened the pull request, lowercased, or `undefined` where GitHub did not
+ * say. Read only to refuse a self-review with a reason — GitHub refuses one
+ * anyway, so it fails open rather than withhold work over a momentary failure.
+ */
+const pullRequestAuthor = <E, R>(
+  client: HttpClient.HttpClient.With<E, R>,
+  repository: string,
+  pull: unknown,
+) =>
+  Effect.gen(function* () {
+    if (typeof pull !== 'number' || !Number.isInteger(pull) || pull < 1) return undefined;
+    const response = yield* client.execute(
+      HttpClientRequest.get(`/repos/${repository}/pulls/${pull}`),
+    );
+    if (response.status < 200 || response.status >= 300) return undefined;
+    const body = (yield* response.json) as { readonly user?: { readonly login?: unknown } } | null;
+    const login = body?.user?.login;
+    return typeof login === 'string' ? login.trim().toLowerCase() : undefined;
+  }).pipe(Effect.orElseSucceed(() => undefined));
+
 const route = (repository: string, tool: BrokerTool, input: Readonly<Record<string, unknown>>) => {
   const base = `/repos/${repository}`;
   switch (tool) {
@@ -338,7 +568,14 @@ const route = (repository: string, tool: BrokerTool, input: Readonly<Record<stri
         path: `${base}/issues/${number(input, 'number')}/comments?per_page=3&page=${input.page === undefined ? 1 : number(input, 'page')}`,
       } as const;
     case 'list_review_threads':
+    case 'resolve_review_thread':
+    case 'unresolve_review_thread':
       return { method: 'POST', path: '/graphql' } as const;
+    case 'list_reviews':
+      return {
+        method: 'GET',
+        path: `${base}/pulls/${number(input, 'number')}/reviews?per_page=3&page=${input.page === undefined ? 1 : number(input, 'page')}`,
+      } as const;
     case 'list_review_comments':
       return {
         method: 'GET',
@@ -366,6 +603,24 @@ const route = (repository: string, tool: BrokerTool, input: Readonly<Record<stri
       return { method: 'POST', path: `${base}/git/commits` } as const;
     case 'create_pull_request':
       return { method: 'POST', path: `${base}/pulls` } as const;
+    case 'create_review':
+      return { method: 'POST', path: `${base}/pulls/${number(input, 'number')}/reviews` } as const;
+    case 'submit_review':
+      // POST, not the PUT that `/dismissals` and the review body take.
+      return {
+        method: 'POST',
+        path: `${base}/pulls/${number(input, 'number')}/reviews/${number(input, 'review_id')}/events`,
+      } as const;
+    case 'delete_pending_review':
+      return {
+        method: 'DELETE',
+        path: `${base}/pulls/${number(input, 'number')}/reviews/${number(input, 'review_id')}`,
+      } as const;
+    case 'reply_review_comment':
+      return {
+        method: 'POST',
+        path: `${base}/pulls/${number(input, 'number')}/comments/${number(input, 'comment_id')}/replies`,
+      } as const;
     case 'merge_pull_request':
       return { method: 'PUT', path: `${base}/pulls/${number(input, 'number')}/merge` } as const;
   }
@@ -449,6 +704,62 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
       return job.grant === undefined ? live : intersectCapabilities(job.grant.capabilities, live);
     };
 
+    /**
+     * GitHub's non-2xx answer, classified. Every request a call makes routes
+     * here, the ownership probe included: one that swallowed a failure would
+     * report a revoked credential or a closed bucket as its own absent answer.
+     */
+    const githubFailure = (
+      response: HttpClientResponse.HttpClientResponse,
+    ): Effect.Effect<never, CapabilityError> =>
+      Effect.gen(function* () {
+        // An installation token heals by re-minting; a revoked PAT never
+        // does. Collapsing a 401 into a generic failure spends every attempt,
+        // each one a full clone cycle.
+        if (response.status === 401) {
+          yield* health.suspend;
+          return yield* new CapabilityError({
+            code: 'CAPABILITY_CREDENTIAL_REJECTED',
+            message: 'GitHub rejected the daemon credential',
+            ...(quotaNote(response.headers) === undefined
+              ? {}
+              : { cause: quotaNote(response.headers) }),
+          });
+        }
+        // A 429 is definitive alone; 403 needs evidence — headers first,
+        // prose second (a secondary limit answers with neither rate header).
+        // Retrying either against a closed bucket is a retry storm.
+        const hinted =
+          response.status === 403 || response.status === 429
+            ? retryAfterMs(response.headers, yield* Clock.currentTimeMillis)
+            : undefined;
+        const secondary =
+          response.status === 403 &&
+          hinted === undefined &&
+          // No reset time still means exhausted; secondary limits say so only
+          // in prose.
+          (response.headers['x-ratelimit-remaining'] === '0' ||
+            isSecondaryRateLimit(yield* Effect.orElseSucceed(response.text, () => '')));
+        const wait =
+          response.status === 429 || secondary ? (hinted ?? DEFAULT_THROTTLE_WAIT_MS) : hinted;
+        if (wait !== undefined) {
+          return yield* new CapabilityError({
+            code: 'CAPABILITY_RATE_LIMITED',
+            message: `GitHub rate limit reached; retry in ${Math.ceil(wait / 1000)}s${
+              quotaNote(response.headers) === undefined ? '' : `, ${quotaNote(response.headers)}`
+            }`,
+            retryAfterMs: wait,
+          });
+        }
+        return yield* new CapabilityError({
+          code: 'CAPABILITY_GITHUB_FAILED',
+          message: `GitHub returned status ${response.status}`,
+          ...(quotaNote(response.headers) === undefined
+            ? {}
+            : { cause: quotaNote(response.headers) }),
+        });
+      });
+
     const callTool = (request: {
       readonly jobId: number;
       readonly attemptNumber: number;
@@ -524,6 +835,50 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
               message: `${request.name} is denied by repository policy`,
             });
           }
+          const client = yield* github.authenticated;
+          // A verdict is an argument, not a tool, so it is gated per call the
+          // way `update_branch`'s force is.
+          const verdict = reviewVerdict(request.name, request.input);
+          if (verdict !== undefined) {
+            if (narrowed) {
+              return yield* new CapabilityError({
+                code: 'CAPABILITY_DENIED',
+                message: `${verdict} is withheld from a turn that continues earlier work`,
+              });
+            }
+            const author = yield* pullRequestAuthor(
+              client,
+              expectedRepository,
+              request.input.number,
+            );
+            if (author !== undefined && author === (yield* actor)) {
+              return yield* new CapabilityError({
+                code: 'CAPABILITY_DENIED',
+                message: `${verdict} is withheld on a pull request this account opened`,
+              });
+            }
+          }
+          if (isGraphqlMutation(request.name)) {
+            const thread = yield* Effect.try({
+              try: () => reviewThreadId(request.input),
+              catch: (cause) =>
+                cause instanceof CapabilityError
+                  ? cause
+                  : new CapabilityError({
+                      code: 'CAPABILITY_INPUT_INVALID',
+                      message: 'Capability input is invalid',
+                      cause,
+                    }),
+            });
+            const owned = yield* reviewThreadRepository(client, thread);
+            if ('failed' in owned) return yield* githubFailure(owned.failed);
+            if (owned.owner !== expectedRepository) {
+              return yield* new CapabilityError({
+                code: 'CAPABILITY_REPOSITORY_DENIED',
+                message: 'Review thread belongs to another repository',
+              });
+            }
+          }
           const target = yield* Effect.try({
             try: () => route(expectedRepository, request.name, request.input),
             catch: (cause) =>
@@ -535,89 +890,47 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
                     cause,
                   }),
           });
-          const client = yield* github.authenticated;
           let baseRequest = HttpClientRequest.get(target.path);
           if (target.method === 'POST') baseRequest = HttpClientRequest.post(target.path);
           if (target.method === 'PATCH') baseRequest = HttpClientRequest.patch(target.path);
           if (target.method === 'PUT') baseRequest = HttpClientRequest.put(target.path);
-          const body =
-            request.name === 'list_review_threads'
-              ? yield* Effect.try({
-                  try: () => ({
-                    query:
-                      'query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:10,after:$after){pageInfo{hasNextPage endCursor} nodes{isResolved comments(first:10){pageInfo{hasNextPage endCursor} nodes{id body path line author{login} url}}}}}}}',
-                    variables: {
-                      owner: expectedRepository.split('/')[0],
-                      name: expectedRepository.split('/')[1],
-                      number: number(request.input, 'number'),
-                      after: typeof request.input.after === 'string' ? request.input.after : null,
-                    },
+          if (target.method === 'DELETE') baseRequest = HttpClientRequest.del(target.path);
+          const body = yield* Effect.try({
+            try: () =>
+              graphqlBody(expectedRepository, request.name, request.input) ??
+              pinCommitIdentity(request.name, request.input),
+            catch: (cause) =>
+              cause instanceof CapabilityError
+                ? cause
+                : new CapabilityError({
+                    code: 'CAPABILITY_INPUT_INVALID',
+                    message: 'Capability input is invalid',
+                    cause,
                   }),
-                  catch: (cause) =>
-                    cause instanceof CapabilityError
-                      ? cause
-                      : new CapabilityError({
-                          code: 'CAPABILITY_INPUT_INVALID',
-                          message: 'Capability input is invalid',
-                          cause,
-                        }),
-                })
-              : pinCommitIdentity(request.name, request.input);
+          });
           const httpRequest =
-            target.method === 'GET'
+            target.method === 'GET' || target.method === 'DELETE'
               ? baseRequest
               : HttpClientRequest.bodyUnsafeJson(baseRequest, body);
           const response = yield* client.execute(httpRequest);
           if (response.status < 200 || response.status >= 300) {
-            // An installation token heals by re-minting; a revoked PAT never
-            // does. Collapsing a 401 into a generic failure spends every attempt,
-            // each one a full clone cycle.
-            if (response.status === 401) {
-              yield* health.suspend;
-              return yield* new CapabilityError({
-                code: 'CAPABILITY_CREDENTIAL_REJECTED',
-                message: 'GitHub rejected the daemon credential',
-                ...(quotaNote(response.headers) === undefined
-                  ? {}
-                  : { cause: quotaNote(response.headers) }),
-              });
-            }
-            // A 429 is definitive alone; 403 needs evidence — headers first,
-            // prose second (a secondary limit answers with neither rate header).
-            // Retrying either against a closed bucket is a retry storm.
-            const hinted =
-              response.status === 403 || response.status === 429
-                ? retryAfterMs(response.headers, yield* Clock.currentTimeMillis)
-                : undefined;
-            const secondary =
-              response.status === 403 &&
-              hinted === undefined &&
-              // No reset time still means exhausted; secondary limits say so only
-              // in prose.
-              (response.headers['x-ratelimit-remaining'] === '0' ||
-                isSecondaryRateLimit(yield* Effect.orElseSucceed(response.text, () => '')));
-            const wait =
-              response.status === 429 || secondary ? (hinted ?? DEFAULT_THROTTLE_WAIT_MS) : hinted;
-            if (wait !== undefined) {
-              return yield* new CapabilityError({
-                code: 'CAPABILITY_RATE_LIMITED',
-                message: `GitHub rate limit reached; retry in ${Math.ceil(wait / 1000)}s${
-                  quotaNote(response.headers) === undefined
-                    ? ''
-                    : `, ${quotaNote(response.headers)}`
-                }`,
-                retryAfterMs: wait,
-              });
-            }
-            return yield* new CapabilityError({
-              code: 'CAPABILITY_GITHUB_FAILED',
-              message: `GitHub returned status ${response.status}`,
-              ...(quotaNote(response.headers) === undefined
-                ? {}
-                : { cause: quotaNote(response.headers) }),
-            });
+            return yield* githubFailure(response);
           }
-          return boundedJson(yield* response.json);
+          // A delete answers with the record it removed, but 204 is legal on
+          // any of these and `response.json` has nothing to parse.
+          if (response.status === 204) return {};
+          const payload = boundedJson(yield* response.json);
+          if (isGraphqlMutation(request.name)) {
+            const refusal = graphqlRefusal(payload);
+            if (refusal !== undefined) {
+              return yield* new CapabilityError({
+                code: 'CAPABILITY_GITHUB_FAILED',
+                message: 'GitHub refused the GraphQL mutation',
+                cause: refusal,
+              });
+            }
+          }
+          return payload;
         }).pipe(
           Effect.mapError((cause) =>
             cause instanceof CapabilityError
