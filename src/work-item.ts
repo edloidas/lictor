@@ -50,7 +50,10 @@ export type ContextRef =
 export type TriggerRecord = {
   readonly source: ContextRef;
   readonly url: string;
-  /** Bounded body. Empty for an assignment or review request, which have none. */
+  /**
+   * Bounded body. An assignment or review request has no text of its own, so
+   * this holds the subject body instead — the event names the task.
+   */
   readonly text: string;
   /**
    * ! Set when the bound could not hold the request. The worker refuses to run
