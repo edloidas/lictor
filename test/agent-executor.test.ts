@@ -525,6 +525,75 @@ describe('buildPrompt', () => {
     expect(prompt).toContain('Never ask for capability');
     expect(prompt).toContain('no reply widens what this job may do');
   });
+
+  it('asks an assignment on an issue for a pull request that resolves it', () => {
+    const prompt = buildPrompt({ ...work, reasons: ['assigned'] }, grant());
+
+    expect(prompt).toContain('This interaction is an assignment');
+    expect(prompt).toContain('a pull request against the default branch that resolves it');
+    expect(prompt).toContain('verified before it is opened');
+    expect(prompt).toContain('The issue body is the recorded request');
+  });
+
+  // `contextKind` is derived from the notification reason, not the subject, so
+  // an assignment brief can land on a job that is already a pull request.
+  it('does not ask an assignment on a pull request to open another', () => {
+    const prompt = buildPrompt(
+      { ...work, reasons: ['assigned'], subject: { ...work.subject, kind: 'pull_request' } },
+      grant(),
+    );
+
+    expect(prompt).toContain('carried to completion on its own branch');
+    expect(prompt).not.toContain('a pull request against the default branch');
+  });
+
+  // The default is no code, but a request that asked for a fix while reviewing
+  // is still the recorded request — a flat ban would overrule it.
+  it('asks a review request for a verdict at the head, and no code unless asked', () => {
+    const prompt = buildPrompt({ ...work, reasons: ['review_requested'] }, grant());
+
+    expect(prompt).toContain('a review of its current head');
+    expect(prompt).toContain(
+      'does not call for changes to the code unless the recorded request asks for them',
+    );
+  });
+
+  it('keeps a mention on the thread it was posted on', () => {
+    const prompt = buildPrompt(work, grant());
+
+    expect(prompt).toContain('This interaction is a mention');
+    expect(prompt).toContain('answered on the thread it was posted on');
+  });
+
+  // ! A continuation withholds the task, not only what `authority()` withholds
+  // ! — reading a reply as a new brief lets an untrusted comment start work.
+  it('gives a continuation no task of its own', () => {
+    const prompt = buildPrompt(
+      { ...work, reasons: ['mentioned'], continuation: true },
+      grant({ comment: true }),
+    );
+
+    expect(prompt).toContain('this reply adds none of its own');
+    expect(prompt).not.toContain('This interaction is a mention');
+    expect(prompt).not.toContain('This interaction is an assignment');
+  });
+
+  // Qualification emits one reason today and the schema permits several, so
+  // the order is what a second producer would meet rather than dead code.
+  it('takes the triggering event over a mention when a job carries both', () => {
+    const prompt = buildPrompt({ ...work, reasons: ['mentioned', 'assigned'] }, grant());
+
+    expect(prompt).toContain('This interaction is an assignment');
+    expect(prompt).not.toContain('This interaction is a mention');
+  });
+
+  // The daemon decides the task from the trigger it recorded. Leaving the old
+  // clause beside the brief would ask the agent to decide it a second time.
+  it('no longer asks the agent to decide what response is appropriate', () => {
+    const prompt = buildPrompt({ ...work, reasons: ['assigned'] }, grant());
+
+    expect(prompt).not.toContain('decide the appropriate response');
+  });
 });
 
 describe('AgentExecutor', () => {
