@@ -917,13 +917,25 @@ export const qualifyNotification = (input: {
       // fetched even when a mention matched, because an untrusted participant
       // must not mute a trusted assignment with one throwaway mention.
       const reason = input.thread.reason;
+      const closed = subject.state === 'closed';
+      const triggerReason =
+        reason === 'assign' || reason === 'review_requested' ? reason : undefined;
+      // A closed subject can take neither deliverable an assignment or a review
+      // request calls for, and the timeline walk pages to `PAGE_CEILING`, so it
+      // is not read at all. A mention is exempt: a closed thread can still owe
+      // an answer to whatever its own comment asks.
+      if (triggerReason !== undefined && closed) {
+        yield* Effect.logInfo('Trigger skipped: the subject is closed').pipe(
+          Effect.annotateLogs({ repository, subject: ref.number, reason: triggerReason }),
+        );
+      }
       const assignedEvent =
-        reason === 'assign' || reason === 'review_requested'
+        triggerReason !== undefined && !closed
           ? yield* fetchTriggeringEvent(
               client,
               repository,
               ref.number,
-              reason,
+              triggerReason,
               selfLogin,
               trusted,
               since,
@@ -933,7 +945,7 @@ export const qualifyNotification = (input: {
       // While live, any non-self reply continues at continuation strength —
       // trust was gated when the trigger armed liveness. A closed subject ends
       // it regardless of the stored window; opening an issue is not replying.
-      const live = input.live === true && subject.state !== 'closed';
+      const live = input.live === true && !closed;
       const continuationTrigger = live
         ? open.reduce<(typeof usable)[number] | undefined>((best, candidate) => {
             if (candidate.ref.kind === 'body') return best;
