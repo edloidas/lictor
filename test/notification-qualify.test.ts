@@ -37,6 +37,9 @@ const issue = (overrides: Record<string, unknown> = {}) => ({
   user: { login: 'edloidas' },
   created_at: '2026-08-20T08:00:00Z',
   updated_at: '2026-08-20T08:00:00Z',
+  // Spelled out, not omitted: qualification asks whether the state is `closed`,
+  // so an absent one pins the open case against a value the API never sends.
+  state: 'open',
   ...overrides,
 });
 
@@ -1565,6 +1568,111 @@ describe('qualifyNotification', () => {
     const work = qualified(result.exit).work;
     expect(work?.sender).toBe('edloidas');
     expect(work?.reasons).toEqual(['assigned']);
+  });
+
+  it('drops a trusted assignment on a closed issue', async () => {
+    const result = await run(
+      qualifyWith({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'assign' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      [['/issues/7/events', { body: [event()] }], ...issueRoutes(issue({ state: 'closed' }), [])],
+    );
+
+    const value = qualified(result.exit);
+    expect(value.work).toBeUndefined();
+    // A dropped trigger still moves the cursor, or the next delivery on this
+    // thread reads an over-wide window and re-attributes old activity as fresh.
+    expect(value.lastActivityAt).toBe(Date.parse('2026-08-21T10:00:00Z'));
+    // The timeline walk pages to `PAGE_CEILING`; a closed subject must not pay
+    // for a result the gate discards.
+    expect(result.requests.some((url) => url.includes('/events'))).toBe(false);
+  });
+
+  // A merged pull request reports `closed` like any other.
+  it('drops a trusted review request on a closed pull request', async () => {
+    const result = await run(
+      qualifyWith({
+        deliveryId: 'delivery',
+        thread: thread({
+          reason: 'review_requested',
+          subject: {
+            title: 'Fix the thing',
+            url: 'https://api.github.com/repos/edloidas/sandbox/pulls/12',
+            type: 'PullRequest',
+          },
+        }),
+        policy,
+        cursorMs: undefined,
+      }),
+      [
+        [
+          '/issues/12/events',
+          {
+            body: [
+              event({
+                event: 'review_requested',
+                review_requester: { login: 'friend' },
+                requested_reviewer: { login: 'adiutriel' },
+                assignee: null,
+              }),
+            ],
+          },
+        ],
+        ['/issues/12/comments', { body: [] }],
+        ['/pulls/12/comments', { body: [] }],
+        ['/pulls/12/reviews', { body: [] }],
+        [
+          '/issues/12',
+          {
+            body: issue({
+              html_url: 'https://github.com/edloidas/sandbox/pull/12',
+              state: 'closed',
+            }),
+          },
+        ],
+      ],
+    );
+
+    expect(qualified(result.exit).work).toBeUndefined();
+  });
+
+  // The exemption the gate depends on — a closed thread can still owe an answer.
+  it('acts on a trusted mention when the subject is closed', async () => {
+    const result = await run(
+      qualifyWith({
+        deliveryId: 'delivery',
+        thread: thread(),
+        policy,
+        cursorMs: undefined,
+      }),
+      issueRoutes(issue({ state: 'closed' }), [comment()]),
+    );
+
+    const work = qualified(result.exit).work;
+    expect(work?.sender).toBe('edloidas');
+    expect(work?.reasons).toEqual(['mentioned']);
+  });
+
+  it('falls back to the mention when a closed subject drops the assignment', async () => {
+    const result = await run(
+      qualifyWith({
+        deliveryId: 'delivery',
+        thread: thread({ reason: 'assign' }),
+        policy,
+        cursorMs: undefined,
+      }),
+      [
+        ['/issues/7/events', { body: [event()] }],
+        ...issueRoutes(issue({ state: 'closed' }), [comment()]),
+      ],
+    );
+
+    const work = qualified(result.exit).work;
+    expect(work?.reasons).toEqual(['mentioned']);
+    expect(work?.context).toEqual({ kind: 'issue_comment', id: 99 });
   });
 
   // The whole point of liveness: a reply this policy does not trust keeps the
