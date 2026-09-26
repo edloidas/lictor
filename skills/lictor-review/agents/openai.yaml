@@ -1,0 +1,6 @@
+interface:
+  display_name: "Lictor Review"
+  short_description: "End-to-end pull request review for the lictor daemon"
+  default_prompt: "Use $lictor-review to review this pull request end to end and publish one review."
+policy:
+  allow_implicit_invocation: false

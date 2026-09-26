@@ -144,6 +144,11 @@ indistinguishable from a revoked token.
   agent prompt as trusted prose, re-read per job, bounded at 32 KiB, and the only
   place operator text enters the prompt unescaped. A missing file is a supported
   configuration; a dangling symlink or an oversized file is logged, never fatal
+- `skills/` is the daemon's own procedure, installed over `<CODEX_HOME>/skills/<name>`
+  at every start and inlined into the prompt of the jobs it serves — never named for
+  the agent to look up. `HOME` is the workspace, so Codex also lists skills from the
+  checkout's `.agents/skills`, and a pull request can ship one under the same name.
+  Never move it under `.agents/`, where lictor's own sessions and reviews would load it
 - **In tests, provide `Service.DefaultWithoutDependencies`, not
   `Service.Default`.** `Default` bakes in `FetchHttpClient.layer`, which wins over
   any client provided from outside — a suite using `Default` silently calls the
