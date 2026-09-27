@@ -10,6 +10,7 @@ import {
   type GrantNarrowing,
   GrantNarrowingSchema,
   GrantSchema,
+  type OperationClass,
 } from '../github/grant.ts';
 import { processAlive } from '../process-liveness.ts';
 import { type ContextRef, ContextRefSchema, type WorkItem, WorkItemSchema } from '../work-item.ts';
@@ -180,6 +181,38 @@ const UNHELD_JOBS_WHERE = `(
  */
 const COUNTED_JOBS_WHERE = `status IN ('pending', 'retry', 'interrupted', 'running')
                  AND question_id IS NULL AND ${UNHELD_JOBS_WHERE}`;
+
+/**
+ * `sent` is the intent alone. While its attempt runs the request may still be
+ * in flight; after, it is exactly as unknown as `unresolved` — which is what an
+ * answer that settles nothing records, a 5xx or a dropped connection.
+ */
+export type OperationState = 'sent' | 'landed' | 'refused' | 'unresolved';
+
+export type OperationRecord = {
+  readonly id: number;
+  readonly attempt: number;
+  readonly tool: string;
+  readonly operationClass: Exclude<OperationClass, 'read'>;
+  readonly input: string;
+  readonly state: OperationState;
+  readonly receipt?: unknown;
+  readonly error?: string;
+  readonly sentAt: number;
+  readonly settledAt?: number;
+  /** When an operator released the job past it; the claim no longer holds on it. */
+  readonly releasedAt?: number;
+};
+
+/** An unsettled append no operator has released. Goes in a `WHERE` on `jobs`. */
+const UNSETTLED_APPEND_WHERE = `EXISTS (
+                   SELECT 1 FROM operations
+                   WHERE operations.job_id = jobs.id AND operations.class = 'append'
+                     AND operations.state IN ('sent', 'unresolved')
+                     AND operations.released_at IS NULL
+                 )`;
+
+const UNSETTLED_HOLD_REASON = 'held: an earlier attempt left an append whose outcome is unknown';
 
 export type QueuedJob = {
   readonly id: number;
@@ -394,7 +427,8 @@ const migrate = (database: Database) => {
     hasColumn('outbox', 'lease_expires_at') &&
     hasColumn('outbox', 'context') &&
     !hasColumn('outbox', 'comment_url') &&
-    hasTable('agent_processes')
+    hasTable('agent_processes') &&
+    hasTable('operations')
   )
     return;
   if (version.user_version > 18) {
@@ -646,6 +680,23 @@ const migrate = (database: Database) => {
         owner_id TEXT NOT NULL,
         started_at INTEGER NOT NULL
       );
+      -- Additive, so the stamp stays 18: an older daemon ignores the table and
+      -- loses only the hold it drives.
+      CREATE TABLE IF NOT EXISTS operations (
+        id INTEGER PRIMARY KEY,
+        job_id INTEGER NOT NULL,
+        attempt INTEGER NOT NULL,
+        tool TEXT NOT NULL,
+        class TEXT NOT NULL CHECK (class IN ('content', 'state', 'append')),
+        input TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('sent', 'landed', 'refused', 'unresolved')),
+        receipt TEXT,
+        error TEXT,
+        sent_at INTEGER NOT NULL,
+        settled_at INTEGER,
+        released_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS operations_job ON operations(job_id, attempt, id);
       PRAGMA user_version = 18;
     `);
     // Ordered after the CREATE TABLE above, like the `deliveries` and `jobs`
@@ -1537,21 +1588,24 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         });
       });
 
-    const claimFor = (workerId: string) =>
+    /** Without `approvalExpiryMs`, a hold this arms is dated from `ready_at`. */
+    const claimFor = (workerId: string, approvalExpiryMs?: number) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
-        return yield* attempt('claim', () =>
+        const held: number[] = [];
+        const claimed = yield* attempt('claim', () =>
           database
             .transaction(() => {
-              // ! An approval-required job is never claimable on age alone. It
-              // ! used to be, and the claim then walked it into the worker's
-              // ! policy gate, which failed it into a status `job.approve` will
-              // ! not accept — so ageing out an unapproved job destroyed the
-              // ! operator's ability to approve it. Expiry belongs to
-              // ! `maintenance`, which finishes the row without claiming it.
-              const row = database
-                .query(
-                  `SELECT id, payload, status, attempts, retry_base AS retryBase, created_at AS createdAt,
+              for (;;) {
+                // ! An approval-required job is never claimable on age alone. It
+                // ! used to be, and the claim then walked it into the worker's
+                // ! policy gate, which failed it into a status `job.approve` will
+                // ! not accept — so ageing out an unapproved job destroyed the
+                // ! operator's ability to approve it. Expiry belongs to
+                // ! `maintenance`, which finishes the row without claiming it.
+                const row = database
+                  .query(
+                    `SELECT id, payload, status, attempts, retry_base AS retryBase, created_at AS createdAt,
                       ready_at AS readyAt, grant, narrowing
                FROM jobs
                WHERE status IN ('pending', 'retry', 'interrupted') AND available_at <= ?
@@ -1559,60 +1613,90 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                  AND ${UNHELD_JOBS_WHERE}
                ORDER BY available_at, id
                LIMIT 1`,
-                )
-                .get(now) as JobRow | null;
-              if (row === null) return undefined;
+                  )
+                  .get(now) as JobRow | null;
+                if (row === null) return undefined;
 
-              const attemptNumber = row.attempts + 1;
-              if (attemptNumber - (row.retryBase ?? 0) > config.workerMaxAttempts) {
-                insertOutboxFromJobs('failed', 'id = ?', [row.id], now);
-                database
-                  .query(
-                    `UPDATE jobs SET status = 'dead_letter', outcome = 'failed', failed_at = ?,
+                const attemptNumber = row.attempts + 1;
+                if (attemptNumber - (row.retryBase ?? 0) > config.workerMaxAttempts) {
+                  insertOutboxFromJobs('failed', 'id = ?', [row.id], now);
+                  database
+                    .query(
+                      `UPDATE jobs SET status = 'dead_letter', outcome = 'failed', failed_at = ?,
                      updated_at = ?, last_error = 'attempt limit exhausted' WHERE id = ?`,
-                  )
-                  .run(now, now, row.id);
-                return undefined;
-              }
-              let decoded: QueuedJob;
-              try {
-                decoded = decodeJob({ ...row, status: 'running', attempts: attemptNumber });
-              } catch {
-                // A payload that fails the schema may still carry a repository
-                // and a subject number, and that is all a message needs. The
-                // insert's own guards skip the rows where it does not.
-                insertOutboxFromJobs('failed', 'id = ?', [row.id], now);
+                    )
+                    .run(now, now, row.id);
+                  return undefined;
+                }
+                let decoded: QueuedJob;
+                try {
+                  decoded = decodeJob({ ...row, status: 'running', attempts: attemptNumber });
+                } catch {
+                  // A payload that fails the schema may still carry a repository
+                  // and a subject number, and that is all a message needs. The
+                  // insert's own guards skip the rows where it does not.
+                  insertOutboxFromJobs('failed', 'id = ?', [row.id], now);
+                  database
+                    .query(
+                      `UPDATE jobs SET status = 'dead_letter', outcome = 'failed', failed_at = ?,
+                     updated_at = ?, last_error = 'invalid stored payload' WHERE id = ?`,
+                    )
+                    .run(now, now, row.id);
+                  return undefined;
+                }
+                // After the budget check, so an exhausted job dead-letters rather
+                // than waits on an operator for a run it could never have.
+                if (
+                  database
+                    .query(`SELECT 1 FROM jobs WHERE id = ? AND ${UNSETTLED_APPEND_WHERE}`)
+                    .get(row.id) !== null
+                ) {
+                  database
+                    .query(
+                      `UPDATE jobs SET status = 'pending',
+                       payload = json_set(payload, '$.approvalRequired', json('true')),
+                       hold_expires_at = ?, last_error = ?, updated_at = ?
+                     WHERE id = ?`,
+                    )
+                    .run(
+                      approvalExpiryMs === undefined ? null : now + approvalExpiryMs,
+                      UNSETTLED_HOLD_REASON,
+                      now,
+                      row.id,
+                    );
+                  held.push(row.id);
+                  continue;
+                }
                 database
                   .query(
-                    `UPDATE jobs SET status = 'dead_letter', outcome = 'failed', failed_at = ?,
-                     updated_at = ?, last_error = 'invalid stored payload' WHERE id = ?`,
-                  )
-                  .run(now, now, row.id);
-                return undefined;
-              }
-              database
-                .query(
-                  `UPDATE jobs
+                    `UPDATE jobs
                SET status = 'running', attempts = ?, claimed_at = ?, updated_at = ?,
                    worker_id = ?, lease_expires_at = ?
                WHERE id = ?`,
-                )
-                .run(attemptNumber, now, now, workerId, now + WORKER_LEASE_MS, row.id);
-              database
-                .query(
-                  `INSERT INTO attempts (job_id, number, status, started_at)
+                  )
+                  .run(attemptNumber, now, now, workerId, now + WORKER_LEASE_MS, row.id);
+                database
+                  .query(
+                    `INSERT INTO attempts (job_id, number, status, started_at)
                VALUES (?, ?, 'running', ?)`,
-                )
-                .run(row.id, attemptNumber, now);
+                  )
+                  .run(row.id, attemptNumber, now);
 
-              return {
-                ...decoded,
-                workerId,
-                leaseExpiresAt: now + WORKER_LEASE_MS,
-              };
+                return {
+                  ...decoded,
+                  workerId,
+                  leaseExpiresAt: now + WORKER_LEASE_MS,
+                };
+              }
             })
             .immediate(),
         );
+        for (const jobId of held) {
+          yield* Effect.logWarning(
+            'Held queued work on an operation whose outcome is unknown',
+          ).pipe(Effect.annotateLogs({ job: jobId }));
+        }
+        return claimed;
       });
     const claim = claimFor(ownerId);
 
@@ -2135,6 +2219,14 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                (status IN ('failed', 'dead_letter') AND failed_at < ?))`,
           )
           .run(completedBefore, failedBefore);
+        database
+          .query(
+            `DELETE FROM operations WHERE job_id IN
+             (SELECT id FROM jobs WHERE
+               (status = 'completed' AND completed_at < ?) OR
+               (status IN ('failed', 'dead_letter') AND failed_at < ?))`,
+          )
+          .run(completedBefore, failedBefore);
         const completed = database
           .query("DELETE FROM jobs WHERE status = 'completed' AND completed_at < ?")
           .run(completedBefore).changes;
@@ -2344,6 +2436,93 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         return row?.createdAt;
       });
 
+    /** Fails the call when it cannot write: a mutation sent unrecorded is one the ledger never reports. */
+    const recordIntent = (entry: {
+      readonly jobId: number;
+      readonly attemptNumber: number;
+      readonly tool: string;
+      readonly operationClass: Exclude<OperationClass, 'read'>;
+      readonly input: string;
+    }) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        return yield* attempt('record operation intent', () =>
+          Number(
+            database
+              .query(
+                `INSERT INTO operations (job_id, attempt, tool, class, input, state, sent_at)
+                 VALUES (?, ?, ?, ?, ?, 'sent', ?)`,
+              )
+              .run(
+                entry.jobId,
+                entry.attemptNumber,
+                entry.tool,
+                entry.operationClass,
+                entry.input,
+                now,
+              ).lastInsertRowid,
+          ),
+        );
+      });
+
+    const settleOperation = (
+      operationId: number,
+      settlement: {
+        readonly state: Exclude<OperationState, 'sent'>;
+        readonly receipt?: Readonly<Record<string, unknown>>;
+        readonly error?: string;
+      },
+    ) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        yield* attempt('settle operation', () => {
+          database
+            .query(
+              `UPDATE operations SET state = ?, receipt = ?, error = ?, settled_at = ?
+               WHERE id = ? AND state = 'sent'`,
+            )
+            .run(
+              settlement.state,
+              settlement.receipt === undefined ? null : JSON.stringify(settlement.receipt),
+              settlement.error ?? null,
+              now,
+              operationId,
+            );
+        });
+      });
+
+    const readOperations = (where: string, params: readonly (string | number)[]) =>
+      (
+        database
+          .query(
+            `SELECT id, attempt, tool, class AS operationClass, input, state, receipt, error,
+               sent_at AS sentAt, settled_at AS settledAt, released_at AS releasedAt
+             FROM operations WHERE ${where} ORDER BY id`,
+          )
+          .all(...params) as readonly (Omit<OperationRecord, 'receipt'> & {
+          readonly receipt: string | null;
+          readonly error: string | null;
+          readonly settledAt: number | null;
+          readonly releasedAt: number | null;
+        })[]
+      ).map(
+        ({ receipt, error, settledAt, releasedAt, ...row }): OperationRecord => ({
+          ...row,
+          ...(receipt === null ? {} : { receipt: JSON.parse(receipt) as unknown }),
+          ...(error === null ? {} : { error }),
+          ...(settledAt === null ? {} : { settledAt }),
+          ...(releasedAt === null ? {} : { releasedAt }),
+        }),
+      );
+
+    const operationsFor = (jobId: number) =>
+      attempt('list operations', () => readOperations('job_id = ?', [jobId]));
+
+    const priorOperations = (jobId: number, attemptNumber: number) =>
+      attempt('list prior operations', () =>
+        readOperations('job_id = ? AND attempt < ?', [jobId, attemptNumber]),
+      );
+
     const listJobs = (limit = 100) =>
       attempt('list jobs', () => {
         const rows = database
@@ -2423,6 +2602,15 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         } satisfies JobDetails;
       });
 
+    /** An operator has looked, so the claim no longer holds on these rows. */
+    const releaseOperations = (jobId: number, now: number) =>
+      database
+        .query(
+          `UPDATE operations SET released_at = ?
+           WHERE job_id = ? AND released_at IS NULL AND state IN ('sent', 'unresolved')`,
+        )
+        .run(now, jobId);
+
     const mutateJob = (
       id: number,
       action: 'approve' | 'cancel' | 'retry',
@@ -2449,7 +2637,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               // ! decision and records the scope released here, but a ceiling
               // ! already on the row outranks it — and unlike `recordGrant`, a
               // ! lost race must still approve the job.
-              return (
+              const approved =
                 database
                   .query(
                     `UPDATE jobs SET payload = ?, updated_at = ?, ready_at = ?,
@@ -2463,8 +2651,9 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                     now,
                     grant === undefined ? null : JSON.stringify(grant),
                     id,
-                  ).changes === 1
-              );
+                  ).changes === 1;
+              if (approved) releaseOperations(id, now);
+              return approved;
             }
             if (action === 'retry') {
               if (row.status !== 'failed' && row.status !== 'dead_letter') return false;
@@ -2483,7 +2672,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               // ! both read `pending` only — so a held job left in `retry` can
               // ! never run, be approved, or expire.
               const held = (JSON.parse(row.payload) as WorkItem).approvalRequired === true;
-              return (
+              const retried =
                 database
                   .query(
                     `UPDATE jobs SET status = ?, retry_base = attempts, available_at = ?, failed_at = NULL,
@@ -2499,8 +2688,9 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                     now,
                     held && approvalExpiryMs !== undefined ? now + approvalExpiryMs : null,
                     id,
-                  ).changes === 1
-              );
+                  ).changes === 1;
+              if (retried) releaseOperations(id, now);
+              return retried;
             }
             if (!['pending', 'retry', 'interrupted', 'running'].includes(row.status)) return false;
             // The thread saw the eyes reaction and would otherwise never hear
@@ -2640,6 +2830,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       recordAudit,
       auditLog,
       lastCommentAt,
+      recordIntent,
+      settleOperation,
+      operationsFor,
+      priorOperations,
       recordSubjectBranch,
       branchForSubject,
       markLive,

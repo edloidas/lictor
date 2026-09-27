@@ -393,6 +393,82 @@ describe('buildPrompt', () => {
     expect(prompt).not.toContain('may since have been edited or deleted');
   });
 
+  it('tells a re-run what earlier attempts landed and what they left unknown', () => {
+    const prompt = buildPrompt(work, undefined, undefined, undefined, [
+      {
+        id: 1,
+        attempt: 1,
+        tool: 'create_comment',
+        operationClass: 'append',
+        input: '{"number":17,"body":"done"}',
+        state: 'landed',
+        receipt: { id: 5, html_url: 'https://github.com/edloidas/lictor/issues/17#issuecomment-5' },
+        sentAt: 1,
+      },
+      {
+        id: 2,
+        attempt: 1,
+        tool: 'create_pull_request',
+        operationClass: 'append',
+        input: '{"title":"fix"}',
+        state: 'sent',
+        sentAt: 2,
+      },
+    ]);
+
+    expect(prompt).toContain('## Earlier attempts');
+    expect(prompt).toContain('do not make them again');
+    expect(prompt).toContain(
+      '{"attempt":1,"tool":"create_comment","number":17,"state":"landed","receipt":{"id":5,"html_url":"https://github.com/edloidas/lictor/issues/17#issuecomment-5"}}',
+    );
+    // An intent nobody settled reads as what it is to the agent: unknown.
+    expect(prompt).toContain(
+      '{"attempt":1,"tool":"create_pull_request","title":"fix","state":"unresolved"}',
+    );
+    // The agent's own prose from the earlier run is not replayed to it.
+    expect(prompt).not.toContain('"body":"done"');
+  });
+
+  it('keeps appends and says so when it cuts the list of earlier writes', () => {
+    const comment = {
+      id: 1,
+      attempt: 1,
+      tool: 'create_comment',
+      operationClass: 'append',
+      input: '{"number":17}',
+      state: 'landed',
+      sentAt: 1,
+    } as const;
+    const branches = Array.from({ length: 120 }, (_, index) => ({
+      id: index + 2,
+      attempt: 1,
+      tool: 'update_branch',
+      operationClass: 'state' as const,
+      input: '{}',
+      state: 'landed' as const,
+      sentAt: index + 2,
+    }));
+    const blob = {
+      id: 200,
+      attempt: 1,
+      tool: 'create_blob',
+      operationClass: 'content',
+      input: '{}',
+      state: 'landed',
+      sentAt: 200,
+    } as const;
+    const prompt = buildPrompt(work, undefined, undefined, undefined, [comment, ...branches, blob]);
+
+    expect(prompt).toContain('"tool":"create_comment"');
+    expect(prompt).not.toContain('"tool":"create_blob"');
+    expect(prompt.match(/"tool":/g)).toHaveLength(100);
+    expect(prompt).toContain('21 further writes were cut from the list');
+  });
+
+  it('says nothing about earlier attempts on a first run', () => {
+    expect(buildPrompt(work)).not.toContain('## Earlier attempts');
+  });
+
   // The agent reached for Codex's own GitHub connector when the broker showed
   // it no tool for the job, and reported the resulting approval block as a
   // failure. Both halves are named here: one route, and a withheld tool is an
@@ -824,6 +900,47 @@ describe('AgentExecutor', () => {
       attempt: 2,
       timeoutMs: 1000,
     });
+  });
+
+  it("prompts a job's next attempt with what the earlier ones sent", async () => {
+    const databasePath = tempStatePath();
+    const jobId = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const { jobId } = yield* queue.enqueue(work);
+          yield* queue.claim;
+          const sent = yield* queue.recordIntent({
+            jobId,
+            attemptNumber: 1,
+            tool: 'create_comment',
+            operationClass: 'append',
+            input: '{"number":17}',
+          });
+          yield* queue.settleOperation(sent, { state: 'landed', receipt: { id: 5 } });
+          return jobId;
+        }),
+      ).pipe(
+        Effect.provide(WorkQueue.DefaultWithoutDependencies),
+        Effect.provideService(LictorConfig, config('codex', databasePath)),
+      ),
+    );
+    let observed: ProcessRequest | undefined;
+
+    await runWith(
+      Effect.flatMap(AgentExecutor, (agent) =>
+        agent.execute(work, '/tmp/lictor-workspace', 1000, jobId, 2, 'worker-1'),
+      ),
+      writingRunner(completedResult, (request) => {
+        observed = request;
+      }),
+      'codex',
+      databasePath,
+    );
+
+    expect(observed?.input).toContain(
+      '{"attempt":1,"tool":"create_comment","number":17,"state":"landed","receipt":{"id":5}}',
+    );
   });
 
   it('passes the prompt to Codex as stdin in a fixed argv and environment', async () => {

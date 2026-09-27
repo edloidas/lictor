@@ -70,6 +70,38 @@ export const toolCapabilities: Readonly<Record<BrokerTool, ToolCapability>> = {
 };
 
 /**
+ * What repeating a call does: `content` yields the same SHA or an unreferenced
+ * object, `state` is a no-op or a refusal, `append` is a visible duplicate.
+ */
+export type OperationClass = 'read' | 'content' | 'state' | 'append';
+
+export const operationClasses: Readonly<Record<BrokerTool, OperationClass>> = {
+  get_issue: 'read',
+  get_pull_request: 'read',
+  get_repository: 'read',
+  list_comments: 'read',
+  list_reviews: 'read',
+  list_review_threads: 'read',
+  list_review_comments: 'read',
+  create_blob: 'content',
+  create_tree: 'content',
+  create_commit: 'content',
+  create_branch: 'state',
+  update_branch: 'state',
+  update_issue: 'state',
+  submit_review: 'state',
+  delete_pending_review: 'state',
+  resolve_review_thread: 'state',
+  unresolve_review_thread: 'state',
+  merge_pull_request: 'state',
+  create_comment: 'append',
+  create_issue: 'append',
+  create_pull_request: 'append',
+  create_review: 'append',
+  reply_review_comment: 'append',
+};
+
+/**
  * Policy's capabilities with `undefined` settled to `false` before storage, and
  * without `scripts`, which is workspace authority rather than the broker's.
  */

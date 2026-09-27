@@ -3845,3 +3845,182 @@ describe('WorkQueue', () => {
     });
   });
 });
+
+describe('WorkQueue operations', () => {
+  const sendComment = (queue: WorkQueue, jobId: number, attemptNumber: number) =>
+    queue.recordIntent({
+      jobId,
+      attemptNumber,
+      tool: 'create_comment',
+      operationClass: 'append',
+      input: '{"number":17}',
+    });
+
+  it('holds a retried job whose earlier attempt left an append unsettled', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('unsettled'));
+        const first = yield* queue.claim;
+        const operationId = yield* sendComment(queue, jobId, first?.attempts ?? 1);
+        yield* queue.settleOperation(operationId, { state: 'unresolved', error: 'interrupted' });
+        yield* queue.fail(jobId, first?.attempts ?? 1, 'timeout', Date.now() - 1, 'failed');
+        const second = yield* queue.claimFor(queue.ownerId, 60_000);
+        return {
+          second,
+          held: yield* queue.job(jobId),
+          operations: yield* queue.operationsFor(jobId),
+        };
+      }),
+    );
+    expect(result.second).toBeUndefined();
+    expect(result.held?.status).toBe('pending');
+    expect(result.held?.work.approvalRequired).toBe(true);
+    // Holding spends nothing: the attempt the claim would have minted never ran.
+    expect(result.held?.attempts).toBe(1);
+    expect(result.operations).toMatchObject([
+      { attempt: 1, tool: 'create_comment', state: 'unresolved', error: 'interrupted' },
+    ]);
+  });
+
+  it('holds a job whose attempt was lost with an intent still unsettled', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('lost'));
+        const first = yield* queue.claim;
+        yield* sendComment(queue, jobId, first?.attempts ?? 1);
+        yield* queue.recoverStale((first?.leaseExpiresAt ?? 0) + 1);
+        return { second: yield* queue.claim, held: yield* queue.job(jobId) };
+      }),
+    );
+    expect(result.second).toBeUndefined();
+    expect(result.held?.work.approvalRequired).toBe(true);
+  });
+
+  it('runs again past settled appends and unsettled state-class writes', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('settled'));
+        const first = yield* queue.claim;
+        const landed = yield* sendComment(queue, jobId, first?.attempts ?? 1);
+        yield* queue.settleOperation(landed, { state: 'landed', receipt: { id: 5 } });
+        yield* queue.recordIntent({
+          jobId,
+          attemptNumber: first?.attempts ?? 1,
+          tool: 'update_branch',
+          operationClass: 'state',
+          input: '{}',
+        });
+        yield* queue.fail(jobId, first?.attempts ?? 1, 'timeout', Date.now() - 1, 'failed');
+        return yield* queue.claim;
+      }),
+    );
+    expect(result?.attempts).toBe(2);
+  });
+
+  it('releases the rows it held on when the operator approves', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('approved'));
+        const first = yield* queue.claim;
+        const operationId = yield* sendComment(queue, jobId, first?.attempts ?? 1);
+        yield* queue.settleOperation(operationId, { state: 'unresolved', error: 'interrupted' });
+        yield* queue.fail(jobId, first?.attempts ?? 1, 'timeout', Date.now() - 1, 'failed');
+        yield* queue.claim;
+        const approved = yield* queue.approve(jobId);
+        return {
+          approved,
+          second: yield* queue.claim,
+          operations: yield* queue.operationsFor(jobId),
+        };
+      }),
+    );
+    expect(result.approved).toBe(true);
+    expect(result.second?.attempts).toBe(2);
+    // Released, not rewritten: the outcome stays unknown in the record.
+    expect(result.operations[0]?.state).toBe('unresolved');
+    expect(result.operations[0]?.releasedAt).toBeNumber();
+  });
+
+  it('releases the rows it held on when the operator retries', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('retried'));
+        const first = yield* queue.claim;
+        yield* sendComment(queue, jobId, first?.attempts ?? 1);
+        yield* queue.fail(jobId, first?.attempts ?? 1, 'malformed', undefined, 'failed');
+        yield* queue.retry(jobId);
+        return yield* queue.claim;
+      }),
+    );
+    expect(result?.attempts).toBe(2);
+  });
+
+  it('dead-letters an exhausted job rather than holding it', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('exhausted-unsettled'));
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          const job = yield* queue.claim;
+          if (attempt === 3) yield* sendComment(queue, jobId, job?.attempts ?? attempt);
+          yield* queue.fail(jobId, job?.attempts ?? attempt, 'boom', Date.now() - 1, 'failed');
+        }
+        yield* queue.claim;
+        return yield* queue.job(jobId);
+      }),
+    );
+    expect(result?.status).toBe('dead_letter');
+  });
+
+  it('lists only the operations of attempts before the one asked about', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('prior'));
+        const first = yield* queue.claim;
+        const landed = yield* sendComment(queue, jobId, first?.attempts ?? 1);
+        yield* queue.settleOperation(landed, { state: 'landed' });
+        yield* queue.fail(jobId, first?.attempts ?? 1, 'timeout', Date.now() - 1, 'failed');
+        const second = yield* queue.claim;
+        yield* sendComment(queue, jobId, second?.attempts ?? 2);
+        return yield* queue.priorOperations(jobId, second?.attempts ?? 2);
+      }),
+    );
+    expect(result.map((operation) => operation.attempt)).toEqual([1]);
+  });
+
+  it('settles an intent once', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('once'));
+        const first = yield* queue.claim;
+        const operationId = yield* sendComment(queue, jobId, first?.attempts ?? 1);
+        yield* queue.settleOperation(operationId, { state: 'landed', receipt: { id: 9 } });
+        yield* queue.settleOperation(operationId, { state: 'unresolved' });
+        return yield* queue.operationsFor(jobId);
+      }),
+    );
+    expect(result).toMatchObject([{ state: 'landed', receipt: { id: 9 } }]);
+  });
+
+  it('prunes the operations of a job retention removes', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('pruned'));
+        const first = yield* queue.claim;
+        yield* sendComment(queue, jobId, first?.attempts ?? 1);
+        yield* queue.fail(jobId, first?.attempts ?? 1, 'done', undefined, 'failed');
+        yield* queue.maintenance(Date.now() + 1, Date.now() + 1);
+        return yield* queue.operationsFor(jobId);
+      }),
+    );
+    expect(result).toHaveLength(0);
+  });
+});

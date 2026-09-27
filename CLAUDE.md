@@ -135,6 +135,16 @@ indistinguishable from a revoked token.
 - **No string a terminal write holds reaches GitHub.** The agent's `summary`,
   an `ExecutorError` message, a `WorkspaceError` message, a policy refusal code:
   all of them stay in the row and the log, where `job.show` reads them
+- **A mutation is recorded before it is sent and settled from GitHub's answer,
+  never from the job's outcome.** The broker inserts an `operations` row per
+  mutating call — a failed insert sends nothing — and settles it on exit: 2xx
+  `landed` with a receipt, 4xx or a GraphQL error envelope `refused`, anything
+  else `unresolved`, because a 5xx or a dropped connection may follow a write
+  that applied. The claim, not the requeue paths, holds a job whose earlier
+  attempt left an `append`-class row unsettled: one hook covers retry,
+  `recoverStale`, takeover and a resumed question. It holds through
+  `approvalRequired`, after the budget check, and `job.approve` or `job.retry`
+  releases the rows it held on
 - A throw inside `Effect.gen` is a defect, not a failure: `catchAll` never sees
   it, so the recovery branches in the delivery worker are all bypassed and the
   loop dies. Wrap anything that throws — `JSON.parse` above all — in `Effect.try`

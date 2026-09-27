@@ -147,9 +147,12 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
             // ! those rows — reading it first made the record unreachable for
             // ! the case it was added for.
             const outbox = yield* queue.outboxFor(jobId);
+            const operations = yield* queue.operationsFor(jobId);
             const found = yield* Effect.orElseSucceed(queue.job(jobId), () => undefined);
-            if (found !== undefined) return { ...found, outbox };
-            return outbox.length === 0 ? undefined : { id: jobId, undecodable: true, outbox };
+            if (found !== undefined) return { ...found, outbox, operations };
+            return outbox.length === 0 && operations.length === 0
+              ? undefined
+              : { id: jobId, undecodable: true, outbox, operations };
           }
           case 'job.approve':
             return yield* mutate('approve', yield* positiveId(args[0]));

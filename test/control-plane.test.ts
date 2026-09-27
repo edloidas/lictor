@@ -155,6 +155,14 @@ describe('local control plane', () => {
               args: ['1', '1', 'worker-a', '{"jsonrpc":"2.0","id":1,"method":"tools/call"}'],
             });
             const claimed = yield* queue.claim;
+            const sent = yield* queue.recordIntent({
+              jobId: enqueued.jobId,
+              attemptNumber: claimed?.attempts ?? 0,
+              tool: 'create_pull_request',
+              operationClass: 'append',
+              input: '{}',
+            });
+            yield* queue.settleOperation(sent, { state: 'landed', receipt: { number: 14 } });
             yield* queue.complete(enqueued.jobId, claimed?.attempts ?? 0, '{}', {
               repository: work.repository,
               subjectNumber: work.subject.number,
@@ -194,6 +202,10 @@ describe('local control plane', () => {
           id: 1,
           outcome: 'completed',
           outbox: [{ outcome: 'completed', note: 'Opened the pull request.', status: 'pending' }],
+          // What landed on GitHub, independent of what the agent reported.
+          operations: [
+            { attempt: 1, tool: 'create_pull_request', state: 'landed', receipt: { number: 14 } },
+          ],
         },
       });
       expect(result.mode).toBe(0o600);

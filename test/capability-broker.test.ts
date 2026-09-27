@@ -5,7 +5,7 @@ import {
   HttpClientRequest,
   HttpClientResponse,
 } from '@effect/platform';
-import { Effect, Exit, Layer, Redacted, Ref } from 'effect';
+import { Effect, Exit, Fiber, Layer, Redacted, Ref } from 'effect';
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { CapabilityBroker } from '../src/github/capability-broker.ts';
 import { GitHubClient } from '../src/github/client.ts';
@@ -88,6 +88,10 @@ type Reply = {
   readonly body?: unknown;
   /** Answer nothing at all, the way an unreachable GitHub does. */
   readonly transportFails?: boolean;
+  /** Never answer, so the call is still in flight when it is interrupted. */
+  readonly hangs?: boolean;
+  /** A body sent as-is rather than encoded, for one that does not parse. */
+  readonly raw?: string;
 };
 
 const run = <A, E>(
@@ -109,6 +113,7 @@ const run = <A, E>(
           return Ref.update(requests, (items) => [...items, request.url]).pipe(
             Effect.zipRight(Ref.update(methods, (items) => [...items, request.method])),
             Effect.zipRight(Ref.update(bodies, (items) => [...items, sent])),
+            Effect.zipRight(answer.hangs === true ? Effect.never : Effect.void),
             Effect.zipRight(
               answer.transportFails === true
                 ? Effect.fail(
@@ -120,7 +125,8 @@ const run = <A, E>(
                       new Response(
                         nullBodyStatus.has(answer.status ?? 200)
                           ? null
-                          : JSON.stringify(answer.body ?? { ok: true, token: undefined }),
+                          : (answer.raw ??
+                              JSON.stringify(answer.body ?? { ok: true, token: undefined })),
                         {
                           status: answer.status ?? 200,
                           headers: { 'content-type': 'application/json', ...answer.headers },
@@ -691,6 +697,172 @@ describe('CapabilityBroker', () => {
     expect(result.value.audit[0]?.input).toContain('[REDACTED]');
   });
 
+  /** Claims a job under a policy granting `comment`, then posts one comment. */
+  const commentCall = (reply: Parameters<typeof run>[2], source = 'comment = true') =>
+    run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        const exit = yield* Effect.exit(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'create_comment',
+            input: { number: 13, body: 'hello' },
+          }),
+        );
+        return { exit, operations: yield* queue.operationsFor(enqueued.jobId) };
+      }),
+      `[defaults.capabilities]\nread = true\n${source}`,
+      reply,
+    );
+
+  it('records a landed mutation with the identifiers GitHub answered', async () => {
+    const result = await commentCall({
+      status: 201,
+      body: {
+        id: 5,
+        node_id: 'IC_5',
+        html_url: 'https://github.com/edloidas/lictor/issues/13#issuecomment-5',
+        body: 'hello',
+        user: { login: 'adiutriel' },
+      },
+    });
+    expect(Exit.isSuccess(result.value.exit)).toBe(true);
+    expect(result.value.operations).toMatchObject([
+      {
+        attempt: 1,
+        tool: 'create_comment',
+        operationClass: 'append',
+        state: 'landed',
+        receipt: {
+          id: 5,
+          node_id: 'IC_5',
+          html_url: 'https://github.com/edloidas/lictor/issues/13#issuecomment-5',
+        },
+      },
+    ]);
+    // Identifiers only: the prose GitHub echoed back is not the receipt.
+    expect(result.value.operations[0]?.receipt).not.toHaveProperty('body');
+  });
+
+  it('records a mutation GitHub refused as refused', async () => {
+    const result = await commentCall({ status: 422 });
+    expect(Exit.isFailure(result.value.exit)).toBe(true);
+    expect(result.value.operations).toMatchObject([
+      { state: 'refused', error: 'GitHub returned status 422' },
+    ]);
+  });
+
+  // A 5xx can follow a write GitHub applied: the answer settles nothing.
+  it('leaves a mutation answered with a server error unresolved', async () => {
+    const result = await commentCall({ status: 502 });
+    expect(result.value.operations).toMatchObject([
+      { state: 'unresolved', error: 'GitHub returned status 502' },
+    ]);
+  });
+
+  it('leaves a mutation that got no answer unresolved', async () => {
+    const result = await commentCall({ transportFails: true });
+    expect(String(result.value.exit)).toContain('CAPABILITY_FAILED');
+    expect(result.value.operations).toMatchObject([
+      { state: 'unresolved', error: 'no answer from GitHub' },
+    ]);
+  });
+
+  it('leaves a mutation interrupted in flight unresolved', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        const fiber = yield* Effect.fork(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'create_comment',
+            input: { number: 13, body: 'hello' },
+          }),
+        );
+        while ((yield* queue.operationsFor(enqueued.jobId)).length === 0) {
+          yield* Effect.yieldNow();
+        }
+        yield* Fiber.interrupt(fiber);
+        return yield* queue.operationsFor(enqueued.jobId);
+      }),
+      '[defaults.capabilities]\nread = true\ncomment = true',
+      { hangs: true },
+    );
+    expect(result.value).toMatchObject([{ state: 'unresolved', error: 'interrupted' }]);
+  });
+
+  it('records no operation for a call refused before sending', async () => {
+    const denied = await commentCall({}, 'comment = false');
+    expect(denied.requests).toHaveLength(0);
+    expect(denied.value.operations).toHaveLength(0);
+  });
+
+  it('records no operation for a read', async () => {
+    const read = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        yield* broker.callTool({
+          jobId: enqueued.jobId,
+          attemptNumber: claimed?.attempts ?? -1,
+          workerId: claimed?.workerId ?? '',
+          name: 'get_issue',
+          input: { number: 13 },
+        });
+        return yield* queue.operationsFor(enqueued.jobId);
+      }),
+      '[defaults.capabilities]\nread = true',
+    );
+    expect(read.value).toHaveLength(0);
+  });
+
+  it('takes the revision of a created ref from the commit it points at', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        yield* broker.callTool({
+          jobId: enqueued.jobId,
+          attemptNumber: claimed?.attempts ?? -1,
+          workerId: claimed?.workerId ?? '',
+          name: 'create_branch',
+          input: { ref: 'refs/heads/lictor-issue-13', sha: 'a'.repeat(40) },
+        });
+        return yield* queue.operationsFor(enqueued.jobId);
+      }),
+      '[defaults.capabilities]\nread = true\nbranches = true',
+      {
+        status: 201,
+        body: {
+          ref: 'refs/heads/lictor-issue-13',
+          node_id: 'REF_1',
+          object: { sha: 'b'.repeat(40) },
+        },
+      },
+    );
+    expect(result.value).toMatchObject([
+      {
+        operationClass: 'state',
+        state: 'landed',
+        receipt: { ref: 'refs/heads/lictor-issue-13', node_id: 'REF_1', sha: 'b'.repeat(40) },
+      },
+    ]);
+  });
+
   // A continuation turn inherits its authority from the trigger that armed
   // liveness, so it never reaches the escalation capabilities even where
   // repository policy grants them to the operator.
@@ -752,7 +924,11 @@ describe('CapabilityBroker', () => {
             input,
           }),
         );
-        return { exit, audit: yield* queue.auditLog(enqueued.jobId) };
+        return {
+          exit,
+          audit: yield* queue.auditLog(enqueued.jobId),
+          operations: yield* queue.operationsFor(enqueued.jobId),
+        };
       }),
       '[defaults.capabilities]\nread = true\nreview = true',
       options.reply ?? {},
@@ -908,6 +1084,23 @@ describe('CapabilityBroker', () => {
 
     // None of the three reached the mutation.
     for (const result of [refused, throttled, unreachable]) expect(result.bodies).toHaveLength(1);
+  });
+
+  // GraphQL answers 200 whatever it did, so a body nobody can read settles nothing.
+  it('leaves a GraphQL mutation whose answer cannot be read unresolved', async () => {
+    const result = await reviewCall(
+      'resolve_review_thread',
+      { thread_id: 'PRRT_node' },
+      { reply: ownedBy('edloidas/lictor', { raw: '{"data":{"resolveReview' }) },
+    );
+    expect(Exit.isFailure(result.value.exit)).toBe(true);
+    expect(result.value.operations).toMatchObject([
+      {
+        tool: 'resolve_review_thread',
+        state: 'unresolved',
+        error: 'GitHub answer could not be read',
+      },
+    ]);
   });
 
   it('refuses a thread id that names nothing', async () => {
