@@ -45,7 +45,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       // it runs, and a dead credential makes every claim burn it on a clone that
       // cannot push.
       if (yield* health.isRejected) return false;
-      const job = yield* queue.claimFor(queue.ownerId);
+      const job = yield* queue.claimFor(queue.ownerId, policy.approvalExpiryMs);
       if (job === undefined) return false;
       yield* Effect.logInfo('Claimed queued work').pipe(
         Effect.annotateLogs({ job: job.id, attempt: job.attempts }),

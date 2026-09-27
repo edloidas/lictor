@@ -1,6 +1,6 @@
 import type { HttpClient, HttpClientResponse } from '@effect/platform';
 import { HttpClientRequest } from '@effect/platform';
-import { Clock, Data, Effect } from 'effect';
+import { Clock, Data, Effect, Either, Exit } from 'effect';
 import { bounded } from '../bounded.ts';
 import { Policy } from '../policy.ts';
 import { type QueuedJob, WorkQueue } from '../queue/work-queue.ts';
@@ -12,6 +12,7 @@ import {
   grantCapabilities,
   grantedTools,
   intersectCapabilities,
+  operationClasses,
   toolCapabilities,
 } from './grant.ts';
 import { GitHubIdentity } from './identity.ts';
@@ -661,6 +662,60 @@ const sanitized = (input: Readonly<Record<string, unknown>>): string => {
   return JSON.stringify({ ...scalars, truncated: true });
 };
 
+const RECEIPT_FIELDS = ['id', 'node_id', 'number', 'html_url', 'sha', 'ref', 'state', 'merged'];
+
+/** A git ref carries its commit under `object`, whose `sha` stands in for a missing top-level one. */
+const receiptOf = (payload: unknown): Readonly<Record<string, unknown>> => {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return {};
+  const record = payload as Readonly<Record<string, unknown>>;
+  const ref = record.object as { readonly sha?: unknown } | null | undefined;
+  return Object.fromEntries(
+    RECEIPT_FIELDS.flatMap((key): readonly (readonly [string, unknown])[] => {
+      const value = key === 'sha' && record.sha === undefined ? ref?.sha : record[key];
+      if (typeof value === 'string') return [[key, bounded(value, 512)]];
+      return typeof value === 'number' || typeof value === 'boolean' ? [[key, value]] : [];
+    }),
+  );
+};
+
+/**
+ * A 5xx, a dropped connection or an interruption can follow a write GitHub
+ * applied, so only a 2xx or a refusal settles one.
+ */
+const settlementOf = (
+  tool: BrokerTool,
+  exit: Exit.Exit<
+    {
+      readonly response: HttpClientResponse.HttpClientResponse;
+      readonly answer: Either.Either<unknown, unknown> | undefined;
+    },
+    unknown
+  >,
+) => {
+  if (Exit.isFailure(exit)) {
+    return {
+      state: 'unresolved',
+      error: Exit.isInterrupted(exit) ? 'interrupted' : 'no answer from GitHub',
+    } as const;
+  }
+  const { response, answer } = exit.value;
+  if (response.status >= 500) {
+    return { state: 'unresolved', error: `GitHub returned status ${response.status}` } as const;
+  }
+  if (response.status < 200 || response.status >= 300) {
+    return { state: 'refused', error: `GitHub returned status ${response.status}` } as const;
+  }
+  // GraphQL says whether it applied only in the body it answered with.
+  if (isGraphqlMutation(tool) && (answer === undefined || Either.isLeft(answer))) {
+    return { state: 'unresolved', error: 'GitHub answer could not be read' } as const;
+  }
+  if (answer === undefined || Either.isLeft(answer)) return { state: 'landed' } as const;
+  if (isGraphqlMutation(tool) && graphqlRefusal(answer.right) !== undefined) {
+    return { state: 'refused', error: 'GitHub refused the GraphQL mutation' } as const;
+  }
+  return { state: 'landed', receipt: receiptOf(answer.right) } as const;
+};
+
 const boundedJson = (value: unknown): unknown => {
   const encoded = Buffer.from(
     JSON.stringify(value, (_key, item) =>
@@ -912,14 +967,47 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
             target.method === 'GET' || target.method === 'DELETE'
               ? baseRequest
               : HttpClientRequest.bodyUnsafeJson(baseRequest, body);
-          const response = yield* client.execute(httpRequest);
+          const operationClass = operationClasses[request.name];
+          const operationId =
+            operationClass === 'read'
+              ? undefined
+              : yield* queue.recordIntent({
+                  jobId: request.jobId,
+                  attemptNumber: job.attempts,
+                  tool: request.name,
+                  operationClass,
+                  input: auditInput,
+                });
+          const { response, answer } = yield* Effect.gen(function* () {
+            const response = yield* client.execute(httpRequest);
+            // A delete answers with the record it removed, but 204 is legal on
+            // any of these and `response.json` has nothing to parse.
+            const answer =
+              response.status >= 200 && response.status < 300 && response.status !== 204
+                ? yield* Effect.either(response.json)
+                : undefined;
+            return { response, answer };
+          }).pipe(
+            Effect.onExit((exit) =>
+              operationId === undefined
+                ? Effect.void
+                : queue
+                    .settleOperation(operationId, settlementOf(request.name, exit))
+                    .pipe(
+                      Effect.catchAll((cause) =>
+                        Effect.logError('Could not settle a capability operation').pipe(
+                          Effect.annotateLogs({ job: request.jobId, error: cause.message }),
+                        ),
+                      ),
+                    ),
+            ),
+          );
           if (response.status < 200 || response.status >= 300) {
             return yield* githubFailure(response);
           }
-          // A delete answers with the record it removed, but 204 is legal on
-          // any of these and `response.json` has nothing to parse.
-          if (response.status === 204) return {};
-          const payload = boundedJson(yield* response.json);
+          if (answer === undefined) return {};
+          if (Either.isLeft(answer)) return yield* Effect.fail(answer.left);
+          const payload = boundedJson(answer.right);
           if (isGraphqlMutation(request.name)) {
             const refusal = graphqlRefusal(payload);
             if (refusal !== undefined) {
