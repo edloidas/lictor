@@ -30,9 +30,10 @@ const AgentRequest = Schema.Struct({ mcp: McpRequest });
 const SOCKET_PATH_MAX = 107;
 
 /**
- * Job ids are SQLite rowids and attempts are capped by `LICTOR_WORKER_MAX_ATTEMPTS`
- * — sized to that reality, not to `Number.MAX_SAFE_INTEGER`, which would refuse
- * state directories every real socket fits in.
+ * Job ids are SQLite rowids, and an attempt number grows by at most
+ * `LICTOR_WORKER_MAX_ATTEMPTS` per operator retry — sized to that reality, not to
+ * `Number.MAX_SAFE_INTEGER`, which would refuse state directories every real
+ * socket fits in. A job retried past attempt 999 is left to the per-socket check.
  */
 const JOB_DIGITS = 12;
 const ATTEMPT_DIGITS = 3;

@@ -108,7 +108,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       const grant = job.grant === undefined ? live : intersectGrant(job.grant, live);
       const refusal = policyRefusal({
         repository: { ...repositoryPolicy, maxAttempts: grant.maxAttempts },
-        attempts: job.attempts,
+        attempts: job.attemptsSpent,
         readyAt: job.readyAt,
         approvalRequired: job.work.approvalRequired,
         maxJobAgeMs: policy.maxJobAgeMs,
@@ -196,7 +196,8 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       // Parking spends no attempt but restores none, so a question asked with
       // the budget already gone parks a row the next claim dead-letters on
       // sight: answered, and then refused. Finish now and say so instead.
-      const attemptsLeft = job.attempts < Math.min(grant.maxAttempts, config.workerMaxAttempts);
+      const attemptsLeft =
+        job.attemptsSpent < Math.min(grant.maxAttempts, config.workerMaxAttempts);
 
       // ! Before the workspace is acquired, so a request the record could not
       // ! hold never reaches the agent at all. Truncated instructions read as
@@ -389,12 +390,12 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
         return true;
       }
 
-      const retry = result.left.retryable && job.attempts < config.workerMaxAttempts;
+      const retry = result.left.retryable && job.attemptsSpent < config.workerMaxAttempts;
       const now = yield* Clock.currentTimeMillis;
       const retryAt = retry
         ? now +
           (result.left.retryAfterMs ??
-            config.workerRetryBaseMs * 2 ** Math.max(0, job.attempts - 1))
+            config.workerRetryBaseMs * 2 ** Math.max(0, job.attemptsSpent - 1))
         : undefined;
       yield* queue.fail(job.id, job.attempts, result.left.message, retryAt, 'failed', {
         repository: job.work.repository,
