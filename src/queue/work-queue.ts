@@ -185,7 +185,13 @@ export type QueuedJob = {
   readonly id: number;
   readonly work: WorkItem;
   readonly status: JobStatus;
+  /**
+   * The number of the latest execution: every lease-held write fences on it,
+   * and an operator retry never reuses one. Budget checks read `attemptsSpent`.
+   */
   readonly attempts: number;
+  /** Executions since the operator last retried the job, which is what the budget caps. */
+  readonly attemptsSpent: number;
   readonly workerId?: string;
   readonly leaseExpiresAt?: number;
   readonly createdAt: number;
@@ -244,6 +250,7 @@ type JobRow = {
   readonly payload: string;
   readonly status: JobStatus;
   readonly attempts: number;
+  readonly retryBase?: number | null;
   readonly createdAt: number;
   readonly readyAt?: number | null;
   readonly outcome?: JobOutcome | null;
@@ -363,7 +370,7 @@ const migrate = (database: Database) => {
   // every use — the v6 equality-guard failure, one version later. The
   // `installation_id` check is negative so a database predating its drop heals.
   if (
-    version.user_version === 17 &&
+    version.user_version === 18 &&
     hasColumn('daemon_owner', 'pid') &&
     deliveriesHaveSource() &&
     hasColumn('deliveries', 'lease_expires_at') &&
@@ -377,6 +384,7 @@ const migrate = (database: Database) => {
     hasColumn('jobs', 'question_asked_at') &&
     hasColumn('jobs', 'grant') &&
     hasColumn('jobs', 'narrowing') &&
+    hasColumn('jobs', 'retry_base') &&
     hasTable('notification_cursors') &&
     hasTable('poller_state') &&
     hasTable('subject_branches') &&
@@ -389,7 +397,7 @@ const migrate = (database: Database) => {
     hasTable('agent_processes')
   )
     return;
-  if (version.user_version > 17) {
+  if (version.user_version > 18) {
     throw new Error(`Unsupported queue schema version ${version.user_version}`);
   }
 
@@ -551,6 +559,11 @@ const migrate = (database: Database) => {
     if (!hasColumn('jobs', 'narrowing')) {
       database.exec('ALTER TABLE jobs ADD COLUMN narrowing TEXT');
     }
+    // Stamped 18: an older daemon reads raw `attempts` as its budget and would
+    // dead-letter a retried job on its first claim.
+    if (!hasColumn('jobs', 'retry_base')) {
+      database.exec('ALTER TABLE jobs ADD COLUMN retry_base INTEGER NOT NULL DEFAULT 0');
+    }
     database.exec(`
       CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs(status, available_at, id);
       CREATE TABLE IF NOT EXISTS daemon_owner (
@@ -633,7 +646,7 @@ const migrate = (database: Database) => {
         owner_id TEXT NOT NULL,
         started_at INTEGER NOT NULL
       );
-      PRAGMA user_version = 17;
+      PRAGMA user_version = 18;
     `);
     // Ordered after the CREATE TABLE above, like the `deliveries` and `jobs`
     // ALTERs: a fresh table is created complete, and only one predating the
@@ -737,6 +750,7 @@ const decodeJob = (row: JobRow): QueuedJob => ({
   work: Schema.decodeUnknownSync(WorkItemSchema)(JSON.parse(row.payload)),
   status: row.status,
   attempts: row.attempts,
+  attemptsSpent: row.attempts - (row.retryBase ?? 0),
   createdAt: row.createdAt,
   // The migration backfills every existing row, so this coalesce is a floor
   // for a row inserted without one, not a path the upgrade leaves behind.
@@ -1537,7 +1551,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               // ! `maintenance`, which finishes the row without claiming it.
               const row = database
                 .query(
-                  `SELECT id, payload, status, attempts, created_at AS createdAt,
+                  `SELECT id, payload, status, attempts, retry_base AS retryBase, created_at AS createdAt,
                       ready_at AS readyAt, grant, narrowing
                FROM jobs
                WHERE status IN ('pending', 'retry', 'interrupted') AND available_at <= ?
@@ -1550,7 +1564,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               if (row === null) return undefined;
 
               const attemptNumber = row.attempts + 1;
-              if (attemptNumber > config.workerMaxAttempts) {
+              if (attemptNumber - (row.retryBase ?? 0) > config.workerMaxAttempts) {
                 insertOutboxFromJobs('failed', 'id = ?', [row.id], now);
                 database
                   .query(
@@ -2002,17 +2016,17 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             // they are `dead_letter` and the predicate no longer finds them.
             insertOutboxFromJobs(
               'failed',
-              "status = 'running' AND lease_expires_at < ? AND attempts >= ?",
+              "status = 'running' AND lease_expires_at < ? AND attempts - retry_base >= ?",
               [olderThan, config.workerMaxAttempts],
               now,
             );
             return database
               .query(
                 `UPDATE jobs
-                 SET status = CASE WHEN attempts >= ? THEN 'dead_letter' ELSE 'interrupted' END,
-                     outcome = CASE WHEN attempts >= ? THEN 'failed' ELSE outcome END,
+                 SET status = CASE WHEN attempts - retry_base >= ? THEN 'dead_letter' ELSE 'interrupted' END,
+                     outcome = CASE WHEN attempts - retry_base >= ? THEN 'failed' ELSE outcome END,
                      available_at = ?, claimed_at = NULL, worker_id = NULL, lease_expires_at = NULL,
-                     interrupted_at = ?, failed_at = CASE WHEN attempts >= ? THEN ? ELSE failed_at END,
+                     interrupted_at = ?, failed_at = CASE WHEN attempts - retry_base >= ? THEN ? ELSE failed_at END,
                      last_error = 'worker interrupted', updated_at = ?
                  WHERE status = 'running' AND lease_expires_at < ?`,
               )
@@ -2334,7 +2348,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       attempt('list jobs', () => {
         const rows = database
           .query(
-            `SELECT id, payload, status, attempts, last_error AS lastError, grant, narrowing,
+            `SELECT id, payload, status, attempts, retry_base AS retryBase, last_error AS lastError,
+               grant, narrowing,
                created_at AS createdAt, updated_at AS updatedAt,
                ready_at AS readyAt, outcome, hold_expires_at AS holdExpiresAt,
                question_id AS questionId, question_answerers AS questionAnswerers
@@ -2383,7 +2398,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       attempt('inspect job', () => {
         const row = database
           .query(
-            `SELECT id, payload, status, attempts, last_error AS lastError, grant, narrowing,
+            `SELECT id, payload, status, attempts, retry_base AS retryBase, last_error AS lastError,
+               grant, narrowing,
                created_at AS createdAt, updated_at AS updatedAt,
                ready_at AS readyAt, outcome, hold_expires_at AS holdExpiresAt,
                question_id AS questionId, question_answerers AS questionAnswerers,
@@ -2452,7 +2468,6 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
             }
             if (action === 'retry') {
               if (row.status !== 'failed' && row.status !== 'dead_letter') return false;
-              database.query('DELETE FROM attempts WHERE job_id = ?').run(id);
               // The retried job writes its own outcome. A message describing the
               // one it replaces must not post after it.
               database
@@ -2471,7 +2486,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               return (
                 database
                   .query(
-                    `UPDATE jobs SET status = ?, attempts = 0, available_at = ?, failed_at = NULL,
+                    `UPDATE jobs SET status = ?, retry_base = attempts, available_at = ?, failed_at = NULL,
                    retry_at = ?, last_error = NULL, updated_at = ?, ready_at = ?, outcome = NULL,
                    hold_expires_at = ?
                    WHERE id = ?`,

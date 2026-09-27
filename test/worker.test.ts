@@ -1173,6 +1173,43 @@ describe('Worker.runOnce', () => {
     expect(result.job?.lastError).toBe('POLICY_ATTEMPTS_EXHAUSTED');
   });
 
+  // Attempt 3 is past both limits by number. The policy gate and the retry
+  // decision read what the operator retry left spent, not the attempt's number.
+  it('runs and retries an exhausted job again under the budget an operator retry opened', async () => {
+    let executions = 0;
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        yield* TestClock.adjust('150 millis');
+        yield* worker.runOnce;
+        const exhausted = (yield* queue.job(jobId))?.status;
+        yield* queue.retry(jobId);
+        yield* worker.runOnce;
+        return { exhausted, job: yield* queue.job(jobId) };
+      }).pipe(Effect.provide(TestContext.TestContext)),
+      () => {
+        executions += 1;
+        return Effect.fail(new ExecutorError({ message: 'temporary', retryable: true }));
+      },
+      2,
+      true,
+      undefined,
+      { repository: { maxAttempts: 2 } },
+    );
+
+    expect(result.exhausted).toBe('failed');
+    expect(executions).toBe(3);
+    expect(result.job).toMatchObject({
+      status: 'retry',
+      attempts: 3,
+      attemptsSpent: 1,
+      lastError: 'temporary',
+    });
+  });
+
   // Access is a fact about the repository, not the daemon, and repeating the
   // attempt cannot change it — unlike a refused credential, which an operator
   // rotates. So this one stays terminal and the credential one does not.

@@ -1110,28 +1110,86 @@ describe('WorkQueue', () => {
     expect(result.counts.retry).toBe(1);
   });
 
-  it('resets exhausted attempts when an operator retries a dead-letter job', async () => {
-    const result = await Effect.runPromise(
-      Effect.scoped(
-        Effect.gen(function* () {
-          const queue = yield* WorkQueue;
-          yield* queue.enqueue(work('operator-retry'));
-          const first = yield* queue.claim;
-          yield* queue.recoverStale((first?.leaseExpiresAt ?? 0) + 1);
-          yield* queue.retry(first?.id ?? -1);
-          return yield* queue.claim;
-        }).pipe(
-          Effect.provide(
-            WorkQueue.DefaultWithoutDependencies.pipe(
-              Layer.provide(
-                Layer.succeed(LictorConfig, { ...config(':memory:'), workerMaxAttempts: 1 }),
+  it('opens a fresh budget on operator retry without deleting or renumbering attempts', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-retry-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            const { jobId } = yield* queue.enqueue(work('operator-retry'));
+            const first = yield* queue.claim;
+            yield* queue.recoverStale((first?.leaseExpiresAt ?? 0) + 1);
+            const exhausted = (yield* queue.job(jobId))?.status;
+            yield* queue.retry(jobId);
+            const second = yield* queue.claim;
+            yield* queue.recoverStale((second?.leaseExpiresAt ?? 0) + 1);
+            yield* queue.retry(jobId);
+            const third = yield* queue.claim;
+            return { exhausted, second, third };
+          }).pipe(
+            Effect.provide(
+              WorkQueue.DefaultWithoutDependencies.pipe(
+                Layer.provide(
+                  Layer.succeed(LictorConfig, { ...config(path), workerMaxAttempts: 1 }),
+                ),
               ),
             ),
           ),
         ),
-      ),
+      );
+
+      expect(result.exhausted).toBe('dead_letter');
+      // Past `workerMaxAttempts` by number and still claimed: the budget is
+      // measured from the retry, the identity from the job's first run.
+      expect(result.second).toMatchObject({ attempts: 2, attemptsSpent: 1 });
+      expect(result.third).toMatchObject({ attempts: 3, attemptsSpent: 1 });
+
+      const side = new Database(path);
+      const rows = side
+        .query('SELECT number FROM attempts WHERE job_id = ? ORDER BY number')
+        .all(result.third?.id ?? -1);
+      side.close();
+      expect(rows).toEqual([{ number: 1 }, { number: 2 }, { number: 3 }]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('measures stale recovery against the budget a retry opened', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('retry-then-stale'));
+        for (let index = 0; index < 3; index += 1) {
+          const claimed = yield* queue.claim;
+          yield* queue.recoverStale((claimed?.leaseExpiresAt ?? 0) + 1);
+        }
+        const exhausted = (yield* queue.job(jobId))?.status;
+        yield* queue.retry(jobId);
+        const fourth = yield* queue.claim;
+        yield* queue.recoverStale((fourth?.leaseExpiresAt ?? 0) + 1);
+        return {
+          exhausted,
+          afterStale: yield* queue.job(jobId),
+          outbox: (yield* queue.outboxFor(jobId)).map((message) => message.status),
+        };
+      }),
     );
-    expect(result?.attempts).toBe(1);
+
+    expect(result.exhausted).toBe('dead_letter');
+    // Attempt 4 is past the limit of 3 by number, but only the first of the
+    // new budget: it is interrupted and claimable again, not dead-lettered.
+    expect(result.afterStale).toMatchObject({
+      status: 'interrupted',
+      attempts: 4,
+      attemptsSpent: 1,
+    });
+    expect(result.afterStale?.outcome).toBeUndefined();
+    // Only the first dead-letter's message, superseded by the retry: a still
+    // runnable job owes its thread no failure.
+    expect(result.outbox).toEqual(['canceled']);
   });
 
   it('recovers stale running work as retryable', async () => {
@@ -2061,7 +2119,7 @@ describe('WorkQueue', () => {
       const after = new Database(path);
       expect(
         (after.query('PRAGMA user_version').get() as { user_version: number }).user_version,
-      ).toBe(17);
+      ).toBe(18);
       after.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -2313,7 +2371,7 @@ describe('WorkQueue', () => {
       ).toContain('grant');
       expect(
         (after.query('PRAGMA user_version').get() as { user_version: number }).user_version,
-      ).toBe(17);
+      ).toBe(18);
       after.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -2362,12 +2420,56 @@ describe('WorkQueue', () => {
 
       expect(columns).toContain('narrowing');
       // Diagnostic column, so a daemon rolled back past it still starts. The
-      // stamp is the current one, which `agent_processes` moved to 16.
-      expect(stamp).toBe(17);
+      // stamp is the current one.
+      expect(stamp).toBe(18);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  // 18 is the stamp that already claims the column: only the fast-path presence
+  // check keeps it from returning before the ALTER.
+  it.each([17, 18])(
+    'repairs a version-%i database missing the retry base, keeping spent attempts',
+    async (version) => {
+      const directory = mkdtempSync(join(tmpdir(), 'lictor-retry-base-'));
+      const path = join(directory, 'queue.sqlite');
+      try {
+        await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const queue = yield* WorkQueue;
+              yield* queue.enqueue(work('pre-retry-base'));
+              yield* queue.claim;
+            }).pipe(Effect.provide(queueLayer(path))),
+          ),
+        );
+        const stripped = new Database(path);
+        stripped.exec('ALTER TABLE jobs DROP COLUMN retry_base');
+        stripped.exec(`PRAGMA user_version = ${version}`);
+        stripped.close();
+
+        const result = await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const queue = yield* WorkQueue;
+              return yield* queue.job(1);
+            }).pipe(Effect.provide(queueLayer(path))),
+          ),
+        );
+
+        // An attempt spent before the column existed still counts against the budget.
+        expect(result).toMatchObject({ attempts: 1, attemptsSpent: 1 });
+        const repaired = new Database(path);
+        const stamp = (repaired.query('PRAGMA user_version').get() as { user_version: number })
+          .user_version;
+        repaired.close();
+        expect(stamp).toBe(18);
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.each([
     ['a question the outbox actually sent', 1, 'delivered', 500],
@@ -2438,7 +2540,7 @@ describe('WorkQueue', () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
     const path = join(directory, 'queue.sqlite');
     const database = new Database(path, { create: true });
-    database.exec('PRAGMA user_version = 18');
+    database.exec('PRAGMA user_version = 19');
     database.close();
 
     try {
@@ -2458,7 +2560,7 @@ describe('WorkQueue', () => {
       // stamp into the migration body would die on an ALTER against a table it
       // never created, reading as a corrupt database rather than a newer one.
       expect(exit._tag === 'Failure' ? wrappedMessage(exit.cause) : '').toContain(
-        'Unsupported queue schema version 18',
+        'Unsupported queue schema version 19',
       );
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -3134,7 +3236,7 @@ describe('WorkQueue', () => {
       expect(tables).toContain('agent_processes');
       // Re-stamped as well as repaired: a migration that creates the table and
       // leaves the stamp behind runs its whole body again on every open.
-      expect(stamp).toBe(17);
+      expect(stamp).toBe(18);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
