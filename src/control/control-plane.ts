@@ -1,11 +1,27 @@
 import { chmodSync, mkdirSync, statfsSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
+import type { Socket } from 'bun';
 import { Clock, Data, Effect } from 'effect';
 import { LictorConfig } from '../config.ts';
 import { CredentialHealth } from '../github/credential-health.ts';
 import { grantedTools, mintGrant } from '../github/grant.ts';
 import { Policy } from '../policy.ts';
-import { WorkQueue } from '../queue/work-queue.ts';
+import { type ArtifactRecord, WorkQueue } from '../queue/work-queue.ts';
+
+/** The reply is JSON: retained bytes go out as text where they decode, base64 where not. */
+const showArtifact = (artifact: ArtifactRecord) => {
+  if (artifact.state === 'rejected') return artifact;
+  const { content, ...rest } = artifact;
+  try {
+    return {
+      ...rest,
+      bytes: content.byteLength,
+      text: new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(content),
+    };
+  } catch {
+    return { ...rest, bytes: content.byteLength, base64: Buffer.from(content).toString('base64') };
+  }
+};
 
 export class ControlError extends Data.TaggedError('ControlError')<{
   readonly code: string;
@@ -148,11 +164,12 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
             // ! the case it was added for.
             const outbox = yield* queue.outboxFor(jobId);
             const operations = yield* queue.operationsFor(jobId);
+            const artifacts = (yield* queue.artifactsFor(jobId)).map(showArtifact);
             const found = yield* Effect.orElseSucceed(queue.job(jobId), () => undefined);
-            if (found !== undefined) return { ...found, outbox, operations };
-            return outbox.length === 0 && operations.length === 0
+            if (found !== undefined) return { ...found, outbox, operations, artifacts };
+            return outbox.length === 0 && operations.length === 0 && artifacts.length === 0
               ? undefined
-              : { id: jobId, undecodable: true, outbox, operations };
+              : { id: jobId, undecodable: true, outbox, operations, artifacts };
           }
           case 'job.approve':
             return yield* mutate('approve', yield* positiveId(args[0]));
@@ -243,6 +260,24 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
   dependencies: [LictorConfig.Default, Policy.Default, WorkQueue.Default, CredentialHealth.Default],
 }) {}
 
+type ControlSession = { buffer: string; pending?: Uint8Array | undefined };
+
+/**
+ * `socket.write` drops what the kernel buffer does not take, so a large reply
+ * resumes on `drain`, and the socket ends only once all of it is sent.
+ */
+const flushReply = (socket: Socket<ControlSession>) => {
+  const pending = socket.data.pending;
+  if (pending === undefined) return;
+  const written = socket.write(pending);
+  if (written >= 0 && written < pending.byteLength) {
+    socket.data.pending = pending.subarray(written);
+    return;
+  }
+  socket.data.pending = undefined;
+  socket.end();
+};
+
 export class ControlServer extends Effect.Service<ControlServer>()('ControlServer', {
   scoped: Effect.gen(function* () {
     const config = yield* LictorConfig;
@@ -266,12 +301,13 @@ export class ControlServer extends Effect.Service<ControlServer>()('ControlServe
     const server = yield* Effect.acquireRelease(
       Effect.try({
         try: () =>
-          Bun.listen<{ buffer: string }>({
+          Bun.listen<ControlSession>({
             unix: config.controlSocketPath,
             socket: {
               open(socket) {
                 socket.data = { buffer: '' };
               },
+              drain: flushReply,
               data(socket, chunk) {
                 socket.data.buffer += Buffer.from(chunk).toString('utf8');
                 if (Buffer.byteLength(socket.data.buffer) > 256 * 1024) {
@@ -307,8 +343,8 @@ export class ControlServer extends Effect.Service<ControlServer>()('ControlServe
                     }),
                     Effect.tap((response) =>
                       Effect.sync(() => {
-                        socket.write(`${JSON.stringify(response)}\n`);
-                        socket.end();
+                        socket.data.pending = Buffer.from(`${JSON.stringify(response)}\n`);
+                        flushReply(socket);
                       }),
                     ),
                   ),

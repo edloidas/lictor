@@ -145,6 +145,9 @@ const run = <A, E>(
   enabled = true,
   createWorkspace?: InstanceType<typeof RepositoryWorkspace>['acquire'],
   policyOverrides: PolicyOverrides = {},
+  workspace: Partial<
+    Pick<InstanceType<typeof RepositoryWorkspace>, 'release' | 'collectArtifacts'>
+  > = {},
 ) => {
   const ConfigLive = Layer.succeed(LictorConfig, config(maxAttempts));
   const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
@@ -187,8 +190,9 @@ const run = <A, E>(
     RepositoryWorkspace,
     RepositoryWorkspace.make({
       acquire: createWorkspace ?? (() => Effect.succeed({ path: '/tmp/lictor-job' })),
-      release: () => Effect.void,
+      release: workspace.release ?? (() => Effect.void),
       sweep: () => Effect.void,
+      collectArtifacts: workspace.collectArtifacts ?? (() => Effect.succeed([])),
     }),
   );
   const HealthLive = CredentialHealth.Default;
@@ -1578,5 +1582,118 @@ describe('Worker.runOnce on a clipped request', () => {
     );
 
     expect(result?.outcome).toBe('completed');
+  });
+});
+
+describe('Worker.runOnce workspace lifetime', () => {
+  type Release = { readonly retain: boolean; readonly completedAtRelease: number };
+
+  /**
+   * Runs one job, recording each release with how many jobs had already
+   * completed at that moment — the evidence of whether the outcome committed
+   * before the workspace went.
+   */
+  const lifetime = (
+    execute: InstanceType<typeof AgentExecutor>['execute'],
+    collectArtifacts: InstanceType<typeof RepositoryWorkspace>['collectArtifacts'] = () =>
+      Effect.succeed([]),
+    events: string[] = [],
+  ) => {
+    const releases: Release[] = [];
+    let counts: InstanceType<typeof WorkQueue>['counts'] | undefined;
+    return run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        counts = queue.counts;
+        const { jobId } = yield* queue.enqueue(work);
+        const worker = yield* Worker;
+        yield* worker.runOnce;
+        return {
+          releases,
+          artifacts: yield* queue.artifactsFor(jobId),
+          counts: yield* queue.counts,
+        };
+      }),
+      execute,
+      3,
+      true,
+      undefined,
+      {},
+      {
+        release: (_jobId, options) =>
+          Effect.suspend(() => (counts ?? Effect.die('queue not ready')).pipe(Effect.orDie)).pipe(
+            Effect.flatMap((current) =>
+              Effect.sync(() => {
+                events.push('release');
+                releases.push({ retain: options.retain, completedAtRelease: current.completed });
+              }),
+            ),
+          ),
+        collectArtifacts,
+      },
+    );
+  };
+
+  it('deletes the workspace only after the outcome has committed', async () => {
+    const result = await lifetime(() => Effect.succeed({ status: 'completed', summary: 'done' }));
+
+    expect(result.releases).toEqual([{ retain: false, completedAtRelease: 1 }]);
+  });
+
+  it('keeps the workspace of an execution that failed', async () => {
+    const result = await lifetime(() =>
+      Effect.fail(new ExecutorError({ message: 'Codex exited with status 1', retryable: false })),
+    );
+
+    expect(result.releases).toEqual([{ retain: true, completedAtRelease: 0 }]);
+  });
+
+  it('keeps the workspace of a result the agent reported as failed', async () => {
+    const result = await lifetime(() => Effect.succeed({ status: 'failed', summary: 'broke' }));
+
+    expect(result.releases.map((release) => release.retain)).toEqual([true]);
+  });
+
+  it('retains the artifacts a completed result names, read before the release', async () => {
+    const claimed: (readonly string[])[] = [];
+    const events: string[] = [];
+    const result = await lifetime(
+      () =>
+        Effect.succeed({ status: 'completed', summary: 'done', artifacts: ['report.md', '../x'] }),
+      (_jobId, paths) =>
+        Effect.sync(() => {
+          events.push('collect');
+          claimed.push(paths);
+          return [
+            { path: 'report.md', state: 'retained', content: new TextEncoder().encode('# ok') },
+            { path: '../x', state: 'rejected', reason: 'invalid_path' },
+          ] as const;
+        }),
+      events,
+    );
+
+    expect(claimed).toEqual([['report.md', '../x']]);
+    expect(events).toEqual(['collect', 'release']);
+    expect(result.artifacts.map(({ attempt, path, state }) => ({ attempt, path, state }))).toEqual([
+      { attempt: 1, path: 'report.md', state: 'retained' },
+      { attempt: 1, path: '../x', state: 'rejected' },
+    ]);
+    const retained = result.artifacts[0];
+    expect(
+      retained?.state === 'retained' ? new TextDecoder().decode(retained.content) : undefined,
+    ).toBe('# ok');
+  });
+
+  it('completes the job and keeps its workspace when its artifacts cannot be recorded', async () => {
+    const result = await lifetime(
+      () => Effect.succeed({ status: 'completed', summary: 'done', artifacts: ['report.md'] }),
+      // A NULL path fails the insert's constraint: a real QueueError from a
+      // contrived row.
+      () => Effect.succeed([{ path: null as never, state: 'rejected', reason: 'missing' }]),
+    );
+
+    expect(result.counts.completed).toBe(1);
+    expect(result.artifacts).toEqual([]);
+    expect(result.releases).toEqual([{ retain: true, completedAtRelease: 1 }]);
   });
 });

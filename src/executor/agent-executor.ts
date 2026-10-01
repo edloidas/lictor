@@ -569,7 +569,7 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                   .filter(Boolean)
                   .join(
                     '\n\n',
-                  )}\n\nReturn only the result object described by the output schema you were given. Keep \`summary\` under 4000 bytes; it is recorded for the operator, not posted, and a longer one is cut.`,
+                  )}\n\nReturn only the result object described by the output schema you were given. Keep \`summary\` under 4000 bytes; it is recorded for the operator, not posted, and a longer one is cut. \`artifacts\` lists files you wrote in the workspace for the operator to read after it is deleted, such as a report or a log, by path relative to it; never the repository files you changed. Leave it empty when there are none: each is kept only up to 256 KiB, and symlinks are refused.`,
                 timeoutMs: budgetMs,
                 outputLimitBytes: config.executorOutputBytes,
                 // `codex exec` writes its whole transcript here and names a
