@@ -1,12 +1,25 @@
-import { existsSync, mkdirSync, readdirSync, renameSync, statfsSync, statSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readSync,
+  renameSync,
+  statfsSync,
+  statSync,
+} from 'node:fs';
 import { rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { Data, Effect, Option, Redacted, Ref } from 'effect';
 import { LictorConfig } from '../config.ts';
 import { ProcessRunner } from '../executor/process-runner.ts';
 import { GitHubCredential } from '../github/credential.ts';
 import { canonicalRepository, isSafeRepository, type RepositoryPolicy } from '../policy.ts';
-import { WorkQueue } from '../queue/work-queue.ts';
+import { type ArtifactRefusal, type CollectedArtifact, WorkQueue } from '../queue/work-queue.ts';
 
 export class WorkspaceError extends Data.TaggedError('WorkspaceError')<{
   readonly code: string;
@@ -132,6 +145,111 @@ const classifyGitFailure = (
     });
   }
   return new WorkspaceError(fallback);
+};
+
+/** What one result may keep, held in memory between the read and the insert. */
+const ARTIFACT_FILE_LIMIT_BYTES = 256 * 1024;
+const ARTIFACT_TOTAL_LIMIT_BYTES = 1024 * 1024;
+
+/**
+ * Lexical, never `realpath`: the claimed path is walked one segment at a time
+ * so a symlink anywhere on it is refused rather than resolved.
+ */
+const artifactSegments = (claimed: string): readonly string[] | undefined => {
+  if (claimed === '' || claimed.includes('\0') || isAbsolute(claimed)) return undefined;
+  const segments = claimed.split('/').filter((segment) => segment !== '' && segment !== '.');
+  if (segments.length === 0 || segments.includes('..')) return undefined;
+  return segments;
+};
+
+const artifactRefusal = (cause: unknown): ArtifactRefusal => {
+  const code = (cause as { readonly code?: unknown }).code;
+  if (code === 'ELOOP') return 'symlink';
+  if (code === 'ENOENT' || code === 'ENOTDIR') return 'missing';
+  return 'unreadable';
+};
+
+type Refused = { readonly reason: ArtifactRefusal; readonly bytes?: number };
+
+/**
+ * ! The workspace is attacker-shaped: the agent ran shell commands in it. A
+ * ! FIFO would block the single thread, a symlink would read daemon state out
+ * ! into the database, and a file swapped between `lstat` and `open` would do
+ * ! either — hence O_NOFOLLOW | O_NONBLOCK and the dev/ino match after opening.
+ */
+const readArtifact = (
+  sessionPath: string,
+  segments: readonly string[],
+  budget: number,
+): Uint8Array | Refused => {
+  let current = sessionPath;
+  let stats = lstatSync(current);
+  for (const segment of segments) {
+    if (!stats.isDirectory()) return { reason: 'missing' };
+    current = join(current, segment);
+    stats = lstatSync(current);
+    if (stats.isSymbolicLink()) return { reason: 'symlink' };
+  }
+  if (!stats.isFile()) return { reason: 'not_regular' };
+  if (stats.size > ARTIFACT_FILE_LIMIT_BYTES) return { reason: 'too_large', bytes: stats.size };
+  const fd = openSync(current, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== stats.dev || opened.ino !== stats.ino) {
+      return { reason: 'changed' };
+    }
+    // One byte past the limit, so a file that grew after the `lstat` is caught.
+    const buffer = Buffer.alloc(ARTIFACT_FILE_LIMIT_BYTES + 1);
+    let read = 0;
+    while (read < buffer.length) {
+      const n = readSync(fd, buffer, read, buffer.length - read, null);
+      if (n === 0) break;
+      read += n;
+    }
+    if (read > ARTIFACT_FILE_LIMIT_BYTES) return { reason: 'too_large', bytes: read };
+    if (read > budget) return { reason: 'over_budget', bytes: read };
+    // Copied out: a view would pin the whole 256 KiB buffer for a one-byte file.
+    return new Uint8Array(buffer.subarray(0, read));
+  } finally {
+    closeSync(fd);
+  }
+};
+
+/**
+ * Reads every claimed path out of the session in claim order, under one total
+ * budget. Never fails: a path that cannot be kept is recorded with its reason,
+ * since the agent has already run and nothing here may cost the outcome.
+ */
+const collectArtifactsFrom = (
+  sessionPath: string,
+  claimed: readonly string[],
+): readonly CollectedArtifact[] => {
+  const seen = new Set<string>();
+  let budget = ARTIFACT_TOTAL_LIMIT_BYTES;
+  const collected: CollectedArtifact[] = [];
+  for (const path of claimed) {
+    const segments = artifactSegments(path);
+    if (segments === undefined) {
+      collected.push({ path, state: 'rejected', reason: 'invalid_path' });
+      continue;
+    }
+    const normalized = segments.join('/');
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    let outcome: Uint8Array | Refused;
+    try {
+      outcome = readArtifact(sessionPath, segments, budget);
+    } catch (cause) {
+      outcome = { reason: artifactRefusal(cause) };
+    }
+    if (outcome instanceof Uint8Array) {
+      budget -= outcome.byteLength;
+      collected.push({ path: normalized, state: 'retained', content: outcome });
+    } else {
+      collected.push({ path: normalized, state: 'rejected', ...outcome });
+    }
+  }
+  return collected;
 };
 
 export type JobWorkspace = {
@@ -640,7 +758,19 @@ export class RepositoryWorkspace extends Effect.Service<RepositoryWorkspace>()(
           );
         }).pipe(Effect.asVoid);
 
-      return { acquire, release, sweep };
+      const collectArtifacts = (
+        jobId: number,
+        claimed: readonly string[],
+      ): Effect.Effect<readonly CollectedArtifact[]> =>
+        Effect.try(() => collectArtifactsFrom(join(root, `job-${jobId}`), claimed)).pipe(
+          Effect.orElseSucceed(() =>
+            claimed.map(
+              (path): CollectedArtifact => ({ path, state: 'rejected', reason: 'unreadable' }),
+            ),
+          ),
+        );
+
+      return { acquire, release, sweep, collectArtifacts };
     }),
     dependencies: [
       LictorConfig.Default,

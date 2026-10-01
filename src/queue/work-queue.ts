@@ -204,6 +204,28 @@ export type OperationRecord = {
   readonly releasedAt?: number;
 };
 
+export type ArtifactRefusal =
+  | 'invalid_path'
+  | 'symlink'
+  | 'missing'
+  | 'not_regular'
+  | 'changed'
+  | 'too_large'
+  | 'over_budget'
+  | 'unreadable';
+
+/** A path the agent named, read out of its workspace before the workspace went. */
+export type CollectedArtifact =
+  | { readonly path: string; readonly state: 'retained'; readonly content: Uint8Array }
+  | {
+      readonly path: string;
+      readonly state: 'rejected';
+      readonly reason: ArtifactRefusal;
+      readonly bytes?: number;
+    };
+
+export type ArtifactRecord = CollectedArtifact & { readonly attempt: number };
+
 /** An unsettled append no operator has released. Goes in a `WHERE` on `jobs`. */
 const UNSETTLED_APPEND_WHERE = `EXISTS (
                    SELECT 1 FROM operations
@@ -428,7 +450,8 @@ const migrate = (database: Database) => {
     hasColumn('outbox', 'context') &&
     !hasColumn('outbox', 'comment_url') &&
     hasTable('agent_processes') &&
-    hasTable('operations')
+    hasTable('operations') &&
+    hasTable('artifacts')
   )
     return;
   if (version.user_version > 18) {
@@ -697,6 +720,19 @@ const migrate = (database: Database) => {
         released_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS operations_job ON operations(job_id, attempt, id);
+      -- Additive like operations: an older daemon ignores it and retains nothing.
+      CREATE TABLE IF NOT EXISTS artifacts (
+        id INTEGER PRIMARY KEY,
+        job_id INTEGER NOT NULL,
+        attempt INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('retained', 'rejected')),
+        reason TEXT,
+        bytes INTEGER,
+        content BLOB,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS artifacts_job ON artifacts(job_id, attempt, id);
       PRAGMA user_version = 18;
     `);
     // Ordered after the CREATE TABLE above, like the `deliveries` and `jobs`
@@ -2219,6 +2255,22 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                (status IN ('failed', 'dead_letter') AND failed_at < ?))`,
           )
           .run(completedBefore, failedBefore);
+        // An interrupted attempt never reaches an outcome, so what it staged is
+        // never shown; it goes now rather than with the job.
+        database.exec(
+          `DELETE FROM artifacts WHERE EXISTS (
+             SELECT 1 FROM attempts
+             WHERE attempts.job_id = artifacts.job_id AND attempts.number = artifacts.attempt
+               AND attempts.status = 'interrupted')`,
+        );
+        database
+          .query(
+            `DELETE FROM artifacts WHERE job_id IN
+             (SELECT id FROM jobs WHERE
+               (status = 'completed' AND completed_at < ?) OR
+               (status IN ('failed', 'dead_letter') AND failed_at < ?))`,
+          )
+          .run(completedBefore, failedBefore);
         database
           .query(
             `DELETE FROM operations WHERE job_id IN
@@ -2517,6 +2569,100 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
 
     const operationsFor = (jobId: number) =>
       attempt('list operations', () => readOperations('job_id = ?', [jobId]));
+
+    /**
+     * Its own transaction, ahead of the outcome: a megabyte insert that can fail
+     * must not share the one that may not. Fenced like `complete`.
+     */
+    const recordArtifacts = (
+      jobId: number,
+      attemptNumber: number,
+      artifacts: readonly CollectedArtifact[],
+    ) =>
+      Effect.gen(function* () {
+        if (artifacts.length === 0) return;
+        const now = yield* Clock.currentTimeMillis;
+        yield* attempt('record artifacts', () =>
+          database.transaction(() => {
+            const running = database
+              .query("SELECT 1 FROM jobs WHERE id = ? AND status = 'running' AND attempts = ?")
+              .get(jobId, attemptNumber);
+            if (running === null) throw new Error(`Job ${jobId} attempt ${attemptNumber} is stale`);
+            const insert = database.query(
+              `INSERT INTO artifacts (job_id, attempt, path, state, reason, bytes, content, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            );
+            for (const artifact of artifacts) {
+              if (artifact.state === 'retained') {
+                insert.run(
+                  jobId,
+                  attemptNumber,
+                  artifact.path,
+                  'retained',
+                  null,
+                  artifact.content.byteLength,
+                  artifact.content,
+                  now,
+                );
+              } else {
+                insert.run(
+                  jobId,
+                  attemptNumber,
+                  artifact.path,
+                  'rejected',
+                  artifact.reason,
+                  artifact.bytes ?? null,
+                  null,
+                  now,
+                );
+              }
+            }
+          })(),
+        );
+      });
+
+    /**
+     * Only attempts that reached an outcome: rows an attempt recorded before it
+     * crashed or lost its lease belong to a run nothing else accounts for.
+     */
+    const artifactsFor = (jobId: number) =>
+      attempt('list artifacts', () => {
+        const rows = database
+          .query(
+            `SELECT artifacts.attempt, artifacts.path, artifacts.state, artifacts.reason,
+               artifacts.bytes, artifacts.content
+             FROM artifacts
+             JOIN attempts ON attempts.job_id = artifacts.job_id
+               AND attempts.number = artifacts.attempt
+             WHERE artifacts.job_id = ? AND attempts.status IN ('completed', 'failed')
+             ORDER BY artifacts.id`,
+          )
+          .all(jobId) as readonly {
+          readonly attempt: number;
+          readonly path: string;
+          readonly state: 'retained' | 'rejected';
+          readonly reason: ArtifactRefusal | null;
+          readonly bytes: number | null;
+          readonly content: Uint8Array | null;
+        }[];
+        return rows.map(
+          (row): ArtifactRecord =>
+            row.state === 'retained'
+              ? {
+                  attempt: row.attempt,
+                  path: row.path,
+                  state: 'retained',
+                  content: row.content ?? new Uint8Array(),
+                }
+              : {
+                  attempt: row.attempt,
+                  path: row.path,
+                  state: 'rejected',
+                  reason: row.reason ?? 'unreadable',
+                  ...(row.bytes === null ? {} : { bytes: row.bytes }),
+                },
+        );
+      });
 
     const priorOperations = (jobId: number, attemptNumber: number) =>
       attempt('list prior operations', () =>
@@ -2834,6 +2980,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       settleOperation,
       operationsFor,
       priorOperations,
+      recordArtifacts,
+      artifactsFor,
       recordSubjectBranch,
       branchForSubject,
       markLive,

@@ -71,7 +71,7 @@ const planeUnder = (policySource: string, socketPath: string) => {
 
 const call = (path: string, request: ControlRequest) =>
   Effect.async<string, Error>((resume) => {
-    let output = '';
+    const chunks: Buffer[] = [];
     Bun.connect({
       unix: path,
       socket: {
@@ -79,10 +79,10 @@ const call = (path: string, request: ControlRequest) =>
           socket.write(`${JSON.stringify(request)}\n`);
         },
         data(_socket, data) {
-          output += Buffer.from(data).toString('utf8');
+          chunks.push(Buffer.from(data));
         },
         close() {
-          resume(Effect.succeed(output));
+          resume(Effect.succeed(Buffer.concat(chunks).toString('utf8')));
         },
         error(_socket, error) {
           resume(Effect.fail(error));
@@ -163,6 +163,23 @@ describe('local control plane', () => {
               input: '{}',
             });
             yield* queue.settleOperation(sent, { state: 'landed', receipt: { number: 14 } });
+            yield* queue.recordArtifacts(enqueued.jobId, claimed?.attempts ?? 0, [
+              { path: 'report.md', state: 'retained', content: new TextEncoder().encode('# ok') },
+              { path: 'trace.bin', state: 'retained', content: new Uint8Array([0xff, 0x00]) },
+              {
+                path: 'bom.txt',
+                state: 'retained',
+                content: new Uint8Array([0xef, 0xbb, 0xbf, 0x68, 0x69]),
+              },
+              // Past the socket's send buffer, so the reply goes out in parts, and
+              // two-byte characters, so a part can end inside one.
+              {
+                path: 'run.log',
+                state: 'retained',
+                content: new TextEncoder().encode('é'.repeat(128 * 1024)),
+              },
+              { path: 'big.log', state: 'rejected', reason: 'too_large', bytes: 300_000 },
+            ]);
             yield* queue.complete(enqueued.jobId, claimed?.attempts ?? 0, '{}', {
               repository: work.repository,
               subjectNumber: work.subject.number,
@@ -208,6 +225,20 @@ describe('local control plane', () => {
           ],
         },
       });
+      // Retained bytes outlive the workspace, so this is the only place they read back.
+      expect(result.shown.result.artifacts).toEqual([
+        { attempt: 1, path: 'report.md', state: 'retained', bytes: 4, text: '# ok' },
+        { attempt: 1, path: 'trace.bin', state: 'retained', bytes: 2, base64: '/wA=' },
+        { attempt: 1, path: 'bom.txt', state: 'retained', bytes: 5, text: '\uFEFFhi' },
+        {
+          attempt: 1,
+          path: 'run.log',
+          state: 'retained',
+          bytes: 256 * 1024,
+          text: 'é'.repeat(128 * 1024),
+        },
+        { attempt: 1, path: 'big.log', state: 'rejected', reason: 'too_large', bytes: 300_000 },
+      ]);
       expect(result.mode).toBe(0o600);
     } finally {
       rmSync(directory, { recursive: true, force: true });

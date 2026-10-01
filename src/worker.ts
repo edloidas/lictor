@@ -1,6 +1,7 @@
-import { Clock, Effect, Exit, PartitionedSemaphore, Ref } from 'effect';
+import { Cause, Clock, Effect, Exit, PartitionedSemaphore, Ref } from 'effect';
 import { LictorConfig } from './config.ts';
-import { AgentExecutor, ExecutorError } from './executor/agent-executor.ts';
+import { describeCause } from './diagnostics.ts';
+import { AgentExecutor, ExecutorError, type ExecutorResult } from './executor/agent-executor.ts';
 import { CredentialHealth } from './github/credential-health.ts';
 import { grantedTools, grantNarrowing, intersectGrant, mintGrant } from './github/grant.ts';
 import { canonicalRepository, Policy, policyRefusal } from './policy.ts';
@@ -223,23 +224,58 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
       }
 
       const retainWorkspace = yield* Ref.make(false);
-      const execution = locks
-        .withPermits(
-          canonicalRepository(job.work.repository),
-          1,
-        )(
-          Effect.acquireUseRelease(
-            workspaces.acquire(
-              {
-                id: job.id,
-                repository: job.work.repository,
-                ...(ref === undefined ? {} : { ref }),
-              },
-              repositoryPolicy,
-            ),
-            (workspace) =>
-              executor
-                .execute(
+      const keepArtifacts = (result: ExecutorResult) =>
+        result.artifacts === undefined || result.artifacts.length === 0
+          ? Effect.void
+          : workspaces.collectArtifacts(job.id, result.artifacts).pipe(
+              Effect.flatMap((artifacts) => queue.recordArtifacts(job.id, job.attempts, artifacts)),
+              // Logged, never failed: the agent has run, and its outcome is
+              // worth more than what it left behind. The session is kept
+              // instead, so the paths the result names still exist somewhere.
+              Effect.catchAll((cause) =>
+                Effect.logWarning('Could not retain result artifacts').pipe(
+                  Effect.annotateLogs({
+                    job: job.id,
+                    attempt: job.attempts,
+                    error: describeCause(Cause.fail(cause)),
+                  }),
+                  Effect.zipRight(Ref.set(retainWorkspace, true)),
+                ),
+              ),
+            );
+      // ! The workspace is registered in this scope and deleted when it closes,
+      // ! after the outcome below commits. Deleting a clone takes seconds, and a
+      // ! kill inside them, before the commit, reruns an agent whose side
+      // ! effects already landed.
+      return yield* locks.withPermits(
+        canonicalRepository(job.work.repository),
+        1,
+      )(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const execution = Effect.acquireRelease(
+              workspaces.acquire(
+                {
+                  id: job.id,
+                  repository: job.work.repository,
+                  ...(ref === undefined ? {} : { ref }),
+                },
+                repositoryPolicy,
+              ),
+              (_workspace, exit) =>
+                Ref.get(retainWorkspace).pipe(
+                  Effect.flatMap((retain) =>
+                    workspaces.release(job.id, { retain: retain || Exit.isFailure(exit) }),
+                  ),
+                  Effect.catchAll((cause) =>
+                    Effect.logError('Workspace cleanup failed').pipe(
+                      Effect.annotateLogs({ job: job.id, error: cause.message }),
+                    ),
+                  ),
+                ),
+            ).pipe(
+              Effect.flatMap((workspace) =>
+                executor.execute(
                   job.work,
                   workspace.path,
                   grant.maxDurationMs,
@@ -247,173 +283,164 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
                   job.attempts,
                   job.workerId,
                   grant,
-                )
-                .pipe(
-                  // Quarantined for the post-mortem, not for a rerun: a retry
-                  // clones afresh, and this attempt is now the last one. The
-                  // pool is capped, so keeping every failure costs nothing the
-                  // sweep does not reclaim.
-                  Effect.tap((result) =>
-                    result.status === 'failed' ? Ref.set(retainWorkspace, true) : Effect.void,
-                  ),
                 ),
-            (_workspace, exit) =>
-              Ref.get(retainWorkspace)
-                .pipe(
-                  Effect.flatMap((retain) =>
-                    workspaces.release(job.id, { retain: retain || Exit.isFailure(exit) }),
-                  ),
-                )
-                .pipe(
-                  Effect.catchAll((cause) =>
-                    Effect.logError('Workspace cleanup failed').pipe(
-                      Effect.annotateLogs({ job: job.id, error: cause.message }),
-                    ),
-                  ),
-                ),
-          ),
-        )
-        .pipe(
-          Effect.mapError((cause) =>
-            cause instanceof ExecutorError
-              ? cause
-              : new ExecutorError({
-                  message:
-                    cause instanceof WorkspaceError
-                      ? cause.message
-                      : 'Could not prepare or clean up the isolated workspace',
-                  // A refused credential never heals and every retry pays another
-                  // clone; only transient workspace failures are worth an attempt.
-                  retryable: cause instanceof WorkspaceError ? cause.retryable !== false : true,
-                  ...(cause instanceof WorkspaceError && cause.retryAfterMs !== undefined
-                    ? { retryAfterMs: cause.retryAfterMs }
-                    : {}),
-                  cause,
+              ),
+              // Quarantined for the post-mortem, not for a rerun: a retry
+              // clones afresh, and this attempt is now the last one. The pool
+              // is capped, so keeping every failure costs nothing the sweep
+              // does not reclaim.
+              Effect.tap((result) =>
+                result.status === 'failed' ? Ref.set(retainWorkspace, true) : Effect.void,
+              ),
+              // Inside the race, so the lease is still renewed while it reads.
+              Effect.tap(keepArtifacts),
+              Effect.mapError((cause) =>
+                cause instanceof ExecutorError
+                  ? cause
+                  : new ExecutorError({
+                      message:
+                        cause instanceof WorkspaceError
+                          ? cause.message
+                          : 'Could not prepare or clean up the isolated workspace',
+                      // A refused credential never heals and every retry pays another
+                      // clone; only transient workspace failures are worth an attempt.
+                      retryable: cause instanceof WorkspaceError ? cause.retryable !== false : true,
+                      ...(cause instanceof WorkspaceError && cause.retryAfterMs !== undefined
+                        ? { retryAfterMs: cause.retryAfterMs }
+                        : {}),
+                      cause,
+                    }),
+              ),
+            );
+            const result = yield* Effect.either(Effect.raceFirst(execution, keepLease));
+            // Git classifies a refused credential from stderr prose; latch the
+            // daemon-wide breaker here so nothing claims while it is dead.
+            if (
+              result._tag === 'Left' &&
+              result.left.cause instanceof WorkspaceError &&
+              result.left.cause.code === 'WORKSPACE_CREDENTIAL_REJECTED'
+            ) {
+              yield* health.suspend;
+            }
+            // A failed execution's session is the post-mortem: the finalizer sees
+            // the outcome write's exit, which succeeds here.
+            if (result._tag === 'Left') yield* Ref.set(retainWorkspace, true);
+            if (result._tag === 'Right') {
+              const finishedAt = yield* Clock.currentTimeMillis;
+              if (result.right.status === 'completed') {
+                yield* queue.complete(job.id, job.attempts, JSON.stringify(result.right), {
+                  repository: job.work.repository,
+                  subjectNumber: job.work.subject.number,
+                  outcome: 'completed',
+                  note: result.right.summary,
+                  ...deliveryContext,
+                });
+                yield* Effect.logInfo('Completed queued work').pipe(
+                  Effect.annotateLogs({
+                    job: job.id,
+                    attempt: job.attempts,
+                    status: result.right.status,
+                    durationMs: finishedAt - claimedAt,
+                  }),
+                );
+                return true;
+              }
+              // ! Parked only where the agent actually published its question: the
+              // ! daemon sends nothing, so an unpublished one would sit invisible on
+              // ! the thread and swallow the next trusted reply as its answer —
+              // ! resuming this job on input meant as new work.
+              const askedAt =
+                result.right.status === 'needs_input'
+                  ? yield* queue.lastCommentAt(job.id, job.work.subject.number, claimedAt)
+                  : undefined;
+              if (result.right.status === 'needs_input' && attemptsLeft && askedAt !== undefined) {
+                const answerers = answerersFor(
+                  job.work.sender,
+                  repositoryPolicy.trustedSenders,
+                  config.expectedLogin,
+                );
+                yield* queue.park({
+                  jobId: job.id,
+                  attemptNumber: job.attempts,
+                  repository: job.work.repository,
+                  subjectNumber: job.work.subject.number,
+                  question: result.right.summary,
+                  answerers,
+                  askedAt,
+                  expiresAt: finishedAt + policy.answerExpiryMs,
+                });
+                yield* Effect.logInfo('Parked queued work pending an answer').pipe(
+                  Effect.annotateLogs({
+                    job: job.id,
+                    attempt: job.attempts,
+                    status: result.right.status,
+                    durationMs: finishedAt - claimedAt,
+                    answerers: answerers.join(','),
+                  }),
+                );
+                return true;
+              }
+              // ! Every status the agent returns is terminal, `failed` included. A
+              // ! retry is earned by an observed cause — an exit code, a signature in
+              // ! stderr, a refused credential — and those all arrive on the failure
+              // ! branch below with `retryable` computed from evidence. `failed` here
+              // ! is only the agent's opinion of a run whose input the next attempt
+              // ! would reproduce byte for byte, and scheduling one costs the thread
+              // ! its signal: `queue.fail` withholds the outbox row until an attempt
+              // ! is final, so a mislabelled capability denial leaves the
+              // ! acknowledgement unresolved for the whole budget.
+              //
+              // A `needs_input` reaching here was never published, or has no attempt
+              // left to answer it with. Either way nothing is waiting on it.
+              const outcome =
+                result.right.status === 'needs_input' ? 'rejected' : result.right.status;
+              yield* queue.fail(job.id, job.attempts, result.right.summary, undefined, outcome, {
+                repository: job.work.repository,
+                subjectNumber: job.work.subject.number,
+                outcome,
+                note: result.right.summary,
+                ...deliveryContext,
+              });
+              // `summary` is parsed out of Codex stdout and stays in the database:
+              // logging it would echo whatever the repository made the agent say.
+              yield* Effect.logWarning('Queued work did not complete').pipe(
+                Effect.annotateLogs({
+                  job: job.id,
+                  attempt: job.attempts,
+                  status: result.right.status,
+                  durationMs: finishedAt - claimedAt,
                 }),
-          ),
-        );
-      const result = yield* Effect.either(Effect.raceFirst(execution, keepLease));
-      // Git classifies a refused credential from stderr prose; latch the
-      // daemon-wide breaker here so nothing claims while it is dead.
-      if (
-        result._tag === 'Left' &&
-        result.left.cause instanceof WorkspaceError &&
-        result.left.cause.code === 'WORKSPACE_CREDENTIAL_REJECTED'
-      ) {
-        yield* health.suspend;
-      }
-      if (result._tag === 'Right') {
-        const finishedAt = yield* Clock.currentTimeMillis;
-        if (result.right.status === 'completed') {
-          yield* queue.complete(job.id, job.attempts, JSON.stringify(result.right), {
-            repository: job.work.repository,
-            subjectNumber: job.work.subject.number,
-            outcome: 'completed',
-            note: result.right.summary,
-            ...deliveryContext,
-          });
-          yield* Effect.logInfo('Completed queued work').pipe(
-            Effect.annotateLogs({
-              job: job.id,
-              attempt: job.attempts,
-              status: result.right.status,
-              durationMs: finishedAt - claimedAt,
-            }),
-          );
-          return true;
-        }
-        // ! Parked only where the agent actually published its question: the
-        // ! daemon sends nothing, so an unpublished one would sit invisible on
-        // ! the thread and swallow the next trusted reply as its answer —
-        // ! resuming this job on input meant as new work.
-        const askedAt =
-          result.right.status === 'needs_input'
-            ? yield* queue.lastCommentAt(job.id, job.work.subject.number, claimedAt)
-            : undefined;
-        if (result.right.status === 'needs_input' && attemptsLeft && askedAt !== undefined) {
-          const answerers = answerersFor(
-            job.work.sender,
-            repositoryPolicy.trustedSenders,
-            config.expectedLogin,
-          );
-          yield* queue.park({
-            jobId: job.id,
-            attemptNumber: job.attempts,
-            repository: job.work.repository,
-            subjectNumber: job.work.subject.number,
-            question: result.right.summary,
-            answerers,
-            askedAt,
-            expiresAt: finishedAt + policy.answerExpiryMs,
-          });
-          yield* Effect.logInfo('Parked queued work pending an answer').pipe(
-            Effect.annotateLogs({
-              job: job.id,
-              attempt: job.attempts,
-              status: result.right.status,
-              durationMs: finishedAt - claimedAt,
-              answerers: answerers.join(','),
-            }),
-          );
-          return true;
-        }
-        // ! Every status the agent returns is terminal, `failed` included. A
-        // ! retry is earned by an observed cause — an exit code, a signature in
-        // ! stderr, a refused credential — and those all arrive on the failure
-        // ! branch below with `retryable` computed from evidence. `failed` here
-        // ! is only the agent's opinion of a run whose input the next attempt
-        // ! would reproduce byte for byte, and scheduling one costs the thread
-        // ! its signal: `queue.fail` withholds the outbox row until an attempt
-        // ! is final, so a mislabelled capability denial leaves the
-        // ! acknowledgement unresolved for the whole budget.
-        //
-        // A `needs_input` reaching here was never published, or has no attempt
-        // left to answer it with. Either way nothing is waiting on it.
-        const outcome = result.right.status === 'needs_input' ? 'rejected' : result.right.status;
-        yield* queue.fail(job.id, job.attempts, result.right.summary, undefined, outcome, {
-          repository: job.work.repository,
-          subjectNumber: job.work.subject.number,
-          outcome,
-          note: result.right.summary,
-          ...deliveryContext,
-        });
-        // `summary` is parsed out of Codex stdout and stays in the database:
-        // logging it would echo whatever the repository made the agent say.
-        yield* Effect.logWarning('Queued work did not complete').pipe(
-          Effect.annotateLogs({
-            job: job.id,
-            attempt: job.attempts,
-            status: result.right.status,
-            durationMs: finishedAt - claimedAt,
-          }),
-        );
-        return true;
-      }
+              );
+              return true;
+            }
 
-      const retry = result.left.retryable && job.attemptsSpent < config.workerMaxAttempts;
-      const now = yield* Clock.currentTimeMillis;
-      const retryAt = retry
-        ? now +
-          (result.left.retryAfterMs ??
-            config.workerRetryBaseMs * 2 ** Math.max(0, job.attemptsSpent - 1))
-        : undefined;
-      yield* queue.fail(job.id, job.attempts, result.left.message, retryAt, 'failed', {
-        repository: job.work.repository,
-        subjectNumber: job.work.subject.number,
-        outcome: 'failed',
-        ...deliveryContext,
-      });
-      yield* Effect.logWarning(retry ? 'Queued work will retry' : 'Queued work failed').pipe(
-        Effect.annotateLogs({
-          job: job.id,
-          attempt: job.attempts,
-          error: result.left.message,
-          errorCode: result.left.retryable ? 'EXECUTOR_RETRYABLE' : 'EXECUTOR_FAILED',
-          durationMs: now - claimedAt,
-          ...(retryAt === undefined ? {} : { retryAt }),
-        }),
+            const retry = result.left.retryable && job.attemptsSpent < config.workerMaxAttempts;
+            const now = yield* Clock.currentTimeMillis;
+            const retryAt = retry
+              ? now +
+                (result.left.retryAfterMs ??
+                  config.workerRetryBaseMs * 2 ** Math.max(0, job.attemptsSpent - 1))
+              : undefined;
+            yield* queue.fail(job.id, job.attempts, result.left.message, retryAt, 'failed', {
+              repository: job.work.repository,
+              subjectNumber: job.work.subject.number,
+              outcome: 'failed',
+              ...deliveryContext,
+            });
+            yield* Effect.logWarning(retry ? 'Queued work will retry' : 'Queued work failed').pipe(
+              Effect.annotateLogs({
+                job: job.id,
+                attempt: job.attempts,
+                error: result.left.message,
+                errorCode: result.left.retryable ? 'EXECUTOR_RETRYABLE' : 'EXECUTOR_FAILED',
+                durationMs: now - claimedAt,
+                ...(retryAt === undefined ? {} : { retryAt }),
+              }),
+            );
+            return true;
+          }),
+        ),
       );
-      return true;
     });
 
     const run = Effect.forever(

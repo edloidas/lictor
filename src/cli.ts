@@ -18,7 +18,9 @@ const Main = Effect.gen(function* () {
     });
   const config = yield* LictorConfig;
   const response = yield* Effect.async<string, CliError>((resume) => {
-    let output = '';
+    // Bytes, decoded once at the end: a reply arrives in chunks, and a chunk
+    // can end inside a multi-byte character.
+    const chunks: Buffer[] = [];
     Bun.connect({
       unix: config.controlSocketPath,
       socket: {
@@ -26,10 +28,10 @@ const Main = Effect.gen(function* () {
           socket.write(`${JSON.stringify({ command, args })}\n`);
         },
         data(_socket, data) {
-          output += Buffer.from(data).toString('utf8');
+          chunks.push(Buffer.from(data));
         },
         close() {
-          resume(Effect.succeed(output.trim()));
+          resume(Effect.succeed(Buffer.concat(chunks).toString('utf8').trim()));
         },
         error(_socket, cause) {
           resume(

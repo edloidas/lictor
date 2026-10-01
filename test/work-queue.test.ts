@@ -17,7 +17,12 @@ import {
 import { LictorConfig, stateDirOf } from '../src/config.ts';
 import type { Grant } from '../src/github/grant.ts';
 import { processAlive } from '../src/process-liveness.ts';
-import { claimOwnerRow, QueueFull, WorkQueue } from '../src/queue/work-queue.ts';
+import {
+  type CollectedArtifact,
+  claimOwnerRow,
+  QueueFull,
+  WorkQueue,
+} from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
 
 /**
@@ -4022,5 +4027,167 @@ describe('WorkQueue operations', () => {
       }),
     );
     expect(result).toHaveLength(0);
+  });
+});
+
+describe('WorkQueue artifacts', () => {
+  const report: CollectedArtifact = {
+    path: 'report.md',
+    state: 'retained',
+    content: new TextEncoder().encode('# findings'),
+  };
+  const refused: CollectedArtifact = {
+    path: 'big.log',
+    state: 'rejected',
+    reason: 'too_large',
+    bytes: 300_000,
+  };
+
+  it('keeps what an attempt retained, bytes intact, once it reaches an outcome', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('artifacts'));
+        const claimed = yield* queue.claim;
+        yield* queue.recordArtifacts(jobId, claimed?.attempts ?? 1, [report, refused]);
+        yield* queue.complete(jobId, claimed?.attempts ?? 1, '{}');
+        return yield* queue.artifactsFor(jobId);
+      }),
+    );
+
+    expect(result).toEqual([
+      { ...report, attempt: 1 },
+      { ...refused, attempt: 1 },
+    ]);
+  });
+
+  it('records nothing for an attempt that is no longer running', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('stale-artifacts'));
+        const claimed = yield* queue.claim;
+        yield* queue.complete(jobId, claimed?.attempts ?? 1, '{}');
+        const recorded = yield* Effect.either(
+          queue.recordArtifacts(jobId, claimed?.attempts ?? 1, [report]),
+        );
+        return { recorded, artifacts: yield* queue.artifactsFor(jobId) };
+      }),
+    );
+
+    expect(result.recorded._tag).toBe('Left');
+    expect(result.artifacts).toEqual([]);
+  });
+
+  it('hides what an attempt recorded before it lost its lease', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('lost-artifacts'));
+        const first = yield* queue.claim;
+        yield* queue.recordArtifacts(jobId, first?.attempts ?? 1, [report]);
+        yield* queue.recoverStale((first?.leaseExpiresAt ?? 0) + 1);
+        const second = yield* queue.claim;
+        yield* queue.recordArtifacts(jobId, second?.attempts ?? 2, [refused]);
+        yield* queue.complete(jobId, second?.attempts ?? 2, '{}');
+        return yield* queue.artifactsFor(jobId);
+      }),
+    );
+
+    expect(result).toEqual([{ ...refused, attempt: 2 }]);
+  });
+
+  it('prunes artifacts with the job they belong to', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            const pruned = yield* queue.enqueue(work('pruned-artifacts'));
+            const first = yield* queue.claim;
+            yield* queue.recordArtifacts(pruned.jobId, first?.attempts ?? 1, [report]);
+            yield* queue.complete(pruned.jobId, first?.attempts ?? 1, '{}');
+            // Still running, so retention never reaches it.
+            const kept = yield* queue.enqueue(work('kept-artifacts'));
+            const second = yield* queue.claim;
+            yield* queue.recordArtifacts(kept.jobId, second?.attempts ?? 1, [report]);
+            yield* queue.maintenance(Date.now() + 1, Date.now() + 1);
+            return kept.jobId;
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      ).then((keptJobId) => {
+        const database = new Database(path);
+        const left = database.query('SELECT job_id AS jobId FROM artifacts').all();
+        database.close();
+        expect(left).toEqual([{ jobId: keptJobId }]);
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('sweeps what an interrupted attempt staged without waiting for the job', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      const jobId = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            const { jobId } = yield* queue.enqueue(work('interrupted-artifacts'));
+            const first = yield* queue.claim;
+            yield* queue.recordArtifacts(jobId, first?.attempts ?? 1, [report]);
+            yield* queue.recoverStale((first?.leaseExpiresAt ?? 0) + 1);
+            const second = yield* queue.claim;
+            yield* queue.recordArtifacts(jobId, second?.attempts ?? 2, [refused]);
+            yield* queue.maintenance(0, 0);
+            return jobId;
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+      const database = new Database(path);
+      const left = database.query('SELECT attempt FROM artifacts WHERE job_id = ?').all(jobId) as {
+        attempt: number;
+      }[];
+      database.close();
+      // The running second attempt keeps its row; the interrupted first loses its own.
+      expect(left).toEqual([{ attempt: 2 }]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('creates the table on a database stamped current without it', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.flatMap(WorkQueue, (queue) => queue.counts).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+      const database = new Database(path);
+      database.exec('DROP TABLE artifacts');
+      database.close();
+
+      const result = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const queue = yield* WorkQueue;
+            const { jobId } = yield* queue.enqueue(work('upgraded-artifacts'));
+            const claimed = yield* queue.claim;
+            yield* queue.recordArtifacts(jobId, claimed?.attempts ?? 1, [report]);
+            yield* queue.complete(jobId, claimed?.attempts ?? 1, '{}');
+            return yield* queue.artifactsFor(jobId);
+          }).pipe(Effect.provide(queueLayer(path))),
+        ),
+      );
+
+      expect(result).toEqual([{ ...report, attempt: 1 }]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

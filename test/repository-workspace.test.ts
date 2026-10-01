@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
@@ -879,6 +880,155 @@ describe('RepositoryWorkspace', () => {
         expect(failedWith(exit).code).toBe('WORKSPACE_DISK_PROBE_FAILED');
         expect(String(exit)).not.toContain('WORKSPACE_DISK_EXHAUSTED');
       });
+    });
+  });
+});
+
+describe('RepositoryWorkspace.collectArtifacts', () => {
+  const collect = (home: string, claimed: readonly string[]) =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const manager = yield* RepositoryWorkspace;
+        return yield* manager.collectArtifacts(10, claimed);
+      }).pipe(Effect.provide(service(home, () => Effect.die('unused')))),
+    );
+
+  /** What each claimed path came to, without the bytes. */
+  const verdicts = (collected: Awaited<ReturnType<typeof collect>>) =>
+    collected.map((artifact) =>
+      artifact.state === 'retained'
+        ? { path: artifact.path, state: artifact.state, bytes: artifact.content.byteLength }
+        : { path: artifact.path, state: artifact.state, reason: artifact.reason },
+    );
+
+  it('reads a named file out of the session under its normalized path', async () => {
+    await withHome(async (home) => {
+      mkdirSync(join(sessionPath(home, 10), 'out'), { recursive: true });
+      writeFileSync(join(sessionPath(home, 10), 'out', 'report.md'), '# findings');
+
+      const collected = await collect(home, ['./out//report.md']);
+
+      expect(collected).toHaveLength(1);
+      const [artifact] = collected;
+      expect(artifact?.path).toBe('out/report.md');
+      expect(
+        artifact?.state === 'retained' ? new TextDecoder().decode(artifact.content) : undefined,
+      ).toBe('# findings');
+    });
+  });
+
+  it('refuses a path that could leave the session, without touching the disk', async () => {
+    await withHome(async (home) => {
+      mkdirSync(sessionPath(home, 10), { recursive: true });
+      writeFileSync(join(home, 'secret'), 'daemon state');
+
+      const collected = await collect(home, ['', '/etc/passwd', '../../secret', 'a/../b', 'x\0y']);
+
+      expect(collected.map((artifact) => artifact.state)).toEqual(Array(5).fill('rejected'));
+      expect(
+        collected.map((artifact) => (artifact.state === 'rejected' ? artifact.reason : '')),
+      ).toEqual(Array(5).fill('invalid_path'));
+    });
+  });
+
+  it('refuses a symlink at the leaf and anywhere above it', async () => {
+    await withHome(async (home) => {
+      const session = sessionPath(home, 10);
+      mkdirSync(join(session, 'real'), { recursive: true });
+      writeFileSync(join(home, 'secret'), 'daemon state');
+      writeFileSync(join(session, 'real', 'inside.md'), 'fine');
+      symlinkSync(join(home, 'secret'), join(session, 'leaf.md'));
+      symlinkSync(join(session, 'real'), join(session, 'linked'));
+
+      const collected = await collect(home, ['leaf.md', 'linked/inside.md', 'real/inside.md']);
+
+      expect(verdicts(collected)).toEqual([
+        { path: 'leaf.md', state: 'rejected', reason: 'symlink' },
+        { path: 'linked/inside.md', state: 'rejected', reason: 'symlink' },
+        { path: 'real/inside.md', state: 'retained', bytes: 4 },
+      ]);
+    });
+  });
+
+  it('refuses a FIFO and a directory instead of reading them', async () => {
+    await withHome(async (home) => {
+      const session = sessionPath(home, 10);
+      mkdirSync(join(session, 'dir'), { recursive: true });
+      expect(Bun.spawnSync(['mkfifo', join(session, 'pipe')]).exitCode).toBe(0);
+
+      const collected = await collect(home, ['pipe', 'dir']);
+
+      expect(verdicts(collected)).toEqual([
+        { path: 'pipe', state: 'rejected', reason: 'not_regular' },
+        { path: 'dir', state: 'rejected', reason: 'not_regular' },
+      ]);
+    });
+  });
+
+  it('records a missing file, and one under a file, as missing', async () => {
+    await withHome(async (home) => {
+      mkdirSync(sessionPath(home, 10), { recursive: true });
+      writeFileSync(join(sessionPath(home, 10), 'plain'), 'x');
+
+      const collected = await collect(home, ['absent.md', 'plain/child.md']);
+
+      expect(verdicts(collected)).toEqual([
+        { path: 'absent.md', state: 'rejected', reason: 'missing' },
+        { path: 'plain/child.md', state: 'rejected', reason: 'missing' },
+      ]);
+    });
+  });
+
+  it('refuses a file over the per-file limit and records its size', async () => {
+    await withHome(async (home) => {
+      mkdirSync(sessionPath(home, 10), { recursive: true });
+      writeFileSync(join(sessionPath(home, 10), 'big.log'), Buffer.alloc(256 * 1024 + 1));
+
+      const [artifact] = await collect(home, ['big.log']);
+
+      expect(artifact).toEqual({
+        path: 'big.log',
+        state: 'rejected',
+        reason: 'too_large',
+        bytes: 256 * 1024 + 1,
+      });
+    });
+  });
+
+  it('keeps files in claim order until the total budget runs out', async () => {
+    await withHome(async (home) => {
+      mkdirSync(sessionPath(home, 10), { recursive: true });
+      const names = ['a', 'b', 'c', 'd', 'e'];
+      for (const name of names) {
+        writeFileSync(join(sessionPath(home, 10), name), Buffer.alloc(256 * 1024));
+      }
+
+      const collected = await collect(home, names);
+
+      expect(collected.map((artifact) => artifact.state)).toEqual([
+        'retained',
+        'retained',
+        'retained',
+        'retained',
+        'rejected',
+      ]);
+      expect(collected[4]).toEqual({
+        path: 'e',
+        state: 'rejected',
+        reason: 'over_budget',
+        bytes: 256 * 1024,
+      });
+    });
+  });
+
+  it('reads a path named twice once', async () => {
+    await withHome(async (home) => {
+      mkdirSync(sessionPath(home, 10), { recursive: true });
+      writeFileSync(join(sessionPath(home, 10), 'report.md'), 'x');
+
+      const collected = await collect(home, ['report.md', './report.md']);
+
+      expect(collected.map((artifact) => artifact.path)).toEqual(['report.md']);
     });
   });
 });

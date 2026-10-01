@@ -179,6 +179,7 @@ describe('notification-to-agent pipeline', () => {
               acquire: () => Effect.succeed({ path: process.cwd() }),
               release: () => Effect.void,
               sweep: () => Effect.void,
+              collectArtifacts: () => Effect.succeed([]),
             }),
           );
           const Services = Layer.mergeAll(
