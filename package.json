@@ -39,7 +39,7 @@
   "dependencies": {
     "@effect/platform": "^0.97.1",
     "@effect/platform-bun": "^0.91.2",
-    "effect": "^3.22.1"
+    "effect": "^3.22.2"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.11",
