@@ -667,6 +667,106 @@ describe('WorkQueue', () => {
     expect(result.after).toBeUndefined();
   });
 
+  it('refuses to park a second question on a subject, and writes nothing for it', async () => {
+    const parkOn = (item: WorkItem) =>
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(item);
+        const claimed = yield* queue.claim;
+        const questionId = yield* queue.park({
+          jobId,
+          attemptNumber: claimed?.attempts ?? 1,
+          repository: item.repository,
+          subjectNumber: item.subject.number,
+          question: 'which branch?',
+          answerers: ['edloidas'],
+          askedAt: Date.now(),
+          expiresAt: Date.now() + 3_600_000,
+        });
+        return { jobId, questionId, job: yield* queue.job(jobId) };
+      });
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const first = yield* parkOn(work('first'));
+        // Case folded like every other subject match: GitHub hands back either.
+        const second = yield* parkOn({
+          ...work('second'),
+          repository: 'EDLOIDAS/Lictor',
+        });
+        const otherNumber = yield* parkOn({
+          ...work('other-number'),
+          subject: { ...work('x').subject, number: 18 },
+        });
+        const otherKind = yield* parkOn({
+          ...work('other-kind'),
+          subject: { ...work('x').subject, kind: 'pull_request' },
+        });
+        const otherRepo = yield* parkOn({ ...work('other-repo'), repository: 'edloidas/other' });
+        return {
+          first,
+          second,
+          otherNumber,
+          otherKind,
+          otherRepo,
+          waiting: yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17),
+        };
+      }),
+    );
+
+    expect(result.first.questionId).toBeString();
+    expect(result.second.questionId).toBeUndefined();
+    // Still the running row the claim left: the caller finishes it.
+    expect(result.second.job?.status).toBe('running');
+    expect(result.second.job?.questionId).toBeUndefined();
+    expect(result.waiting?.jobId).toBe(result.first.jobId);
+    expect(result.otherNumber.questionId).toBeString();
+    expect(result.otherKind.questionId).toBeString();
+    expect(result.otherRepo.questionId).toBeString();
+  });
+
+  it('retires an expired question the sweep has not reached rather than park beside it', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const parked = [] as { jobId: number; questionId: string | undefined }[];
+        for (const [deliveryId, expiresAt] of [
+          ['expired', Date.now() - 5_000],
+          ['live', Date.now() + 3_600_000],
+        ] as const) {
+          const { jobId } = yield* queue.enqueue(work(deliveryId));
+          const claimed = yield* queue.claim;
+          const questionId = yield* queue.park({
+            jobId,
+            attemptNumber: claimed?.attempts ?? 1,
+            repository: 'edloidas/lictor',
+            subjectNumber: 17,
+            question: 'which branch?',
+            answerers: ['edloidas'],
+            askedAt: Date.now(),
+            expiresAt,
+          });
+          parked.push({ jobId, questionId });
+        }
+        const [expired, live] = parked;
+        return {
+          live,
+          expired: yield* queue.job(expired?.jobId ?? 0),
+          expiredMessages: yield* queue.outboxFor(expired?.jobId ?? 0),
+          waiting: yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17),
+        };
+      }),
+    );
+
+    expect(result.live?.questionId).toBeString();
+    expect(result.waiting?.questionId).toBe(result.live?.questionId as string);
+    // Failed as the sweep would have failed it, owing the thread the same reaction.
+    expect(result.expired?.status).toBe('failed');
+    expect(result.expired?.outcome).toBe('unanswered');
+    expect(result.expired?.questionId).toBeUndefined();
+    expect(result.expiredMessages.map((message) => message.outcome)).toEqual(['unanswered']);
+  });
+
   it('makes a parked question answerable at once, owing the thread nothing', async () => {
     // `askedAt` is the whole proof the question was shown, so the row is
     // answerable the moment it is written.

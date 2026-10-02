@@ -943,6 +943,60 @@ describe('AgentExecutor', () => {
     );
   });
 
+  it('withholds needs_input from a job whose subject already waits on a question', async () => {
+    const databasePath = tempStatePath();
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          // Live on 17; on 19, expired but not yet swept.
+          for (const [number, expiresAt] of [
+            [17, Date.now() + 3_600_000],
+            [19, Date.now() - 5_000],
+          ] as const) {
+            const { jobId } = yield* queue.enqueue({
+              ...work,
+              deliveryId: `parked-${number}`,
+              interactionId: `parked-${number}`,
+              repository: 'EDLOIDAS/Lictor',
+              subject: { ...work.subject, number },
+            });
+            const claimed = yield* queue.claim;
+            yield* queue.park({
+              jobId,
+              attemptNumber: claimed?.attempts ?? 1,
+              repository: 'EDLOIDAS/Lictor',
+              subjectNumber: number,
+              question: 'which branch?',
+              answerers: ['edloidas'],
+              askedAt: Date.now(),
+              expiresAt,
+            });
+          }
+        }),
+      ).pipe(
+        Effect.provide(WorkQueue.DefaultWithoutDependencies),
+        Effect.provideService(LictorConfig, config('codex', databasePath)),
+      ),
+    );
+
+    const behind = await captureInput('codex', databasePath);
+    const elsewhere = await captureInput('codex', databasePath, undefined, {
+      ...work,
+      subject: { ...work.subject, number: 18 },
+    });
+    const expired = await captureInput('codex', databasePath, undefined, {
+      ...work,
+      subject: { ...work.subject, number: 19 },
+    });
+
+    expect(expired).toContain('`needs_input` — exceptional');
+    expect(behind).toContain('`needs_input` — not available to this run.');
+    expect(behind).not.toContain('`needs_input` — exceptional');
+    expect(elsewhere).toContain('`needs_input` — exceptional');
+    expect(elsewhere).not.toContain('not available to this run');
+  });
+
   it('passes the prompt to Codex as stdin in a fixed argv and environment', async () => {
     const statePath = tempStatePath();
     const request = await Effect.runPromise(

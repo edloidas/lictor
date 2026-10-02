@@ -359,7 +359,7 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
                   repositoryPolicy.trustedSenders,
                   config.expectedLogin,
                 );
-                yield* queue.park({
+                const questionId = yield* queue.park({
                   jobId: job.id,
                   attemptNumber: job.attempts,
                   repository: job.work.repository,
@@ -369,16 +369,21 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
                   askedAt,
                   expiresAt: finishedAt + policy.answerExpiryMs,
                 });
-                yield* Effect.logInfo('Parked queued work pending an answer').pipe(
-                  Effect.annotateLogs({
-                    job: job.id,
-                    attempt: job.attempts,
-                    status: result.right.status,
-                    durationMs: finishedAt - claimedAt,
-                    answerers: answerers.join(','),
-                  }),
-                );
-                return true;
+                if (questionId !== undefined) {
+                  yield* Effect.logInfo('Parked queued work pending an answer').pipe(
+                    Effect.annotateLogs({
+                      job: job.id,
+                      attempt: job.attempts,
+                      status: result.right.status,
+                      durationMs: finishedAt - claimedAt,
+                      answerers: answerers.join(','),
+                    }),
+                  );
+                  return true;
+                }
+                yield* Effect.logInfo(
+                  'Refused to park behind another question on the subject',
+                ).pipe(Effect.annotateLogs({ job: job.id, attempt: job.attempts }));
               }
               // ! Every status the agent returns is terminal, `failed` included. A
               // ! retry is earned by an observed cause — an exit code, a signature in
@@ -390,8 +395,9 @@ export class Worker extends Effect.Service<Worker>()('Worker', {
               // ! is final, so a mislabelled capability denial leaves the
               // ! acknowledgement unresolved for the whole budget.
               //
-              // A `needs_input` reaching here was never published, or has no attempt
-              // left to answer it with. Either way nothing is waiting on it.
+              // A `needs_input` reaching here was never published, has no attempt
+              // left to answer it with, or would share its subject with a question
+              // already waiting. Either way nothing is waiting on it.
               const outcome =
                 result.right.status === 'needs_input' ? 'rejected' : result.right.status;
               yield* queue.fail(job.id, job.attempts, result.right.summary, undefined, outcome, {
