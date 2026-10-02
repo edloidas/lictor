@@ -183,6 +183,20 @@ const COUNTED_JOBS_WHERE = `status IN ('pending', 'retry', 'interrupted', 'runni
                  AND question_id IS NULL AND ${UNHELD_JOBS_WHERE}`;
 
 /**
+ * A job waiting on a question the thread was shown. Shared by `pendingQuestion`,
+ * which hands it to qualification, and `park`, which refuses a second one on
+ * the same subject — a reply names no question, so two on one subject leave
+ * every answer routed to whichever the lookup returns.
+ */
+const ASKED_QUESTION_WHERE = `j.status = 'pending' AND j.question_id IS NOT NULL
+               AND j.question_asked_at IS NOT NULL AND json_valid(j.payload)`;
+
+/** Fails a parked question as `unanswered`; binds `failed_at`, then `updated_at`. */
+const UNANSWERED_SET = `status = 'failed', outcome = 'unanswered', failed_at = ?, updated_at = ?,
+                 hold_expires_at = NULL, question_id = NULL, question_answerers = NULL,
+                 question_asked_at = NULL, last_error = 'answer expired'`;
+
+/**
  * `sent` is the intent alone. While its attempt runs the request may still be
  * in flight; after, it is exactly as unknown as `unresolved` — which is what an
  * answer that settles nothing records, a 5xx or a dropped connection.
@@ -1940,6 +1954,9 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
      * ! The attempt that asked is spent and stays spent. Waiting costs no
      * ! further attempt, but the agent ran to produce the question — refunding
      * ! it would let one job ask without bound.
+     *
+     * `undefined`, parking nothing, when another job on the subject still
+     * waits on a live question: the caller finishes this one instead.
      */
     const park = (input: {
       readonly jobId: number;
@@ -1963,7 +1980,25 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         return yield* attempt('park', () =>
-          database.transaction(() => {
+          database.transaction((): string | undefined => {
+            const sameSubject = `SELECT j.id FROM jobs self, jobs j
+                 WHERE self.id = ? AND json_valid(self.payload) AND j.id != self.id
+                   AND ${ASKED_QUESTION_WHERE}
+                   AND lower(json_extract(j.payload, '$.repository'))
+                     = lower(json_extract(self.payload, '$.repository'))
+                   AND json_extract(j.payload, '$.subject.kind')
+                     = json_extract(self.payload, '$.subject.kind')
+                   AND json_extract(j.payload, '$.subject.number')
+                     = json_extract(self.payload, '$.subject.number')`;
+            // An expired question the sweep has not reached is retired here, as
+            // the sweep would, rather than left answerable beside this one.
+            const expiredWhere = `id IN (${sameSubject} AND j.hold_expires_at < ?)`;
+            insertOutboxFromJobs('unanswered', expiredWhere, [input.jobId, now], now);
+            database
+              .query(`UPDATE jobs SET ${UNANSWERED_SET} WHERE ${expiredWhere}`)
+              .run(now, now, input.jobId, now);
+            const contested = database.query(`${sameSubject} LIMIT 1`).get(input.jobId);
+            if (contested != null) return undefined;
             // Minted here: the daemon sends nothing for a parked job, so no
             // message id exists for a resumed answer to name the question by.
             const questionId = randomUUID();
@@ -2061,11 +2096,10 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         const row = database
           .query(
             `SELECT j.id AS jobId, j.question_id AS questionId,
-               j.question_answerers AS answerers, j.question_asked_at AS askedAt
+               j.question_answerers AS answerers, j.question_asked_at AS askedAt,
+               j.hold_expires_at AS expiresAt
              FROM jobs j
-             WHERE j.status = 'pending' AND j.question_id IS NOT NULL
-               AND j.question_asked_at IS NOT NULL
-               AND json_valid(j.payload)
+             WHERE ${ASKED_QUESTION_WHERE}
                AND lower(json_extract(j.payload, '$.repository')) = ?
                AND json_extract(j.payload, '$.subject.kind') = ?
                AND json_extract(j.payload, '$.subject.number') = ?
@@ -2077,6 +2111,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               readonly questionId: string;
               readonly answerers: string | null;
               readonly askedAt: number;
+              readonly expiresAt: number | null;
             }
           | null
           | undefined;
@@ -2087,6 +2122,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
               questionId: row.questionId,
               answerers: decodeAnswerers(row.answerers),
               askedAt: row.askedAt,
+              ...(row.expiresAt == null ? {} : { expiresAt: row.expiresAt }),
             };
       });
 
@@ -2237,14 +2273,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
         const unanswered = database.transaction(() => {
           insertOutboxFromJobs('unanswered', unansweredWhere, [heldBefore], now);
           return database
-            .query(
-              `UPDATE jobs
-             SET status = 'failed', outcome = 'unanswered', failed_at = ?, updated_at = ?,
-                 hold_expires_at = NULL, question_id = NULL, question_answerers = NULL,
-                 question_asked_at = NULL,
-                 last_error = 'answer expired'
-             WHERE ${unansweredWhere}`,
-            )
+            .query(`UPDATE jobs SET ${UNANSWERED_SET} WHERE ${unansweredWhere}`)
             .run(now, now, heldBefore).changes;
         })();
         database

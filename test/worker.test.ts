@@ -900,6 +900,51 @@ describe('Worker.runOnce', () => {
     expect(result.messages.map((message) => message.outcome)).toEqual(['rejected']);
   });
 
+  it('finishes rather than parks a second question on a subject already waiting on one', async () => {
+    // A reply names no question, so with two parked on one subject every answer
+    // resumes whichever the lookup returns, and the other can never be answered.
+    let publish: () => void = () => undefined;
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const worker = yield* Worker;
+        const first = yield* queue.enqueue(work);
+        publish = yield* publishing(queue, first.jobId);
+        yield* worker.runOnce;
+        const second = yield* queue.enqueue({
+          ...work,
+          deliveryId: 'delivery-2',
+          interactionId: 'interaction-2',
+          repository: 'EDLOIDAS/Lictor',
+        });
+        publish = yield* publishing(queue, second.jobId);
+        yield* worker.runOnce;
+        return {
+          first: yield* queue.job(first.jobId),
+          second: yield* queue.job(second.jobId),
+          messages: yield* queue.outboxFor(second.jobId),
+          waiting: yield* queue.pendingQuestion('edloidas/lictor', 'issue', 17),
+          // Published, so the refusal is what finished it, not the unpublished branch.
+          secondAsked: yield* queue.lastCommentAt(second.jobId, 17, 0),
+        };
+      }),
+      () => {
+        publish();
+        return Effect.succeed({ status: 'needs_input', summary: 'which branch?' });
+      },
+      3,
+    );
+
+    expect(result.secondAsked).toBeNumber();
+    expect(result.first?.status).toBe('pending');
+    expect(result.waiting?.jobId).toBe(result.first?.id);
+    expect(result.waiting?.questionId).toBe(result.first?.questionId);
+    expect(result.second?.questionId).toBeUndefined();
+    expect(result.second?.status).toBe('failed');
+    expect(result.second?.outcome).toBe('rejected');
+    expect(result.messages.map((message) => message.outcome)).toEqual(['rejected']);
+  });
+
   it('leaves the job untouched when the park is fenced out', async () => {
     // A park that loses its fence must write nothing. `question_id` is what the
     // claim skips on and what an answer is matched against, so a half-applied

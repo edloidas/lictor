@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { Cause, Data, Effect, JSONSchema, Schema } from 'effect';
+import { Cause, Clock, Data, Effect, JSONSchema, Schema } from 'effect';
 import { bounded } from '../bounded.ts';
 import { LictorConfig } from '../config.ts';
 import { AgentListener } from '../control/agent-listener.ts';
@@ -314,12 +314,19 @@ const earlierAttempts = (operations: readonly OperationRecord[]): string => {
   return `\n\n## Earlier attempts\n\nThis job has run before. The GitHub writes those attempts sent are listed below, recorded by the daemon from GitHub's own answers; git blobs, trees and commits are left out, since repeating one is harmless.${omitted} \`landed\` writes happened: continue from them and do not make them again. \`refused\` writes did not happen. An \`unresolved\` write may or may not have happened — before making the same one again, look for it with the read tools, and say in \`summary\` what you found.\n${JSON.stringify(rows)}`;
 };
 
+const NEEDS_INPUT = `- \`needs_input\` — exceptional, and the last thing to reach for. Whoever wrote the request is waiting for a result, not a question, so returning this is closer to a soft rejection than to a pause: use it only where no reasonable reading of the request lets you finish any of it. Before returning it you must post the report yourself, with \`create_comment\` — nothing else publishes it, and a question nobody can see is never answered. Write that comment as an account of work that stopped short: what you did establish, what blocked you, and what the reader should do next. Put the same question in \`summary\` for the record. Never ask for capability: no reply widens what this job may do.`;
+
+// `park` refuses a second question on a subject regardless; withholding the
+// status keeps the agent from posting one that the refusal would orphan.
+const QUESTION_TAKEN = `- \`needs_input\` — not available to this run. Another request on this thread is already waiting on an answer to a question, and a second question could not be told apart from it. Where no reasonable reading of the request lets you finish any of it, return \`rejected\` and say in \`summary\` what is missing.`;
+
 export const buildPrompt = (
   work: WorkItem,
   grant?: Grant,
   account?: string,
   review?: ReviewProcedure,
   earlier: readonly OperationRecord[] = [],
+  questionWaiting = false,
 ): string => {
   const metadata = {
     ...(account === undefined ? {} : { account: bounded(account, 64) }),
@@ -384,7 +391,7 @@ Every GitHub action goes through the \`lictor\` MCP server, which is the only Gi
 Report the outcome as one status:
 - \`completed\` — you carried out what this interaction authorized. Part of the request falling outside your capabilities does not change that: do the rest, and say in \`summary\` what you did not do and why.
 - \`rejected\` — you carried out none of it, because you lacked the authority or you decline. Say why. Answering a question counts as carrying something out.
-- \`needs_input\` — exceptional, and the last thing to reach for. Whoever wrote the request is waiting for a result, not a question, so returning this is closer to a soft rejection than to a pause: use it only where no reasonable reading of the request lets you finish any of it. Before returning it you must post the report yourself, with \`create_comment\` — nothing else publishes it, and a question nobody can see is never answered. Write that comment as an account of work that stopped short: what you did establish, what blocked you, and what the reader should do next. Put the same question in \`summary\` for the record. Never ask for capability: no reply widens what this job may do.
+${questionWaiting ? QUESTION_TAKEN : NEEDS_INPUT}
 - \`failed\` — something broke that you could not work around. This run is the last one either way, so \`summary\` has to carry what broke. Never for a capability you were not granted.${reviewSection(work, review)}`;
 };
 
@@ -525,8 +532,15 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
           ? Effect.succeed([] as readonly OperationRecord[])
           : queue.priorOperations(jobId, attemptNumber);
 
+      // `park` retires an expired question the sweep has not reached yet.
+      const waiting = Effect.zipWith(
+        queue.pendingQuestion(work.repository, work.subject.kind, work.subject.number),
+        Clock.currentTimeMillis,
+        (question, now) => question?.expiresAt !== undefined && question.expiresAt > now,
+      );
+
       const run = (mcpArgs: readonly string[], resultPath: string) =>
-        Effect.flatMap(Effect.all([readSoul, earlier]), ([soul, prior]) =>
+        Effect.flatMap(Effect.all([readSoul, earlier, waiting]), ([soul, prior, questionWaiting]) =>
           Effect.logInfo('Starting agent process').pipe(
             Effect.annotateLogs({
               ...(jobId === undefined ? {} : { job: jobId, attempt: attemptNumber }),
@@ -565,7 +579,10 @@ export class AgentExecutor extends Effect.Service<AgentExecutor>()('AgentExecuto
                   '-',
                 ],
                 cwd: workdir,
-                input: `${[soul, buildPrompt(work, grant, config.expectedLogin, review, prior)]
+                input: `${[
+                  soul,
+                  buildPrompt(work, grant, config.expectedLogin, review, prior, questionWaiting),
+                ]
                   .filter(Boolean)
                   .join(
                     '\n\n',
