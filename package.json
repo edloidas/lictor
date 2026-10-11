@@ -37,7 +37,7 @@
     "*.{ts,tsx}": "biome check --write --no-errors-on-unmatched"
   },
   "dependencies": {
-    "@effect/platform": "^0.97.1",
+    "@effect/platform": "^0.97.2",
     "@effect/platform-bun": "^0.91.2",
     "effect": "^3.22.1"
   },
