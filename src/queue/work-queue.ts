@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { uptime } from 'node:os';
 import { dirname } from 'node:path';
-import { Clock, Data, Effect, Schema } from 'effect';
+import { Clock, Data, Effect, Either, ParseResult, Schema } from 'effect';
+import { bounded } from '../bounded.ts';
 import { LictorConfig } from '../config.ts';
 import {
   type Grant,
@@ -309,6 +310,23 @@ export type JobDetails = QueuedJob & {
   readonly updatedAt: number;
 };
 
+/**
+ * A row whose payload no longer satisfies `WorkItemSchema`: every column the
+ * operator can read without it, plus the repository and subject wherever the
+ * payload still names them.
+ */
+export type UndecodableJob = Omit<JobDetails, 'work'> & {
+  readonly undecodable: true;
+  readonly decodeError: string;
+  readonly repository?: string;
+  readonly subjectNumber?: number;
+};
+
+export type JobRecord = JobDetails | UndecodableJob;
+
+/** Bounds the decode error an undecodable row reports, which echoes payload values. */
+const DECODE_ERROR_MAX_BYTES = 2048;
+
 export class QueueError extends Data.TaggedError('QueueError')<{
   readonly operation: string;
   readonly cause: unknown;
@@ -330,6 +348,12 @@ type JobRow = {
   readonly leaseExpiresAt?: number | null;
   readonly grant?: string | null;
   readonly narrowing?: string | null;
+};
+
+type DetailedJobRow = JobRow & {
+  readonly lastError: string | null;
+  readonly createdAt: number;
+  readonly updatedAt: number;
 };
 
 type OutboxRow = {
@@ -849,6 +873,67 @@ const narrowingOf = (stored: string | null | undefined): { narrowing?: GrantNarr
 const decodeJob = (row: JobRow): QueuedJob => ({
   id: row.id,
   work: Schema.decodeUnknownSync(WorkItemSchema)(JSON.parse(row.payload)),
+  ...columnsOf(row),
+});
+
+/** Never throws: a payload that will not decode becomes an `UndecodableJob`. */
+const inspectRow = (row: DetailedJobRow): JobRecord => {
+  const details = detailsOf(row);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.payload);
+  } catch (cause) {
+    return undecodableOf(row, details, undefined, String(cause));
+  }
+  const work = Schema.decodeUnknownEither(WorkItemSchema)(parsed);
+  return Either.isRight(work)
+    ? { id: row.id, work: work.right, ...columnsOf(row), ...details }
+    : undecodableOf(row, details, parsed, decodeIssues(work.left));
+};
+
+/**
+ * Path first. The tree formatter opens with the whole schema's type literal, so
+ * a byte bound on it cuts off the failing path of anything nested.
+ */
+const decodeIssues = (error: ParseResult.ParseError): string =>
+  ParseResult.ArrayFormatter.formatErrorSync(error)
+    .map(
+      (issue) => `${issue.path.length === 0 ? '(root)' : issue.path.join('.')}: ${issue.message}`,
+    )
+    .join('\n');
+
+const detailsOf = (
+  row: DetailedJobRow,
+): Pick<JobDetails, 'lastError' | 'createdAt' | 'updatedAt'> => ({
+  ...(row.lastError === null ? {} : { lastError: row.lastError }),
+  createdAt: row.createdAt,
+  updatedAt: row.updatedAt,
+});
+
+const undecodableOf = (
+  row: DetailedJobRow,
+  details: Pick<JobDetails, 'lastError' | 'createdAt' | 'updatedAt'>,
+  parsed: unknown,
+  error: string,
+): UndecodableJob => {
+  const payload =
+    typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  const subject =
+    typeof payload.subject === 'object' && payload.subject !== null
+      ? (payload.subject as Record<string, unknown>)
+      : {};
+  return {
+    id: row.id,
+    ...columnsOf(row),
+    ...details,
+    undecodable: true,
+    decodeError: bounded(error, DECODE_ERROR_MAX_BYTES),
+    ...(typeof payload.repository === 'string' ? { repository: payload.repository } : {}),
+    ...(Number.isInteger(subject.number) ? { subjectNumber: subject.number as number } : {}),
+  };
+};
+
+const columnsOf = (row: JobRow): Omit<QueuedJob, 'id' | 'work'> => ({
   status: row.status,
   attempts: row.attempts,
   attemptsSpent: row.attempts - (row.retryBase ?? 0),
@@ -2735,25 +2820,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                question_id AS questionId, question_answerers AS questionAnswerers
              FROM jobs ORDER BY id DESC LIMIT ?`,
           )
-          .all(Math.max(1, Math.min(1000, limit))) as readonly (JobRow & {
-          readonly lastError: string | null;
-          readonly createdAt: number;
-          readonly updatedAt: number;
-        })[];
-        return rows.flatMap((row) => {
-          try {
-            return [
-              {
-                ...decodeJob(row),
-                ...(row.lastError === null ? {} : { lastError: row.lastError }),
-                createdAt: row.createdAt,
-                updatedAt: row.updatedAt,
-              } satisfies JobDetails,
-            ];
-          } catch {
-            return [];
-          }
-        });
+          .all(Math.max(1, Math.min(1000, limit))) as readonly DetailedJobRow[];
+        return rows.map(inspectRow);
       });
 
     /**
@@ -2774,33 +2842,32 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       return new Set<number>(rows.map((row) => row.id));
     });
 
+    const jobRow = (id: number) =>
+      database
+        .query(
+          `SELECT id, payload, status, attempts, retry_base AS retryBase, last_error AS lastError,
+             grant, narrowing,
+             created_at AS createdAt, updated_at AS updatedAt,
+             ready_at AS readyAt, outcome, hold_expires_at AS holdExpiresAt,
+             question_id AS questionId, question_answerers AS questionAnswerers,
+             worker_id AS workerId, lease_expires_at AS leaseExpiresAt
+           FROM jobs WHERE id = ?`,
+        )
+        .get(id) as DetailedJobRow | null;
+
+    /** Fails on a row whose payload will not decode, so nothing acts on one. */
     const job = (id: number) =>
       attempt('inspect job', () => {
-        const row = database
-          .query(
-            `SELECT id, payload, status, attempts, retry_base AS retryBase, last_error AS lastError,
-               grant, narrowing,
-               created_at AS createdAt, updated_at AS updatedAt,
-               ready_at AS readyAt, outcome, hold_expires_at AS holdExpiresAt,
-               question_id AS questionId, question_answerers AS questionAnswerers,
-               worker_id AS workerId, lease_expires_at AS leaseExpiresAt
-             FROM jobs WHERE id = ?`,
-          )
-          .get(id) as
-          | (JobRow & {
-              readonly lastError: string | null;
-              readonly createdAt: number;
-              readonly updatedAt: number;
-            })
-          | null;
+        const row = jobRow(id);
         if (row === null) return undefined;
-        const decoded = decodeJob(row);
-        return {
-          ...decoded,
-          ...(row.lastError === null ? {} : { lastError: row.lastError }),
-          createdAt: row.createdAt,
-          updatedAt: row.updatedAt,
-        } satisfies JobDetails;
+        return { ...decodeJob(row), ...detailsOf(row) } satisfies JobDetails;
+      });
+
+    /** For the operator: reports a row `job` fails on instead of failing. */
+    const inspectJob = (id: number) =>
+      attempt('inspect job', () => {
+        const row = jobRow(id);
+        return row === null ? undefined : inspectRow(row);
       });
 
     /** An operator has looked, so the claim no longer holds on these rows. */
@@ -3044,6 +3111,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       livenessFor,
       listJobs,
       job,
+      inspectJob,
       liveJobIds,
       approve: (id: number, grant?: Grant) => mutateJob(id, 'approve', undefined, grant),
       retry: (id: number, approvalExpiryMs?: number) => mutateJob(id, 'retry', approvalExpiryMs),
