@@ -873,8 +873,7 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
           }
           const effective = effectiveCapabilities(job);
           const capability = toolCapabilities[request.name];
-          // A continuation inherits its authority from the arming trigger: it
-          // never reaches escalation capabilities however generous policy is.
+          // A continuation's grant, minted from current policy, loses merge, force and verdicts.
           const narrowed = job.work.continuation === true;
           const forcePushDenied =
             request.name === 'update_branch' &&

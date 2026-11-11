@@ -983,9 +983,7 @@ describe('CapabilityBroker', () => {
     ]);
   });
 
-  // A continuation turn inherits its authority from the trigger that armed
-  // liveness, so it never reaches the escalation capabilities even where
-  // repository policy grants them to the operator.
+  // A continuation's grant is minted from current policy at claim, then narrowed.
   it('strips escalation capabilities from continuation turns', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -1008,6 +1006,50 @@ describe('CapabilityBroker', () => {
     );
     expect(String(result.value.exit)).toContain('CAPABILITY_DENIED');
     expect(result.requests).toHaveLength(0);
+  });
+
+  /** Claims a job under a policy granting `branches` and `forcePush`, then moves a branch. */
+  const branchMove = (force: boolean, continuation: boolean) =>
+    run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const enqueued = yield* queue.enqueue(continuation ? { ...work, continuation } : work);
+        const claimed = yield* queue.claim;
+        return yield* Effect.exit(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'update_branch',
+            input: { ref: 'heads/lictor-issue-13', sha: 'a'.repeat(40), ...(force && { force }) },
+          }),
+        );
+      }),
+      '[defaults.capabilities]\nread = true\nbranches = true\nforcePush = true',
+      {
+        body: {
+          ref: 'refs/heads/lictor-issue-13',
+          node_id: 'REF_1',
+          object: { sha: 'a'.repeat(40) },
+        },
+      },
+    );
+
+  it('refuses a forced branch move on a continuation whatever policy grants', async () => {
+    const forced = await branchMove(true, true);
+    expect(String(forced.value)).toContain('CAPABILITY_DENIED');
+    expect(forced.requests).toHaveLength(0);
+
+    const plain = await branchMove(false, true);
+    expect(Exit.isSuccess(plain.value)).toBe(true);
+    expect(plain.methods).toEqual(['PATCH']);
+    expect(plain.requests[0]).toContain('/repos/edloidas/lictor/git/refs/heads/lictor-issue-13');
+
+    const triggered = await branchMove(true, false);
+    expect(Exit.isSuccess(triggered.value)).toBe(true);
+    expect(triggered.methods).toEqual(['PATCH']);
+    expect(triggered.bodies[0]).toContain('"force":true');
   });
 
   /** Claims a job under a policy granting `review`, then makes one call. */
