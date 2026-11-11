@@ -132,6 +132,11 @@ indistinguishable from a revoked token.
   instead. A parked job consumes the next trusted reply on its thread as the
   answer — arming that for a question nobody was shown would swallow unrelated
   work
+- **A parked question reserves its subject's prose channel.** A reply names no
+  question, so the broker refuses every `publishesProse` call aimed at a number
+  another job is parked on — a comment there, asked or not, would draw a reply
+  that resumes the wrong job. An expired question is retired there first, as
+  `park` does. The prompt says so; the broker is what enforces it
 - **No string a terminal write holds reaches GitHub.** The agent's `summary`,
   an `ExecutorError` message, a `WorkspaceError` message, a policy refusal code:
   all of them stay in the row and the log, where `job.show` reads them
