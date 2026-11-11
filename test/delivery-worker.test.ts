@@ -84,10 +84,16 @@ const comments = [
   },
 ];
 
-const routesFor = (commentBody?: string): readonly (readonly [string, unknown])[] => [
+const routesFor = (
+  commentBody?: string,
+  extraComments: readonly unknown[] = [],
+): readonly (readonly [string, unknown])[] => [
   [
     '/issues/17/comments',
-    commentBody === undefined ? comments : [{ ...comments[0], body: commentBody }],
+    [
+      ...(commentBody === undefined ? comments : [{ ...comments[0], body: commentBody }]),
+      ...extraComments,
+    ],
   ],
   ['/pulls/17/comments', []],
   ['/issues/17', issue],
@@ -107,6 +113,8 @@ const services = (
     readonly queue?: (queue: WorkQueue) => WorkQueue;
     readonly deliveryMaxBytes?: number;
     readonly commentBody?: string;
+    readonly policy?: string;
+    readonly extraComments?: readonly unknown[];
   },
 ) => {
   const ConfigLive = Layer.succeed(
@@ -127,7 +135,7 @@ const services = (
         request,
         new Response(
           JSON.stringify(
-            routesFor(options.commentBody).find(([fragment]) =>
+            routesFor(options.commentBody, options.extraComments).find(([fragment]) =>
               request.url.includes(fragment),
             )?.[1] ?? {},
           ),
@@ -161,7 +169,8 @@ const services = (
   const PolicyLive = Layer.effect(
     Policy,
     parsePolicy(
-      `[defaults]\nexecution = "automatic"\n[limits]\nmaxQueueDepth = ${options.maxQueueDepth ?? 10_000}\n[repositories]\nallow = ["edloidas/lictor"]`,
+      options.policy ??
+        `[defaults]\nexecution = "automatic"\n[limits]\nmaxQueueDepth = ${options.maxQueueDepth ?? 10_000}\n[repositories]\nallow = ["edloidas/lictor"]`,
       ['edloidas'],
     ).pipe(Effect.map(Policy.make)),
   );
@@ -176,7 +185,7 @@ const run = (
   verified: Effect.Effect<VerifiedIdentity, GitHubIdentityError>,
   passes = 1,
   deliveryBody: string = body,
-  options: { readonly reactionStatus?: number } = {},
+  options: { readonly reactionStatus?: number; readonly policy?: string } = {},
 ) => {
   const reactions: string[] = [];
   const requests: string[] = [];
@@ -207,6 +216,7 @@ const run = (
           requests,
           audit: yield* queue.auditLog(1),
           cursor: yield* queue.notificationCursor('14567'),
+          delivery: yield* queue.inspectDelivery('delivery-1'),
         };
       }).pipe(
         Effect.provide(Logger.remove(Logger.defaultLogger)),
@@ -361,6 +371,156 @@ describe('DeliveryWorker', () => {
     expect(result.counts.pending).toBe(1);
     expect(result.audit.map((entry) => entry.capability)).toEqual(['react']);
     expect(result.audit[0]?.outcome).toBe('ok');
+    expect(result.delivery).toMatchObject({
+      status: 'completed',
+      decision: { decision: 'queued', jobId: 1 },
+      repository: 'edloidas/lictor',
+      subject: { kind: 'issue', number: 17 },
+      threadReason: 'mention',
+    });
+  });
+
+  // The decision is the only record of why a notification produced no job: the
+  // reason otherwise lives in a log line.
+  it('records why a notification became no work', async () => {
+    const result = await run(
+      Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }),
+      1,
+      JSON.stringify({ ...JSON.parse(body), reason: 'ci_activity' }),
+    );
+
+    expect(result.status).toBe('completed');
+    expect(result.counts.pending).toBe(0);
+    expect(result.delivery?.decision).toEqual({ decision: 'ignored', reason: 'machine_traffic' });
+  });
+
+  it('records a policy refusal as an ignored delivery', async () => {
+    const result = await run(
+      Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }),
+      1,
+      body,
+      {
+        policy: '[defaults]\nexecution = "denied"\n[repositories]\nallow = ["edloidas/lictor"]',
+      },
+    );
+
+    expect(result.counts.pending).toBe(0);
+    expect(result.delivery?.decision).toEqual({ decision: 'ignored', reason: 'policy_denied' });
+  });
+
+  // A retry of the delivery whose enqueue committed before the attempt died is
+  // the job's origin; another delivery naming the same interaction is not. The
+  // third delivery matches both kinds of row at once, and its own one wins.
+  it('tells the job a delivery created apart from one it duplicated', async () => {
+    const reactions: string[] = [];
+    const requests: string[] = [];
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const worker = yield* DeliveryWorker;
+          for (const id of ['delivery-1', 'delivery-2']) {
+            yield* queue.receiveDelivery({
+              id,
+              event: 'notification',
+              body,
+              source: 'notification',
+            });
+            yield* worker.runOnce;
+          }
+          const origin: WorkItem = {
+            deliveryId: 'delivery-3',
+            interactionId: 'interrupted-interaction',
+            repository: 'edloidas/lictor',
+            sender: 'edloidas',
+            targets: ['adiutriel'],
+            reasons: ['mentioned'],
+            subject: {
+              kind: 'issue',
+              number: 17,
+              title: 'Keep the queue moving',
+              url: 'https://github.com/edloidas/lictor/issues/17',
+            },
+          };
+          // What an attempt that died between enqueue and finish leaves behind.
+          const { jobId } = yield* queue.enqueue(origin);
+          yield* queue.receiveDelivery({
+            id: 'delivery-3',
+            event: 'notification',
+            body,
+            source: 'notification',
+          });
+          yield* worker.runOnce;
+          return {
+            jobId,
+            first: yield* queue.inspectDelivery('delivery-1'),
+            second: yield* queue.inspectDelivery('delivery-2'),
+            third: yield* queue.inspectDelivery('delivery-3'),
+          };
+        }).pipe(
+          Effect.provide(Logger.remove(Logger.defaultLogger)),
+          Effect.provide(
+            services(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }), reactions, {
+              requests,
+            }),
+          ),
+        ),
+      ),
+    );
+
+    expect(result.first?.decision).toEqual({ decision: 'queued', jobId: 1 });
+    expect(result.second?.decision).toEqual({ decision: 'duplicate', jobId: 1 });
+    expect(result.third?.decision).toEqual({ decision: 'queued', jobId: result.jobId });
+  });
+
+  // The first attempt commits the job and moves the cursor to the thread's
+  // activity time, later than the comment; the retry then sees no trigger.
+  it('records the job a retried delivery queued before its first attempt failed', async () => {
+    const reactions: string[] = [];
+    const requests: string[] = [];
+    let finishes = 0;
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.receiveDelivery({
+            id: 'delivery-1',
+            event: 'notification',
+            body: JSON.stringify({ ...JSON.parse(body), updated_at: '2026-08-21T10:00:05Z' }),
+            source: 'notification',
+          });
+          const worker = yield* DeliveryWorker;
+          yield* worker.runOnce;
+          yield* worker.runOnce;
+          return {
+            delivery: yield* queue.inspectDelivery('delivery-1'),
+            jobs: yield* queue.listJobs(10),
+          };
+        }).pipe(
+          Effect.provide(Logger.remove(Logger.defaultLogger)),
+          Effect.provide(
+            services(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }), reactions, {
+              requests,
+              queue: (queue) =>
+                WorkQueue.make({
+                  ...queue,
+                  finishDelivery: (...args) =>
+                    finishes++ === 0
+                      ? Effect.fail(new QueueError({ operation: 'finish', cause: 'disk full' }))
+                      : queue.finishDelivery(...args),
+                }),
+            }),
+          ),
+        ),
+      ),
+    );
+
+    expect(result.jobs).toHaveLength(1);
+    expect(result.delivery).toMatchObject({
+      status: 'completed',
+      attempts: 2,
+      decision: { decision: 'queued', jobId: 1 },
+    });
   });
 
   // The cursor is what makes the next sweep scan from the right anchor. Moving
@@ -443,6 +603,7 @@ describe('DeliveryWorker', () => {
             job: yield* queue.job(jobId),
             jobs: yield* queue.listJobs(10),
             cursor: yield* queue.notificationCursor('14567'),
+            delivery: yield* queue.inspectDelivery('delivery-1'),
             reactions,
           };
         }).pipe(
@@ -469,10 +630,88 @@ describe('DeliveryWorker', () => {
     expect(result.job?.work.reasons).toEqual(['mentioned']);
     expect(result.counts.pending).toBe(1);
     expect(result.cursor).toBe(Date.parse('2026-08-21T10:00:00Z'));
+    expect(result.delivery?.decision).toEqual({
+      decision: 'answered',
+      answered: { jobId: result.jobId, resumed: true },
+    });
     // Recorded rather than endorsed: the eyes reaction rides a fresh insert, so
     // answering a question is currently acknowledged only by whatever the
     // resumed job eventually posts.
     expect(result.reactions).toEqual([]);
+  });
+
+  // One window can answer the parked question and carry a new request from
+  // someone else; the delivery did both, and the record keeps both.
+  it('records an answer beside the job the same window queued', async () => {
+    const reactions: string[] = [];
+    const requests: string[] = [];
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          const parked: WorkItem = {
+            deliveryId: 'asking-delivery',
+            interactionId: 'asking-interaction',
+            repository: 'edloidas/lictor',
+            sender: 'edloidas',
+            targets: ['adiutriel'],
+            reasons: ['mentioned'],
+            subject: {
+              kind: 'issue',
+              number: 17,
+              title: 'Keep the queue moving',
+              url: 'https://github.com/edloidas/lictor/issues/17',
+            },
+          };
+          const { jobId } = yield* queue.enqueue(parked);
+          const claimed = yield* queue.claim;
+          yield* queue.park({
+            jobId,
+            attemptNumber: claimed?.attempts ?? 1,
+            repository: parked.repository,
+            subjectNumber: parked.subject.number,
+            question: 'which branch?',
+            answerers: ['edloidas'],
+            askedAt: yield* Clock.currentTimeMillis,
+            expiresAt: 4_000_000_000_000,
+          });
+          yield* queue.receiveDelivery({
+            id: 'delivery-1',
+            event: 'notification',
+            body,
+            source: 'notification',
+          });
+          yield* (yield* DeliveryWorker).runOnce;
+          return { jobId, delivery: yield* queue.inspectDelivery('delivery-1') };
+        }).pipe(
+          Effect.provide(Logger.remove(Logger.defaultLogger)),
+          Effect.provide(
+            services(Effect.succeed({ login: 'adiutriel', tokenExpiresAt: undefined }), reactions, {
+              requests,
+              policy:
+                '[defaults]\nexecution = "automatic"\nsenders = ["edloidas", "octocat"]\n[repositories]\nallow = ["edloidas/lictor"]',
+              extraComments: [
+                {
+                  ...comments[0],
+                  id: 100,
+                  node_id: 'IC_100',
+                  html_url: 'https://github.com/edloidas/lictor/issues/17#issuecomment-100',
+                  body: '@adiutriel also bump the changelog',
+                  user: { login: 'octocat' },
+                },
+              ],
+            }),
+          ),
+          Effect.provide(TestContext.TestContext),
+        ),
+      ),
+    );
+
+    expect(result.delivery?.decision).toEqual({
+      decision: 'queued',
+      jobId: result.jobId + 1,
+      answered: { jobId: result.jobId, resumed: true },
+    });
   });
 
   // A dead credential says nothing about the delivery. `failed` is terminal —
@@ -616,6 +855,9 @@ describe('DeliveryWorker', () => {
     const result = await run(Effect.die(new Error('enrichment fetch exploded')), 3);
 
     expect(result.status).toBe('failed');
+    // The budget flip finishes no decision, so the read names it.
+    expect(result.delivery?.decision).toEqual({ decision: 'quarantined' });
+    expect(result.delivery?.lastError).toContain('enrichment fetch exploded');
   });
 
   // The recording bound reaches qualification from here and nowhere else, so a

@@ -224,6 +224,8 @@ bun cli job.show 42
 bun cli job.approve 42
 bun cli job.retry 42
 bun cli job.cancel 42
+bun cli delivery.list edloidas/lictor#42
+bun cli delivery.show <delivery-id>
 bun cli repository.list
 bun cli repository.inspect edloidas/lictor
 bun cli prune
@@ -239,6 +241,19 @@ the schema, still appears in `job.list` and `job.show`, with `undecodable: true`
 the `decodeError`, and in place of `work` the `repository` and `subjectNumber`
 wherever the payload still names them. `job.show` answers `pruned: true` for a
 job retention deleted while its outbox message was still kept.
+
+`job.show` explains a job end to end: the recorded request and grant, each
+attempt with its timing and stored result or error, the newest 200 audit rows
+(with `auditTotal` when there are more), the mutations and their receipts, the
+retained artifacts, and the outcome message.
+
+`delivery.list [limit] [owner/repo[#number]]` and `delivery.show <id>` explain a
+notification that produced no job. Each delivery carries its repository and
+subject, and a `decision`: `queued` or `duplicate` with the job id, `answered`
+when the reply resumed a parked job, `ignored` with a `reason` code, or
+`quarantined` for a delivery refused after its attempt budget or a permanent
+error, with `lastError`. An ignored delivery is kept for the completed retention
+window, 30 days by default.
 
 `status` reports queue counts, the daemon heartbeat, oldest active job,
 executor mode, database size, and available disk. Jobs that exhaust their

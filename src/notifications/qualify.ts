@@ -2,6 +2,7 @@ import { type HttpClient, HttpClientRequest } from '@effect/platform';
 import { Clock, Data, Effect, Schema } from 'effect';
 import { bounded, exceeds } from '../bounded.ts';
 import { GitHubClient } from '../github/client.ts';
+import type { IgnoreReason, IntakeNote } from '../intake-decision.ts';
 import type { ContextRef, TriggerRecord, WorkItem } from '../work-item.ts';
 import { type NotificationThread, subjectRef, UNMENTIONABLE_REASONS } from './thread.ts';
 
@@ -41,6 +42,8 @@ export type QualifiedNotification = {
   readonly answer?: { readonly questionId: string; readonly url: string; readonly author: string };
   /** Cursor value to store once this thread is processed, epoch ms. */
   readonly lastActivityAt: number;
+  /** Set exactly when `work` is not: which exit refused the thread. */
+  readonly ignored?: { readonly reason: IgnoreReason; readonly notes?: readonly IntakeNote[] };
 };
 
 type Candidate = {
@@ -676,6 +679,9 @@ const outranks = (candidate: Candidate, best: Candidate): boolean => {
   return kind === bestKind ? id > bestId : kind > bestKind;
 };
 
+const ignoredFor = (reason: IgnoreReason, notes: readonly IntakeNote[]) =>
+  notes.length === 0 ? { reason } : { reason, notes };
+
 export const qualifyNotification = (input: {
   readonly deliveryId: string;
   readonly thread: NotificationThread;
@@ -717,14 +723,18 @@ export const qualifyNotification = (input: {
         yield* Effect.logWarning('Notification dropped: its activity time is unreadable').pipe(
           Effect.annotateLogs({ threadId: input.thread.id, updatedAt: input.thread.updated_at }),
         );
-        return { work: undefined, lastActivityAt };
+        return {
+          work: undefined,
+          lastActivityAt,
+          ignored: { reason: 'activity_time_unreadable' as const },
+        };
       }
 
       if (UNMENTIONABLE_REASONS.has(input.thread.reason)) {
         yield* Effect.logDebug('Notification skipped: machine traffic carries no mention').pipe(
           Effect.annotateLogs({ threadId: input.thread.id, reason: input.thread.reason }),
         );
-        return { work: undefined, lastActivityAt };
+        return { work: undefined, lastActivityAt, ignored: { reason: 'machine_traffic' as const } };
       }
 
       const ref = subjectRef(input.thread);
@@ -732,7 +742,11 @@ export const qualifyNotification = (input: {
         yield* Effect.logDebug(
           'Notification skipped: the subject has no issue number to act on',
         ).pipe(Effect.annotateLogs({ threadId: input.thread.id, type: input.thread.subject.type }));
-        return { work: undefined, lastActivityAt };
+        return {
+          work: undefined,
+          lastActivityAt,
+          ignored: { reason: 'no_subject_number' as const },
+        };
       }
 
       // `undefined` allowed: with no cursor and no read mark the thread is new
@@ -924,6 +938,8 @@ export const qualifyNotification = (input: {
       // request calls for, and the timeline walk pages to `PAGE_CEILING`, so it
       // is not read at all. A mention is exempt: a closed thread can still owe
       // an answer to whatever its own comment asks.
+      const notes: readonly IntakeNote[] =
+        triggerReason !== undefined && closed ? ['subject_closed'] : [];
       if (triggerReason !== undefined && closed) {
         yield* Effect.logInfo('Trigger skipped: the subject is closed').pipe(
           Effect.annotateLogs({ repository, subject: ref.number, reason: triggerReason }),
@@ -982,7 +998,15 @@ export const qualifyNotification = (input: {
             'Notification did not become work: no candidate mentions the target user',
           ).pipe(Effect.annotateLogs({ threadId: input.thread.id }));
         }
-        return { work: undefined, ...answered, lastActivityAt };
+        return {
+          work: undefined,
+          ...answered,
+          lastActivityAt,
+          ignored: ignoredFor(
+            untrustedSenders.length > 0 ? 'untrusted_sender' : 'no_trigger',
+            notes,
+          ),
+        };
       }
 
       // ! A trusted trigger outranks any continuation whatever the timestamps:
@@ -1046,7 +1070,13 @@ export const qualifyNotification = (input: {
       }
 
       const triggering = useContinuation ? continuationTrigger : mentionTrigger;
-      if (triggering === undefined) return { work: undefined, ...answered, lastActivityAt };
+      if (triggering === undefined)
+        return {
+          work: undefined,
+          ...answered,
+          lastActivityAt,
+          ignored: ignoredFor('no_trigger', notes),
+        };
       const sender = normalizeLogin(triggering.author);
       const continued = useContinuation;
       const work: WorkItem = {

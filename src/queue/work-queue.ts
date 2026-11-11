@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { uptime } from 'node:os';
 import { dirname } from 'node:path';
 import { Clock, Data, Effect, Either, ParseResult, Schema } from 'effect';
-import { bounded } from '../bounded.ts';
+import { bounded, exceeds } from '../bounded.ts';
 import { LictorConfig } from '../config.ts';
 import {
   type Grant,
@@ -13,6 +13,8 @@ import {
   GrantSchema,
   type OperationClass,
 } from '../github/grant.ts';
+import { type IntakeDecision, IntakeDecisionSchema } from '../intake-decision.ts';
+import { NotificationThread, subjectRef } from '../notifications/thread.ts';
 import { processAlive } from '../process-liveness.ts';
 import { type ContextRef, ContextRefSchema, type WorkItem, WorkItemSchema } from '../work-item.ts';
 
@@ -241,6 +243,60 @@ export type CollectedArtifact =
 
 export type ArtifactRecord = CollectedArtifact & { readonly attempt: number };
 
+export type AttemptRecord = {
+  readonly number: number;
+  readonly status: 'running' | 'completed' | 'failed' | 'interrupted';
+  readonly startedAt: number;
+  readonly finishedAt?: number;
+  readonly error?: string;
+  readonly errorClipped?: true;
+  /** The agent result a completed attempt stored, already bounded by the executor. */
+  readonly result?: unknown;
+};
+
+export type AuditRecord = {
+  readonly actor?: string;
+  readonly capability: string;
+  readonly input: unknown;
+  readonly outcome: string;
+  readonly createdAt: number;
+};
+
+/**
+ * A delivery as intake left it. `quarantined` is read, not written: a row goes
+ * `failed` on paths that finish no decision, so a failed row without one is
+ * the delivery the attempt budget or a permanent error refused.
+ */
+export type DeliveryRecord = {
+  readonly id: string;
+  /** `webhook` on a row the v7 migration condemned rather than deleted. */
+  readonly source: DeliverySource | 'webhook';
+  readonly status: InboxStatus;
+  readonly attempts: number;
+  readonly receivedAt: number;
+  readonly processedAt?: number;
+  readonly lastError?: string;
+  readonly decision?: IntakeDecision | { readonly decision: 'quarantined' };
+  readonly decisionUnreadable?: true;
+  readonly repository?: string;
+  readonly subject?: { readonly kind: 'issue' | 'pull_request'; readonly number: number };
+  readonly title?: string;
+  readonly threadReason?: string;
+};
+
+export type DeliveryFilter = { readonly repository: string; readonly subjectNumber?: number };
+
+const ATTEMPT_ERROR_MAX_BYTES = 4096;
+
+/** Stored JSON is shown decoded and never cut: a cut inside a string parses as nothing. */
+const jsonOrText = (stored: string): unknown => {
+  try {
+    return JSON.parse(stored) as unknown;
+  } catch {
+    return stored;
+  }
+};
+
 /** An unsettled append no operator has released. Goes in a `WHERE` on `jobs`. */
 const UNSETTLED_APPEND_WHERE = `EXISTS (
                    SELECT 1 FROM operations
@@ -467,6 +523,7 @@ const migrate = (database: Database) => {
     hasColumn('daemon_owner', 'pid') &&
     deliveriesHaveSource() &&
     hasColumn('deliveries', 'lease_expires_at') &&
+    hasColumn('deliveries', 'decision') &&
     hasColumn('capability_audit', 'actor') &&
     !hasColumn('capability_audit', 'installation_id') &&
     hasColumn('jobs', 'outcome') &&
@@ -613,6 +670,11 @@ const migrate = (database: Database) => {
     }
     if (!hasColumn('deliveries', 'lease_expires_at')) {
       database.exec('ALTER TABLE deliveries ADD COLUMN lease_expires_at INTEGER');
+    }
+    // Diagnostic, so the stamp stays at 18: an older daemon never writes it and
+    // loses only the record of why a notification produced no job.
+    if (!hasColumn('deliveries', 'decision')) {
+      database.exec('ALTER TABLE deliveries ADD COLUMN decision TEXT');
     }
     // Added, not folded into the status CHECK: widening that constraint means
     // rebuilding `jobs`, and renaming it repoints the `attempts` foreign key at
@@ -869,6 +931,67 @@ const narrowingOf = (stored: string | null | undefined): { narrowing?: GrantNarr
     return {};
   }
 };
+
+type DeliveryRow = {
+  readonly id: string;
+  readonly source: DeliveryRecord['source'];
+  readonly status: InboxStatus;
+  readonly attempts: number;
+  readonly receivedAt: number;
+  readonly processedAt: number | null;
+  readonly lastError: string | null;
+  readonly body: string;
+  readonly decision: string | null;
+};
+
+type DeliverySubject = Pick<DeliveryRecord, 'repository' | 'subject' | 'title' | 'threadReason'>;
+
+/** What the operator recognizes a delivery by. Never throws: a body that will not decode names nothing. */
+const describeBySource: Record<DeliverySource, (body: string) => DeliverySubject> = {
+  notification: (body) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      return {};
+    }
+    const thread = Schema.decodeUnknownEither(NotificationThread)(parsed);
+    if (Either.isLeft(thread)) return {};
+    const subject = subjectRef(thread.right);
+    return {
+      repository: thread.right.repository.full_name,
+      ...(subject === undefined ? {} : { subject }),
+      title: thread.right.subject.title,
+      threadReason: thread.right.reason,
+    };
+  },
+};
+
+const DELIVERY_ERROR_MAX_BYTES = 2048;
+
+const decisionOf = (row: DeliveryRow): Pick<DeliveryRecord, 'decision' | 'decisionUnreadable'> => {
+  if (row.decision === null)
+    return row.status === 'failed' ? { decision: { decision: 'quarantined' } } : {};
+  const decoded = Schema.decodeUnknownEither(IntakeDecisionSchema)(jsonOrText(row.decision));
+  return Either.isRight(decoded) ? { decision: decoded.right } : { decisionUnreadable: true };
+};
+
+const describe = (row: DeliveryRow): DeliverySubject =>
+  row.source === 'webhook' ? {} : describeBySource[row.source](row.body);
+
+const deliveryOf = (row: DeliveryRow): DeliveryRecord => ({
+  id: row.id,
+  source: row.source,
+  status: row.status,
+  attempts: row.attempts,
+  receivedAt: row.receivedAt,
+  ...(row.processedAt === null ? {} : { processedAt: row.processedAt }),
+  ...(row.lastError === null
+    ? {}
+    : { lastError: bounded(row.lastError, DELIVERY_ERROR_MAX_BYTES) }),
+  ...decisionOf(row),
+  ...describe(row),
+});
 
 const decodeJob = (row: JobRow): QueuedJob => ({
   id: row.id,
@@ -1288,7 +1411,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                VALUES (?, ?, ?, ?, 'pending', ?)
               ON CONFLICT(id) DO UPDATE SET event = excluded.event, body = excluded.body,
                 source = excluded.source, status = 'pending', attempts = 0, claimed_at = NULL,
-                processed_at = NULL, last_error = NULL
+                processed_at = NULL, last_error = NULL, decision = NULL
               WHERE deliveries.status = 'failed'`,
             )
             .run(delivery.id, delivery.event, delivery.body, delivery.source, now);
@@ -1354,6 +1477,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       attempts: number,
       status: 'completed' | 'failed',
       error?: string,
+      decision?: IntakeDecision,
     ) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
@@ -1361,10 +1485,17 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           const result = database
             .query(
               `UPDATE deliveries SET status = ?, processed_at = ?, last_error = ?,
-                 lease_expires_at = NULL
+                 lease_expires_at = NULL, decision = ?
                WHERE id = ? AND status = 'processing' AND attempts = ?`,
             )
-            .run(status, now, error ?? null, id, attempts);
+            .run(
+              status,
+              now,
+              error ?? null,
+              decision === undefined ? null : JSON.stringify(decision),
+              id,
+              attempts,
+            );
           if (result.changes !== 1) throw new Error(`Delivery ${id} attempt ${attempts} is stale`);
         });
       });
@@ -1686,10 +1817,25 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
         return yield* attempt('enqueue', () => {
+          // `fromThisDelivery`: a retry of the delivery that inserted the row on
+          // an attempt that did not finish is the job's origin, not a duplicate.
+          // Its own row is preferred when another job holds the interaction.
           const existing = database
-            .query('SELECT id FROM jobs WHERE delivery_id = ? OR interaction_id = ?')
-            .get(work.deliveryId, work.interactionId) as { id: number } | null;
-          if (existing !== null) return { jobId: existing.id, inserted: false } as const;
+            .query(
+              `SELECT id, delivery_id AS deliveryId FROM jobs
+               WHERE delivery_id = ? OR interaction_id = ?
+               ORDER BY delivery_id = ? DESC, id LIMIT 1`,
+            )
+            .get(work.deliveryId, work.interactionId, work.deliveryId) as {
+            id: number;
+            deliveryId: string;
+          } | null;
+          if (existing !== null)
+            return {
+              jobId: existing.id,
+              inserted: false,
+              fromThisDelivery: existing.deliveryId === work.deliveryId,
+            } as const;
           const active = database
             .query(`SELECT COUNT(*) AS count FROM jobs WHERE ${COUNTED_JOBS_WHERE}`)
             .get() as { count: number };
@@ -1719,7 +1865,11 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           const row = database
             .query('SELECT id FROM jobs WHERE delivery_id = ? OR interaction_id = ?')
             .get(work.deliveryId, work.interactionId) as { id: number };
-          return { jobId: row.id, inserted: result.changes === 1 } as const;
+          return {
+            jobId: row.id,
+            inserted: result.changes === 1,
+            fromThisDelivery: result.changes === 1,
+          } as const;
         });
       });
 
@@ -2605,6 +2755,66 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
           }[],
       );
 
+    /** The newest `limit` audit rows, oldest first, and how many exist. */
+    const auditFor = (jobId: number, limit: number) =>
+      attempt('inspect capability audit', () => {
+        const { total } = database
+          .query('SELECT COUNT(*) AS total FROM capability_audit WHERE job_id = ?')
+          .get(jobId) as { total: number };
+        const rows = database
+          .query(
+            `SELECT actor, capability, input, outcome, created_at AS createdAt
+             FROM capability_audit WHERE job_id = ? ORDER BY id DESC LIMIT ?`,
+          )
+          .all(jobId, limit) as readonly {
+          readonly actor: string | null;
+          readonly capability: string;
+          readonly input: string;
+          readonly outcome: string;
+          readonly createdAt: number;
+        }[];
+        const entries = [...rows].reverse().map(
+          ({ actor, input, ...row }): AuditRecord => ({
+            ...row,
+            ...(actor === null ? {} : { actor }),
+            input: jsonOrText(input),
+          }),
+        );
+        return { total, entries };
+      });
+
+    const attemptsFor = (jobId: number) =>
+      attempt('list attempts', () => {
+        const rows = database
+          .query(
+            `SELECT number, status, started_at AS startedAt, finished_at AS finishedAt, error, output
+             FROM attempts WHERE job_id = ? ORDER BY number`,
+          )
+          .all(jobId) as readonly {
+          readonly number: number;
+          readonly status: AttemptRecord['status'];
+          readonly startedAt: number;
+          readonly finishedAt: number | null;
+          readonly error: string | null;
+          readonly output: string | null;
+        }[];
+        return rows.map(
+          ({ finishedAt, error, output, ...row }): AttemptRecord => ({
+            ...row,
+            ...(finishedAt === null ? {} : { finishedAt }),
+            ...(error === null
+              ? {}
+              : {
+                  error: bounded(error, ATTEMPT_ERROR_MAX_BYTES),
+                  ...(exceeds(error, ATTEMPT_ERROR_MAX_BYTES)
+                    ? { errorClipped: true as const }
+                    : {}),
+                }),
+            ...(output === null ? {} : { result: jsonOrText(output) }),
+          }),
+        );
+      });
+
     /**
      * When this attempt last published a comment of its own, if it did.
      *
@@ -2802,6 +3012,59 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
                   ...(row.bytes === null ? {} : { bytes: row.bytes }),
                 },
         );
+      });
+
+    const DELIVERY_COLUMNS = `id, source, status, attempts, received_at AS receivedAt,
+      processed_at AS processedAt, last_error AS lastError, body, decision`;
+
+    const listDeliveries = (limit = 100, filter?: DeliveryFilter) =>
+      attempt('list deliveries', () => {
+        // `json_valid` first: `json_extract` raises on a malformed body, and a
+        // row the poller stored before a body bug must not fail the listing.
+        const url = `CASE WHEN json_valid(body) THEN json_extract(body, '$.subject.url') END`;
+        const conditions =
+          filter === undefined
+            ? []
+            : [
+                `source = 'notification' AND lower(CASE WHEN json_valid(body)
+                   THEN json_extract(body, '$.repository.full_name') END) = lower(?)`,
+                ...(filter.subjectNumber === undefined
+                  ? []
+                  : [`(${url} LIKE '%/issues/' || ? OR ${url} LIKE '%/pulls/' || ?)`]),
+              ];
+        const params =
+          filter === undefined
+            ? []
+            : [
+                filter.repository,
+                ...(filter.subjectNumber === undefined
+                  ? []
+                  : [filter.subjectNumber, filter.subjectNumber]),
+              ];
+        const rows = database
+          .query(
+            `SELECT ${DELIVERY_COLUMNS} FROM deliveries
+             ${conditions.length === 0 ? '' : `WHERE ${conditions.join(' AND ')}`}
+             ORDER BY received_at DESC, id DESC LIMIT ?`,
+          )
+          .all(...params, Math.max(1, Math.min(1000, limit))) as readonly DeliveryRow[];
+        return rows.map(deliveryOf);
+      });
+
+    const jobForDelivery = (deliveryId: string) =>
+      attempt('find job for delivery', () => {
+        const row = database.query('SELECT id FROM jobs WHERE delivery_id = ?').get(deliveryId) as {
+          id: number;
+        } | null;
+        return row?.id;
+      });
+
+    const inspectDelivery = (id: string) =>
+      attempt('inspect delivery', () => {
+        const row = database
+          .query(`SELECT ${DELIVERY_COLUMNS} FROM deliveries WHERE id = ?`)
+          .get(id) as DeliveryRow | null;
+        return row === null ? undefined : deliveryOf(row);
       });
 
     const priorOperations = (jobId: number, attemptNumber: number) =>
@@ -3098,6 +3361,8 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       maintenance,
       recordAudit,
       auditLog,
+      auditFor,
+      attemptsFor,
       lastCommentAt,
       recordIntent,
       settleOperation,
@@ -3112,6 +3377,9 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       listJobs,
       job,
       inspectJob,
+      listDeliveries,
+      inspectDelivery,
+      jobForDelivery,
       liveJobIds,
       approve: (id: number, grant?: Grant) => mutateJob(id, 'approve', undefined, grant),
       retry: (id: number, approvalExpiryMs?: number) => mutateJob(id, 'retry', approvalExpiryMs),
