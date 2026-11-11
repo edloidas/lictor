@@ -1010,8 +1010,8 @@ export const qualifyNotification = (input: {
       }
 
       // ! A trusted trigger outranks any continuation whatever the timestamps:
-      // ! continuations inherit authority from the arming trigger, so letting a
-      // ! stranger's later comment demote a trusted command strips it unearned.
+      // ! a continuation's grant is minted from current policy and then narrowed,
+      // ! so letting a stranger's later comment demote a trusted command strips it unearned.
       // ! Between trusted triggers, newest wins — the timeline event on ties.
       const assignedAt =
         assignedEvent === undefined ? -1 : (parseDate(assignedEvent.created_at) ?? -1);
