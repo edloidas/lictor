@@ -13,6 +13,7 @@ import {
   grantedTools,
   intersectCapabilities,
   operationClasses,
+  publishesProse,
   toolCapabilities,
 } from './grant.ts';
 import { GitHubIdentity } from './identity.ts';
@@ -888,6 +889,23 @@ export class CapabilityBroker extends Effect.Service<CapabilityBroker>()('Capabi
             return yield* new CapabilityError({
               code: 'CAPABILITY_DENIED',
               message: `${request.name} is denied by repository policy`,
+            });
+          }
+          // ! Keyed on the target, not the job's subject: a post on any number
+          // ! with a parked question can draw a reply that resumes that job.
+          const prose =
+            publishesProse[request.name] &&
+            (request.name !== 'update_issue' ||
+              request.input.title !== undefined ||
+              request.input.body !== undefined);
+          if (
+            prose &&
+            typeof request.input.number === 'number' &&
+            (yield* queue.questionWaitingOn(expectedRepository, request.input.number))
+          ) {
+            return yield* new CapabilityError({
+              code: 'CAPABILITY_DENIED',
+              message: `${request.name} is withheld while another request on this thread waits on an answer`,
             });
           }
           const client = yield* github.authenticated;

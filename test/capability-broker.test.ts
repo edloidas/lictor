@@ -697,6 +697,126 @@ describe('CapabilityBroker', () => {
     expect(result.value.audit[0]?.input).toContain('[REDACTED]');
   });
 
+  it('withholds prose on a subject while another job waits there on a question', async () => {
+    const calls = [
+      ['create_comment', { number: 13, body: 'which branch?' }],
+      ['create_review', { number: 13, body: 'looks fine', event: 'COMMENT' }],
+      ['submit_review', { number: 13, review_id: 99, event: 'COMMENT' }],
+      ['reply_review_comment', { number: 13, comment_id: 7, body: 'see above' }],
+      ['update_issue', { number: 13, body: 'rewritten' }],
+      ['update_issue', { number: 13, title: 'retitled' }],
+      // Not prose, or not this subject: these go through.
+      ['update_issue', { number: 13, state: 'closed' }],
+      ['create_comment', { number: 14, body: 'elsewhere' }],
+    ] as const;
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        // Parked under the other kind and case: the tools address a bare number.
+        const parked = yield* queue.enqueue({
+          ...work,
+          deliveryId: 'parked',
+          interactionId: 'parked',
+          repository: 'EDLOIDAS/Lictor',
+          subject: { ...work.subject, kind: 'pull_request' },
+        });
+        const asking = yield* queue.claim;
+        yield* queue.park({
+          jobId: parked.jobId,
+          attemptNumber: asking?.attempts ?? 1,
+          repository: 'EDLOIDAS/Lictor',
+          subjectNumber: 13,
+          question: 'which branch?',
+          answerers: ['edloidas'],
+          askedAt: Date.now(),
+          expiresAt: Date.now() + 3_600_000,
+        });
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        const exits = [] as string[];
+        for (const [name, input] of calls) {
+          const exit = yield* Effect.exit(
+            broker.callTool({
+              jobId: enqueued.jobId,
+              attemptNumber: claimed?.attempts ?? -1,
+              workerId: claimed?.workerId ?? '',
+              name,
+              input,
+            }),
+          );
+          exits.push(
+            `${name} ${JSON.stringify(input)}: ${Exit.isSuccess(exit) ? 'ok' : String(exit)}`,
+          );
+        }
+        return { claimedId: claimed?.id, jobId: enqueued.jobId, exits };
+      }),
+      '[defaults.capabilities]\nread = true\ncomment = true\nissues = true\nreview = true',
+    );
+
+    expect(result.value.claimedId).toBe(result.value.jobId);
+    const [denied, allowed] = [result.value.exits.slice(0, 6), result.value.exits.slice(6)];
+    for (const exit of denied) {
+      expect(exit).toContain('CAPABILITY_DENIED');
+      expect(exit).toContain('waits on an answer');
+    }
+    expect(allowed).toEqual([
+      'update_issue {"number":13,"state":"closed"}: ok',
+      'create_comment {"number":14,"body":"elsewhere"}: ok',
+    ]);
+    expect(result.requests).toHaveLength(2);
+    expect(result.requests[0]).toContain('/issues/13');
+    expect(result.requests[1]).toContain('/issues/14/comments');
+  });
+
+  it('retires an expired question the sweep has not reached rather than withhold prose for it', async () => {
+    // The prompt already offers `needs_input` past expiry, so a refusal here
+    // would leave the agent told to ask and unable to.
+    const result = await run(
+      Effect.gen(function* () {
+        const broker = yield* CapabilityBroker;
+        const queue = yield* WorkQueue;
+        const parked = yield* queue.enqueue({ ...work, deliveryId: 'parked', interactionId: 'p' });
+        const asking = yield* queue.claim;
+        yield* queue.park({
+          jobId: parked.jobId,
+          attemptNumber: asking?.attempts ?? 1,
+          repository: work.repository,
+          subjectNumber: 13,
+          question: 'which branch?',
+          answerers: ['edloidas'],
+          askedAt: Date.now() - 10_000,
+          expiresAt: Date.now() - 5_000,
+        });
+        const enqueued = yield* queue.enqueue(work);
+        const claimed = yield* queue.claim;
+        const exit = yield* Effect.exit(
+          broker.callTool({
+            jobId: enqueued.jobId,
+            attemptNumber: claimed?.attempts ?? -1,
+            workerId: claimed?.workerId ?? '',
+            name: 'create_comment',
+            input: { number: 13, body: 'which branch?' },
+          }),
+        );
+        return {
+          exit,
+          expired: yield* queue.job(parked.jobId),
+          owed: yield* queue.outboxFor(parked.jobId),
+          waiting: yield* queue.pendingQuestion(work.repository, 'issue', 13),
+        };
+      }),
+      '[defaults.capabilities]\nread = true\ncomment = true',
+    );
+
+    expect(Exit.isSuccess(result.value.exit)).toBe(true);
+    expect(result.requests).toHaveLength(1);
+    expect(result.value.expired?.status).toBe('failed');
+    expect(result.value.expired?.outcome).toBe('unanswered');
+    expect(result.value.owed.map((message) => message.outcome)).toEqual(['unanswered']);
+    expect(result.value.waiting).toBeUndefined();
+  });
+
   /** Claims a job under a policy granting `comment`, then posts one comment. */
   const commentCall = (reply: Parameters<typeof run>[2], source = 'comment = true') =>
     run(

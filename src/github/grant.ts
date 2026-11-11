@@ -102,6 +102,37 @@ export const operationClasses: Readonly<Record<BrokerTool, OperationClass>> = {
 };
 
 /**
+ * Whether a call puts text on the subject its `number` names, where a reply to
+ * it could be read as the answer to a question parked there. `update_issue`
+ * only when it carries a title or body. A new subject is never parked on.
+ */
+export const publishesProse: Readonly<Record<BrokerTool, boolean>> = {
+  get_issue: false,
+  get_pull_request: false,
+  get_repository: false,
+  list_comments: false,
+  list_reviews: false,
+  list_review_threads: false,
+  list_review_comments: false,
+  create_blob: false,
+  create_tree: false,
+  create_commit: false,
+  create_branch: false,
+  update_branch: false,
+  update_issue: true,
+  submit_review: true,
+  delete_pending_review: false,
+  resolve_review_thread: false,
+  unresolve_review_thread: false,
+  merge_pull_request: false,
+  create_comment: true,
+  create_issue: false,
+  create_pull_request: false,
+  create_review: true,
+  reply_review_comment: true,
+};
+
+/**
  * Policy's capabilities with `undefined` settled to `false` before storage, and
  * without `scripts`, which is workspace authority rather than the broker's.
  */

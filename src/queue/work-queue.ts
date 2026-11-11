@@ -2127,6 +2127,32 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       });
 
     /**
+     * Whether a live question is parked on this number, of either kind — issues
+     * and pull requests share one. An expired one the sweep has not reached is
+     * failed `unanswered` first, as `park` does: qualification would still take
+     * an answer for it, while the prompt already offers `needs_input` again.
+     */
+    const questionWaitingOn = (repository: string, subjectNumber: number) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        return yield* attempt('check question waiting on a subject', () =>
+          database.transaction(() => {
+            const onSubject = `SELECT j.id FROM jobs j
+               WHERE ${ASKED_QUESTION_WHERE}
+                 AND lower(json_extract(j.payload, '$.repository')) = ?
+                 AND json_extract(j.payload, '$.subject.number') = ?`;
+            const subject = [repository.toLowerCase(), subjectNumber] as const;
+            const expiredWhere = `id IN (${onSubject} AND j.hold_expires_at < ?)`;
+            insertOutboxFromJobs('unanswered', expiredWhere, [...subject, now], now);
+            database
+              .query(`UPDATE jobs SET ${UNANSWERED_SET} WHERE ${expiredWhere}`)
+              .run(now, now, ...subject, now);
+            return database.query(`${onSubject} LIMIT 1`).get(...subject) != null;
+          })(),
+        );
+      });
+
+    /**
      * Answers already taken on this subject, by the comment each one was.
      *
      * ! Resuming and marking the delivery done are two writes, and a crash
@@ -2998,6 +3024,7 @@ export class WorkQueue extends Effect.Service<WorkQueue>()('WorkQueue', {
       park,
       answerQuestion,
       pendingQuestion,
+      questionWaitingOn,
       answersTaken,
       recoverStale,
       counts,

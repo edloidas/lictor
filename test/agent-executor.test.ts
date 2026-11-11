@@ -943,7 +943,7 @@ describe('AgentExecutor', () => {
     );
   });
 
-  it('withholds needs_input from a job whose subject already waits on a question', async () => {
+  it('withholds needs_input and prose from a job whose subject already waits on a question', async () => {
     const databasePath = tempStatePath();
     await Effect.runPromise(
       Effect.scoped(
@@ -992,6 +992,7 @@ describe('AgentExecutor', () => {
 
     expect(expired).toContain('`needs_input` — exceptional');
     expect(behind).toContain('`needs_input` — not available to this run.');
+    expect(behind).toContain('nothing can be posted on this thread until it is answered');
     expect(behind).not.toContain('`needs_input` — exceptional');
     expect(elsewhere).toContain('`needs_input` — exceptional');
     expect(elsewhere).not.toContain('not available to this run');
