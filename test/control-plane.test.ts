@@ -8,7 +8,7 @@ import { LictorConfig, stateDirOf } from '../src/config.ts';
 import { ControlPlane, type ControlRequest, ControlServer } from '../src/control/control-plane.ts';
 import { CredentialHealth } from '../src/github/credential-health.ts';
 import { Policy, parsePolicy } from '../src/policy.ts';
-import { WorkQueue } from '../src/queue/work-queue.ts';
+import { QueueError, WorkQueue } from '../src/queue/work-queue.ts';
 import type { WorkItem } from '../src/work-item.ts';
 
 const work: WorkItem = {
@@ -245,7 +245,7 @@ describe('local control plane', () => {
     }
   });
 
-  it('still reports a job whose payload no longer decodes', async () => {
+  it('tells an undecodable job apart from a pruned or never-issued one', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'lictor-control-'));
     const path = join(directory, 'queue.sqlite');
     const ConfigLive = Layer.succeed(
@@ -284,51 +284,154 @@ describe('local control plane', () => {
     );
 
     try {
-      const enqueued = await Effect.runPromise(
-        Effect.scoped(
-          Effect.flatMap(WorkQueue, (queue) =>
-            // Not approval-required: the claim skips those, and the claim is
-            // what dead-letters an unreadable payload.
-            queue.enqueue({ ...work, approvalRequired: false }),
-          ).pipe(Effect.provide(QueueLive)),
+      const run = <A, E>(effect: Effect.Effect<A, E, WorkQueue | ControlPlane>) =>
+        Effect.runPromise(
+          Effect.scoped(effect.pipe(Effect.provide(Layer.mergeAll(PlaneLive, QueueLive)))),
+        );
+      const show = (id: number) =>
+        Effect.flatMap(ControlPlane, (plane) =>
+          plane.execute({ command: 'job.show', args: [String(id)] }),
+        );
+
+      // Not approval-required: the claim skips those, and the claim is what
+      // dead-letters an unreadable payload.
+      const [rejected, unparsed, pruned] = await run(
+        Effect.flatMap(WorkQueue, (queue) =>
+          Effect.all(
+            ['rejected', 'unparsed', 'pruned'].map((deliveryId) =>
+              queue.enqueue({
+                ...work,
+                deliveryId,
+                interactionId: deliveryId,
+                approvalRequired: false,
+              }),
+            ),
+          ),
         ),
       );
+      if (rejected === undefined || unparsed === undefined || pruned === undefined)
+        throw new Error('expected three jobs');
 
       const raw = new Database(path);
       const payload = JSON.parse(
         (
-          raw.query('SELECT payload FROM jobs WHERE id = ?').get(enqueued.jobId) as {
+          raw.query('SELECT payload FROM jobs WHERE id = ?').get(rejected.jobId) as {
             payload: string;
           }
         ).payload,
       ) as Record<string, unknown>;
       raw
         .query('UPDATE jobs SET payload = ? WHERE id = ?')
-        .run(JSON.stringify({ ...payload, reasons: 'not-an-array' }), enqueued.jobId);
+        // Oversized, because the decode error echoes the value it rejects.
+        .run(JSON.stringify({ ...payload, reasons: 'x'.repeat(10_000) }), rejected.jobId);
+
+      // The claim dead-letters it and writes the message it still owes; the
+      // cancel leaves a message behind for the row retention deletes next.
+      await run(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.claim;
+          yield* queue.cancel(pruned.jobId);
+        }),
+      );
+      // Never claimed, and malformed past the outbox guard: nothing else
+      // records this job, so the row is the only thing left to report.
+      raw.query("UPDATE jobs SET payload = 'not json' WHERE id = ?").run(unparsed.jobId);
+      raw.query('DELETE FROM jobs WHERE id = ?').run(pruned.jobId);
       raw.close();
 
-      const shown = await Effect.runPromise(
-        Effect.scoped(
-          Effect.gen(function* () {
-            const queue = yield* WorkQueue;
-            // The claim dead-letters it and writes the message it still owes.
-            yield* queue.claim;
-            const plane = yield* ControlPlane;
-            return yield* plane.execute({ command: 'job.show', args: [String(enqueued.jobId)] });
-          }).pipe(Effect.provide(Layer.mergeAll(PlaneLive, QueueLive))),
-        ),
+      const shown = await run(
+        Effect.gen(function* () {
+          const plane = yield* ControlPlane;
+          return {
+            rejected: yield* show(rejected.jobId),
+            unparsed: yield* show(unparsed.jobId),
+            pruned: yield* show(pruned.jobId),
+            unissued: yield* show(pruned.jobId + 100),
+            list: yield* plane.execute({ command: 'job.list', args: [] }),
+            repositories: yield* plane.execute({ command: 'repository.list', args: [] }),
+            // What keeps the broker and the levers off the row.
+            acting: yield* Effect.either((yield* WorkQueue).job(rejected.jobId)),
+          };
+        }),
       );
 
       // `queue.job` cannot decode this row, and it is exactly the row that owes
       // the thread a message — reporting nothing here loses the only record.
-      expect(shown).toMatchObject({
-        id: enqueued.jobId,
+      expect(shown.rejected).toMatchObject({
+        id: rejected.jobId,
         undecodable: true,
+        status: 'dead_letter',
+        repository: 'edloidas/lictor',
+        subjectNumber: 14,
+        lastError: 'invalid stored payload',
+        createdAt: expect.any(Number),
         outbox: [{ outcome: 'failed', status: 'pending' }],
       });
+      expect(shown.rejected).not.toHaveProperty('work');
+      const { decodeError } = shown.rejected as { decodeError: string };
+      expect(decodeError).toStartWith('reasons: Expected');
+      expect(Buffer.byteLength(decodeError)).toBeLessThanOrEqual(2048);
+      expect(shown.acting._tag).toBe('Left');
+      expect(shown.unparsed).toMatchObject({
+        id: unparsed.jobId,
+        undecodable: true,
+        status: 'pending',
+        outbox: [],
+        operations: [],
+        artifacts: [],
+      });
+      expect(shown.unparsed).not.toHaveProperty('repository');
+      expect(shown.pruned).toMatchObject({
+        id: pruned.jobId,
+        pruned: true,
+        outbox: [{ outcome: 'canceled' }],
+      });
+      expect(shown.pruned).not.toHaveProperty('undecodable');
+      expect(shown.unissued).toBeUndefined();
+      expect(shown.list).toMatchObject([
+        { id: unparsed.jobId, undecodable: true },
+        { id: rejected.jobId, undecodable: true, repository: 'edloidas/lictor' },
+      ]);
+      expect(shown.repositories).toStrictEqual(['edloidas/lictor']);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  it('fails job.show on a database error instead of answering not found', async () => {
+    const ConfigLive = Layer.succeed(LictorConfig, config('unused.sock'));
+    const QueueLive = WorkQueue.DefaultWithoutDependencies.pipe(Layer.provide(ConfigLive));
+    const FailingQueue = Layer.effect(
+      WorkQueue,
+      Effect.map(WorkQueue, (queue) =>
+        WorkQueue.make({
+          ...queue,
+          inspectJob: () =>
+            Effect.fail(new QueueError({ operation: 'inspect job', cause: 'database locked' })),
+        }),
+      ),
+    ).pipe(Layer.provide(QueueLive));
+    const PlaneLive = ControlPlane.DefaultWithoutDependencies.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ConfigLive,
+          Layer.effect(Policy, parsePolicy('').pipe(Effect.map(Policy.make))),
+          FailingQueue,
+          CredentialHealth.Default,
+        ),
+      ),
+    );
+
+    const shown = await Effect.runPromise(
+      Effect.scoped(
+        Effect.flatMap(ControlPlane, (plane) =>
+          Effect.either(plane.execute({ command: 'job.show', args: ['1'] })),
+        ).pipe(Effect.provide(PlaneLive)),
+      ),
+    );
+
+    expect(shown._tag).toBe('Left');
   });
 
   // ! The approval is the authorization decision. Minting at the first claim

@@ -653,8 +653,10 @@ describe('DeliveryWorker', () => {
       ),
     );
 
-    expect(result[0]?.work.trigger?.clipped).toBe(true);
-    expect(Buffer.byteLength(result[0]?.work.trigger?.text ?? '')).toBe(512);
+    const [listed] = result;
+    if (listed === undefined || !('work' in listed)) throw new Error('expected a decoded job');
+    expect(listed.work.trigger?.clipped).toBe(true);
+    expect(Buffer.byteLength(listed.work.trigger?.text ?? '')).toBe(512);
   });
 });
 

@@ -157,19 +157,19 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
             // reason live. Nothing is published to the thread, so this is the
             // only place either can be read.
             //
-            // ! Read first, and survive a job that will not decode. A payload
-            // ! the schema no longer accepts is dead-lettered *and* owed a
-            // ! message, and `queue.job` is the one call that fails on exactly
-            // ! those rows — reading it first made the record unreachable for
-            // ! the case it was added for.
+            // ! `inspectJob`, never `queue.job`, and nothing here swallows a
+            // ! failure. `queue.job` fails on a payload the schema no longer
+            // ! accepts, and answering that with `undefined` reads exactly like
+            // ! an id never issued; a swallowed database error reads the same.
             const outbox = yield* queue.outboxFor(jobId);
             const operations = yield* queue.operationsFor(jobId);
             const artifacts = (yield* queue.artifactsFor(jobId)).map(showArtifact);
-            const found = yield* Effect.orElseSucceed(queue.job(jobId), () => undefined);
+            const found = yield* queue.inspectJob(jobId);
             if (found !== undefined) return { ...found, outbox, operations, artifacts };
+            // The outbox outlives a pruned job, having no foreign key to it.
             return outbox.length === 0 && operations.length === 0 && artifacts.length === 0
               ? undefined
-              : { id: jobId, undecodable: true, outbox, operations, artifacts };
+              : { id: jobId, pruned: true, outbox, operations, artifacts };
           }
           case 'job.approve':
             return yield* mutate('approve', yield* positiveId(args[0]));
@@ -211,7 +211,12 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
           }
           case 'repository.list': {
             const jobs = yield* queue.listJobs(1000);
-            return [...new Set(jobs.map((job) => job.work.repository))].sort();
+            const repositories = jobs.map((job) =>
+              'work' in job ? job.work.repository : job.repository,
+            );
+            return [
+              ...new Set(repositories.filter((repository) => repository !== undefined)),
+            ].sort();
           }
           case 'repository.inspect': {
             const repository = args[0]?.toLowerCase();

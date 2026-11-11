@@ -234,6 +234,12 @@ Add `--json` to any command for automation. The CLI communicates only through
 the daemon socket; it never opens SQLite. Mutations are state-checked,
 idempotent, and written to the audit log.
 
+A job whose stored payload no longer decodes, typically after an upgrade narrowed
+the schema, still appears in `job.list` and `job.show`, with `undecodable: true`,
+the `decodeError`, and in place of `work` the `repository` and `subjectNumber`
+wherever the payload still names them. `job.show` answers `pruned: true` for a
+job retention deleted while its outbox message was still kept.
+
 `status` reports queue counts, the daemon heartbeat, oldest active job,
 executor mode, database size, and available disk. Jobs that exhaust their
 attempt budget or contain corrupt durable data move to `dead_letter` instead of
