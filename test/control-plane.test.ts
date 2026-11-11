@@ -180,21 +180,78 @@ describe('local control plane', () => {
               },
               { path: 'big.log', state: 'rejected', reason: 'too_large', bytes: 300_000 },
             ]);
-            yield* queue.complete(enqueued.jobId, claimed?.attempts ?? 0, '{}', {
-              repository: work.repository,
-              subjectNumber: work.subject.number,
-              outcome: 'completed',
-              note: 'Opened the pull request.',
-            });
+            yield* queue.complete(
+              enqueued.jobId,
+              claimed?.attempts ?? 0,
+              JSON.stringify({ status: 'completed', summary: 'Opened the pull request.' }),
+              {
+                repository: work.repository,
+                subjectNumber: work.subject.number,
+                outcome: 'completed',
+                note: 'Opened the pull request.',
+              },
+            );
             const shown = yield* call(server.path, {
               command: 'job.show',
               args: [String(enqueued.jobId)],
+            });
+            yield* queue.receiveDelivery({
+              id: 'notification:1:2026-08-21T10:00:00Z:abc123',
+              event: 'notification',
+              body: JSON.stringify({
+                id: '1',
+                unread: true,
+                reason: 'ci_activity',
+                updated_at: '2026-08-21T10:00:00Z',
+                subject: {
+                  title: 'Control plane',
+                  url: 'https://api.github.com/repos/edloidas/lictor/issues/14',
+                  type: 'Issue',
+                },
+                repository: { full_name: 'edloidas/lictor' },
+              }),
+              source: 'notification',
+            });
+            const delivery = yield* queue.claimDelivery;
+            yield* queue.finishDelivery(
+              'notification:1:2026-08-21T10:00:00Z:abc123',
+              delivery?.attempts ?? 1,
+              'completed',
+              undefined,
+              { decision: 'ignored', reason: 'machine_traffic' },
+            );
+            const deliveries = yield* call(server.path, {
+              command: 'delivery.list',
+              args: ['edloidas/lictor#14', '5'],
+            });
+            const elsewhere = yield* call(server.path, {
+              command: 'delivery.list',
+              args: ['edloidas/lictor#15'],
+            });
+            const limitFirst = yield* call(server.path, {
+              command: 'delivery.list',
+              args: ['1', 'edloidas/lictor'],
+            });
+            const noId = yield* call(server.path, { command: 'delivery.show', args: [] });
+            const badFilter = yield* call(server.path, {
+              command: 'delivery.list',
+              args: ['not a repository'],
+            });
+            const deliveryShown = yield* call(server.path, {
+              command: 'delivery.show',
+              args: ['notification:1:2026-08-21T10:00:00Z:abc123'],
             });
             return {
               approved: JSON.parse(approved),
               status: JSON.parse(status),
               capability: JSON.parse(capability),
               shown: JSON.parse(shown),
+              deliveries: JSON.parse(deliveries),
+              elsewhere: JSON.parse(elsewhere),
+              badFilter: JSON.parse(badFilter),
+              limitFirst: JSON.parse(limitFirst),
+              noId: JSON.parse(noId),
+              deliveryShown: JSON.parse(deliveryShown),
               claimed,
               mode: statSync(server.path).mode & 0o777,
             };
@@ -223,7 +280,44 @@ describe('local control plane', () => {
           operations: [
             { attempt: 1, tool: 'create_pull_request', state: 'landed', receipt: { number: 14 } },
           ],
+          attempts: [
+            {
+              number: 1,
+              status: 'completed',
+              result: { status: 'completed', summary: 'Opened the pull request.' },
+            },
+          ],
+          audit: [{ capability: 'control.approve', input: {}, outcome: 'ok' }],
         },
+      });
+      expect(result.shown.result).not.toHaveProperty('auditTotal');
+      expect(result.deliveries).toMatchObject({
+        ok: true,
+        result: [
+          {
+            id: 'notification:1:2026-08-21T10:00:00Z:abc123',
+            repository: 'edloidas/lictor',
+            subject: { kind: 'issue', number: 14 },
+            decision: { decision: 'ignored', reason: 'machine_traffic' },
+          },
+        ],
+      });
+      expect(result.elsewhere).toEqual({ ok: true, result: [] });
+      expect(result.limitFirst).toMatchObject({
+        ok: true,
+        result: [{ id: 'notification:1:2026-08-21T10:00:00Z:abc123' }],
+      });
+      expect(result.noId).toMatchObject({
+        ok: false,
+        error: { code: 'CONTROL_DELIVERY_ID_REQUIRED' },
+      });
+      expect(result.badFilter).toMatchObject({
+        ok: false,
+        error: { code: 'CONTROL_DELIVERY_FILTER_INVALID' },
+      });
+      expect(result.deliveryShown).toMatchObject({
+        ok: true,
+        result: { status: 'completed', threadReason: 'ci_activity' },
       });
       // Retained bytes outlive the workspace, so this is the only place they read back.
       expect(result.shown.result.artifacts).toEqual([
@@ -377,6 +471,8 @@ describe('local control plane', () => {
         id: unparsed.jobId,
         undecodable: true,
         status: 'pending',
+        attempts: [],
+        audit: [],
         outbox: [],
         operations: [],
         artifacts: [],

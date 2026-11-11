@@ -6,7 +6,7 @@ import { LictorConfig } from '../config.ts';
 import { CredentialHealth } from '../github/credential-health.ts';
 import { grantedTools, mintGrant } from '../github/grant.ts';
 import { Policy } from '../policy.ts';
-import { type ArtifactRecord, WorkQueue } from '../queue/work-queue.ts';
+import { type ArtifactRecord, type DeliveryFilter, WorkQueue } from '../queue/work-queue.ts';
 
 /** The reply is JSON: retained bytes go out as text where they decode, base64 where not. */
 const showArtifact = (artifact: ArtifactRecord) => {
@@ -48,6 +48,28 @@ const answerLocation = (value: string | undefined): Effect.Effect<string, Contro
           message: 'An https URL to the answer is required',
         }),
       );
+
+/** Newest audit rows `job.show` returns; one tool call writes two. */
+const JOB_AUDIT_LIMIT = 200;
+
+/** `owner/repo` or `owner/repo#N`, the handle a thread on GitHub shows. */
+const deliveryFilter = (
+  value: string | undefined,
+): Effect.Effect<DeliveryFilter | undefined, ControlError> => {
+  if (value === undefined) return Effect.succeed(undefined);
+  const match = /^([\w.-]+\/[\w.-]+)(?:#(\d+))?$/.exec(value);
+  if (match?.[1] === undefined)
+    return Effect.fail(
+      new ControlError({
+        code: 'CONTROL_DELIVERY_FILTER_INVALID',
+        message: 'Filter by owner/repo or owner/repo#number',
+      }),
+    );
+  return Effect.succeed({
+    repository: match[1],
+    ...(match[2] === undefined ? {} : { subjectNumber: Number(match[2]) }),
+  });
+};
 
 const positiveId = (value: string | undefined): Effect.Effect<number, ControlError> => {
   const id = Number(value);
@@ -161,15 +183,43 @@ export class ControlPlane extends Effect.Service<ControlPlane>()('ControlPlane',
             // ! failure. `queue.job` fails on a payload the schema no longer
             // ! accepts, and answering that with `undefined` reads exactly like
             // ! an id never issued; a swallowed database error reads the same.
+            const attempts = yield* queue.attemptsFor(jobId);
+            const audit = yield* queue.auditFor(jobId, JOB_AUDIT_LIMIT);
             const outbox = yield* queue.outboxFor(jobId);
             const operations = yield* queue.operationsFor(jobId);
             const artifacts = (yield* queue.artifactsFor(jobId)).map(showArtifact);
+            const evidence = {
+              attempts,
+              audit: audit.entries,
+              ...(audit.total > audit.entries.length ? { auditTotal: audit.total } : {}),
+              outbox,
+              operations,
+              artifacts,
+            };
             const found = yield* queue.inspectJob(jobId);
-            if (found !== undefined) return { ...found, outbox, operations, artifacts };
+            if (found !== undefined) return { ...found, ...evidence };
             // The outbox outlives a pruned job, having no foreign key to it.
-            return outbox.length === 0 && operations.length === 0 && artifacts.length === 0
+            return outbox.length === 0 &&
+              operations.length === 0 &&
+              artifacts.length === 0 &&
+              audit.total === 0
               ? undefined
-              : { id: jobId, pruned: true, outbox, operations, artifacts };
+              : { id: jobId, pruned: true, ...evidence };
+          }
+          case 'delivery.list': {
+            // Either order, either omitted: a limit is the only all-digit argument.
+            const limit = args.find((arg) => /^\d+$/.test(arg));
+            const filter = yield* deliveryFilter(args.find((arg) => arg !== limit));
+            return yield* queue.listDeliveries(Number(limit ?? 100), filter);
+          }
+          case 'delivery.show': {
+            const id = args[0];
+            if (id === undefined || id === '')
+              return yield* new ControlError({
+                code: 'CONTROL_DELIVERY_ID_REQUIRED',
+                message: 'A delivery id is required',
+              });
+            return yield* queue.inspectDelivery(id);
           }
           case 'job.approve':
             return yield* mutate('approve', yield* positiveId(args[0]));

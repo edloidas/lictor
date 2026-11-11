@@ -188,6 +188,7 @@ describe('qualifyNotification', () => {
 
     const value = qualified(result.exit);
     expect(value.work).toBeUndefined();
+    expect(value.ignored).toEqual({ reason: 'machine_traffic' });
     expect(value.lastActivityAt).toBe(Date.parse('2026-08-21T10:00:00Z'));
     expect(result.requests).toEqual([]);
   });
@@ -210,6 +211,7 @@ describe('qualifyNotification', () => {
     );
 
     expect(qualified(result.exit).work).toBeUndefined();
+    expect(qualified(result.exit).ignored).toEqual({ reason: 'no_subject_number' });
     expect(result.requests).toEqual([]);
   });
 
@@ -336,6 +338,7 @@ describe('qualifyNotification', () => {
     );
 
     expect(qualified(result.exit).work).toBeUndefined();
+    expect(qualified(result.exit).ignored).toEqual({ reason: 'untrusted_sender' });
   });
 
   describe('edited text', () => {
@@ -596,6 +599,7 @@ describe('qualifyNotification', () => {
     );
 
     expect(qualified(result.exit).work).toBeUndefined();
+    expect(qualified(result.exit).ignored).toEqual({ reason: 'no_trigger' });
   });
 
   // A near-miss must not match. `@adiutriel-bot` is a different account, and
@@ -913,6 +917,7 @@ describe('qualifyNotification', () => {
     );
 
     expect(qualified(result.exit).work).toBeUndefined();
+    expect(qualified(result.exit).ignored).toEqual({ reason: 'activity_time_unreadable' });
     expect(result.requests).toEqual([]);
   });
 
@@ -1583,6 +1588,8 @@ describe('qualifyNotification', () => {
 
     const value = qualified(result.exit);
     expect(value.work).toBeUndefined();
+    // Closed is not an exit of its own: the scan carries on and finds nothing.
+    expect(value.ignored).toEqual({ reason: 'no_trigger', notes: ['subject_closed'] });
     // A dropped trigger still moves the cursor, or the next delivery on this
     // thread reads an over-wide window and re-attributes old activity as fresh.
     expect(value.lastActivityAt).toBe(Date.parse('2026-08-21T10:00:00Z'));
@@ -1654,6 +1661,7 @@ describe('qualifyNotification', () => {
     const work = qualified(result.exit).work;
     expect(work?.sender).toBe('edloidas');
     expect(work?.reasons).toEqual(['mentioned']);
+    expect(qualified(result.exit).ignored).toBeUndefined();
   });
 
   it('falls back to the mention when a closed subject drops the assignment', async () => {
@@ -1974,6 +1982,7 @@ describe('qualifyNotification', () => {
     );
 
     expect(qualified(result.exit).work).toBeUndefined();
+    expect(qualified(result.exit).ignored).toEqual({ reason: 'no_trigger' });
   });
 });
 

@@ -14,7 +14,8 @@ const args = process.argv.slice(3).filter((arg) => arg !== '--json');
 const Main = Effect.gen(function* () {
   if (command === undefined)
     return yield* new CliError({
-      message: 'Usage: bun cli <status|job.*|repository.*|policy.check|prune> [args] [--json]',
+      message:
+        'Usage: bun cli <status|job.*|delivery.*|repository.*|policy.check|prune> [args] [--json]',
     });
   const config = yield* LictorConfig;
   const response = yield* Effect.async<string, CliError>((resume) => {

@@ -223,8 +223,9 @@ describe('WorkQueue', () => {
       }),
     );
 
-    expect(result.first).toEqual({ jobId: 1, inserted: true });
-    expect(result.duplicate).toEqual({ jobId: 1, inserted: false });
+    expect(result.first).toEqual({ jobId: 1, inserted: true, fromThisDelivery: true });
+    // The same delivery retried after its insert committed: the job's origin.
+    expect(result.duplicate).toEqual({ jobId: 1, inserted: false, fromThisDelivery: true });
     expect(result.counts.pending).toBe(1);
   });
 
@@ -239,7 +240,7 @@ describe('WorkQueue', () => {
       }),
     );
 
-    expect(result).toEqual({ jobId: 1, inserted: false });
+    expect(result).toEqual({ jobId: 1, inserted: false, fromThisDelivery: false });
   });
 
   it('claims pending jobs in insertion order exactly once', async () => {
@@ -1179,9 +1180,17 @@ describe('WorkQueue', () => {
       }),
     );
 
-    expect(result.first).toEqual({ jobId: 2, inserted: true });
-    expect(result.sameDelivery).toEqual({ jobId: result.first.jobId, inserted: false });
-    expect(result.sameInteraction).toEqual({ jobId: result.first.jobId, inserted: false });
+    expect(result.first).toEqual({ jobId: 2, inserted: true, fromThisDelivery: true });
+    expect(result.sameDelivery).toEqual({
+      jobId: result.first.jobId,
+      inserted: false,
+      fromThisDelivery: true,
+    });
+    expect(result.sameInteraction).toEqual({
+      jobId: result.first.jobId,
+      inserted: false,
+      fromThisDelivery: false,
+    });
   });
 
   it('completes a claimed job', async () => {
@@ -4286,6 +4295,306 @@ describe('WorkQueue artifacts', () => {
       );
 
       expect(result).toEqual([{ ...report, attempt: 1 }]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('WorkQueue inspection', () => {
+  it('lists every attempt with its timing, its stored result, and a bounded error', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('attempts'));
+        const first = yield* queue.claim;
+        yield* queue.fail(jobId, first?.attempts ?? 1, 'é'.repeat(3000), 0);
+        const second = yield* queue.claim;
+        yield* queue.complete(
+          jobId,
+          second?.attempts ?? 2,
+          JSON.stringify({ status: 'completed', summary: 'Opened the pull request.' }),
+        );
+        return yield* queue.attemptsFor(jobId);
+      }),
+    );
+
+    expect(result).toEqual([
+      {
+        number: 1,
+        status: 'failed',
+        startedAt: expect.any(Number),
+        finishedAt: expect.any(Number),
+        error: 'é'.repeat(2048),
+        errorClipped: true,
+      },
+      {
+        number: 2,
+        status: 'completed',
+        startedAt: expect.any(Number),
+        finishedAt: expect.any(Number),
+        result: { status: 'completed', summary: 'Opened the pull request.' },
+      },
+    ]);
+  });
+
+  it('returns the newest audit rows, oldest first, with the total', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const { jobId } = yield* queue.enqueue(work('audit'));
+        for (const capability of ['get_issue', 'create_comment', 'react'])
+          yield* queue.recordAudit({
+            jobId,
+            repository: 'edloidas/lictor',
+            ...(capability === 'react' ? {} : { actor: 'adiutriel' }),
+            capability,
+            input: capability === 'react' ? 'not json' : '{"number":17}',
+            outcome: 'ok',
+          });
+        return yield* queue.auditFor(jobId, 2);
+      }),
+    );
+
+    expect(result).toEqual({
+      total: 3,
+      entries: [
+        {
+          actor: 'adiutriel',
+          capability: 'create_comment',
+          input: { number: 17 },
+          outcome: 'ok',
+          createdAt: expect.any(Number),
+        },
+        { capability: 'react', input: 'not json', outcome: 'ok', createdAt: expect.any(Number) },
+      ],
+    });
+  });
+
+  const thread = (repository: string, number: number, reason = 'mention') =>
+    JSON.stringify({
+      id: `${repository}#${number}`,
+      unread: true,
+      reason,
+      updated_at: '2026-08-21T10:00:00Z',
+      subject: {
+        title: `Subject ${number}`,
+        url: `https://api.github.com/repos/${repository}/issues/${number}`,
+        type: 'Issue',
+      },
+      repository: { full_name: repository },
+    });
+
+  it('finds deliveries by the repository and subject a thread shows', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const bodies: Record<string, string> = {
+          'on-42': thread('edloidas/lictor', 42),
+          'on-142': thread('edloidas/lictor', 142),
+          elsewhere: thread('edloidas/other', 42),
+          malformed: 'not json',
+        };
+        for (const [id, body] of Object.entries(bodies))
+          yield* queue.receiveDelivery({ id, event: 'notification', body, source: 'notification' });
+        return {
+          subject: yield* queue.listDeliveries(10, {
+            repository: 'Edloidas/Lictor',
+            subjectNumber: 42,
+          }),
+          repository: yield* queue.listDeliveries(10, { repository: 'edloidas/lictor' }),
+          all: yield* queue.listDeliveries(10),
+          malformed: yield* queue.inspectDelivery('malformed'),
+          missing: yield* queue.inspectDelivery('never-stored'),
+        };
+      }),
+    );
+
+    expect(result.subject).toMatchObject([
+      {
+        id: 'on-42',
+        status: 'pending',
+        repository: 'edloidas/lictor',
+        subject: { kind: 'issue', number: 42 },
+        title: 'Subject 42',
+        threadReason: 'mention',
+      },
+    ]);
+    expect(result.subject[0]).not.toHaveProperty('decision');
+    expect(result.repository.map((delivery) => delivery.id).sort()).toEqual(['on-142', 'on-42']);
+    expect(result.all).toHaveLength(4);
+    expect(result.malformed).toEqual({
+      id: 'malformed',
+      source: 'notification',
+      status: 'pending',
+      attempts: 0,
+      receivedAt: expect.any(Number),
+    });
+    expect(result.missing).toBeUndefined();
+  });
+
+  it('records the decision a delivery finished on, and drops it when GitHub resends', async () => {
+    const result = await run(
+      Effect.gen(function* () {
+        const queue = yield* WorkQueue;
+        const delivery = {
+          id: 'decided',
+          event: 'notification',
+          body: thread('edloidas/lictor', 7),
+          source: 'notification',
+        } as const;
+        yield* queue.receiveDelivery(delivery);
+        const claimed = yield* queue.claimDelivery;
+        yield* queue.finishDelivery('decided', claimed?.attempts ?? 1, 'completed', undefined, {
+          decision: 'ignored',
+          reason: 'no_trigger',
+          notes: ['subject_closed'],
+        });
+        const decided = yield* queue.inspectDelivery('decided');
+
+        yield* queue.receiveDelivery({ ...delivery, id: 'condemned' });
+        const condemned = yield* queue.claimDelivery;
+        yield* queue.finishDelivery(
+          'condemned',
+          condemned?.attempts ?? 1,
+          'failed',
+          'DELIVERY_PROCESSING_FAILED',
+        );
+        const quarantined = yield* queue.inspectDelivery('condemned');
+        // A failed row is the only kind GitHub's resend revives; this one
+        // stored a decision, which the resend must not carry onto the new run.
+        yield* queue.receiveDelivery({ ...delivery, id: 'stale' });
+        const stale = yield* queue.claimDelivery;
+        yield* queue.finishDelivery('stale', stale?.attempts ?? 1, 'failed', 'gone', {
+          decision: 'queued',
+          jobId: 9,
+        });
+        yield* queue.receiveDelivery({ ...delivery, id: 'stale' });
+        return { decided, quarantined, revived: yield* queue.inspectDelivery('stale') };
+      }),
+    );
+
+    expect(result.decided?.decision).toEqual({
+      decision: 'ignored',
+      reason: 'no_trigger',
+      notes: ['subject_closed'],
+    });
+    expect(result.quarantined).toMatchObject({
+      status: 'failed',
+      lastError: 'DELIVERY_PROCESSING_FAILED',
+      decision: { decision: 'quarantined' },
+    });
+    expect(result.revived?.status).toBe('pending');
+    expect(result.revived).not.toHaveProperty('decision');
+    expect(result.revived).not.toHaveProperty('lastError');
+  });
+
+  // The v7 migration condemns webhook rows rather than deleting them, and no
+  // decoder exists for their bodies.
+  it('lists a webhook-era delivery without naming its subject', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    const inLayer = <A, E>(effect: Effect.Effect<A, E, WorkQueue>) =>
+      Effect.runPromise(Effect.scoped(Effect.provide(effect, queueLayer(path))));
+    try {
+      await inLayer(Effect.flatMap(WorkQueue, (queue) => queue.counts));
+      const database = new Database(path);
+      database
+        .query(
+          `INSERT INTO deliveries (id, event, body, source, status, received_at, last_error)
+           VALUES ('legacy', 'issue_comment', '{}', 'webhook', 'failed', 1, 'webhook transport removed')`,
+        )
+        .run();
+      database.close();
+
+      const listed = await inLayer(Effect.flatMap(WorkQueue, (queue) => queue.listDeliveries(10)));
+
+      expect(listed).toEqual([
+        {
+          id: 'legacy',
+          source: 'webhook',
+          status: 'failed',
+          attempts: 0,
+          receivedAt: 1,
+          lastError: 'webhook transport removed',
+          decision: { decision: 'quarantined' },
+        },
+      ]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a stored decision it cannot decode instead of failing the read', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    const inLayer = <A, E>(effect: Effect.Effect<A, E, WorkQueue>) =>
+      Effect.runPromise(Effect.scoped(Effect.provide(effect, queueLayer(path))));
+    try {
+      await inLayer(
+        Effect.flatMap(WorkQueue, (queue) =>
+          queue.receiveDelivery({
+            id: 'future',
+            event: 'notification',
+            body: thread('edloidas/lictor', 7),
+            source: 'notification',
+          }),
+        ),
+      );
+      const database = new Database(path);
+      database
+        .query("UPDATE deliveries SET status = 'completed', decision = ? WHERE id = 'future'")
+        .run(JSON.stringify({ decision: 'deferred' }));
+      database.close();
+
+      const shown = await inLayer(
+        Effect.flatMap(WorkQueue, (queue) => queue.inspectDelivery('future')),
+      );
+
+      expect(shown).toMatchObject({ id: 'future', decisionUnreadable: true });
+      expect(shown).not.toHaveProperty('decision');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  // The early return in `migrate` skips every ALTER once the stamp reads 18,
+  // so a column missing from its guard never reaches a database already there.
+  it('adds the decision column to a version-18 database that predates it', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'lictor-queue-'));
+    const path = join(directory, 'queue.sqlite');
+    const inLayer = <A, E>(effect: Effect.Effect<A, E, WorkQueue>) =>
+      Effect.runPromise(Effect.scoped(Effect.provide(effect, queueLayer(path))));
+    try {
+      await inLayer(Effect.flatMap(WorkQueue, (queue) => queue.counts));
+      const database = new Database(path);
+      database.exec('ALTER TABLE deliveries DROP COLUMN decision');
+      database.close();
+
+      const shown = await inLayer(
+        Effect.gen(function* () {
+          const queue = yield* WorkQueue;
+          yield* queue.receiveDelivery({
+            id: 'upgraded',
+            event: 'notification',
+            body: thread('edloidas/lictor', 7),
+            source: 'notification',
+          });
+          const claimed = yield* queue.claimDelivery;
+          yield* queue.finishDelivery('upgraded', claimed?.attempts ?? 1, 'completed', undefined, {
+            decision: 'queued',
+            jobId: 3,
+          });
+          return yield* queue.inspectDelivery('upgraded');
+        }),
+      );
+
+      expect(shown?.decision).toEqual({ decision: 'queued', jobId: 3 });
+      const reopened = new Database(path);
+      expect(
+        (reopened.query('PRAGMA user_version').get() as { user_version: number }).user_version,
+      ).toBe(18);
+      reopened.close();
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

@@ -4,6 +4,7 @@ import { LictorConfig } from './config.ts';
 import { describeCause } from './diagnostics.ts';
 import { GitHubClient } from './github/client.ts';
 import { GitHubIdentity, type GitHubIdentityError } from './github/identity.ts';
+import type { IntakeDecision } from './intake-decision.ts';
 import { type NotificationError, qualifyNotification } from './notifications/qualify.ts';
 import { decodeThread, subjectRef } from './notifications/thread.ts';
 import { Policy } from './policy.ts';
@@ -91,7 +92,7 @@ const processBySource: Record<
   (
     stored: InboxDelivery,
   ) => Effect.Effect<
-    void,
+    IntakeDecision,
     | InvalidStoredDelivery
     | ParseResult.ParseError
     | NotificationError
@@ -136,7 +137,7 @@ const processBySource: Record<
         subject === undefined
           ? []
           : yield* queue.answersTaken(thread.repository.full_name, subject.kind, subject.number);
-      const { work, answer, lastActivityAt } = yield* qualifyNotification({
+      const { work, answer, lastActivityAt, ignored } = yield* qualifyNotification({
         deliveryId: stored.id,
         thread,
         policy: { selfLogin: login, trustedSenders: threadPolicy.trustedSenders },
@@ -158,6 +159,7 @@ const processBySource: Record<
       // Before the enqueue below and before the cursor advances. Fenced on the
       // question id inside the queue, so a redelivered answer resumes nothing a
       // second time.
+      let answered: Pick<IntakeDecision, 'answered'> = {};
       if (answer !== undefined && parked !== undefined) {
         const resumed = yield* queue.answerQuestion({
           jobId: parked.jobId,
@@ -174,6 +176,7 @@ const processBySource: Record<
             answerer: answer.author,
           }),
         );
+        answered = { answered: { jobId: parked.jobId, resumed } };
       }
       // ! Advanced only after the job commits, never before: a cursor moved
       // ! past a failed `enqueue` loses the comment that caused it all.
@@ -181,14 +184,24 @@ const processBySource: Record<
         ? queue.advanceNotificationCursor(thread.id, lastActivityAt)
         : Effect.void;
 
-      if (work === undefined) return yield* advance;
+      if (work === undefined) {
+        yield* advance;
+        // A retry after the cursor moved past the trigger qualifies nothing, yet
+        // its first attempt may already have queued the job.
+        const queued = yield* queue.jobForDelivery(stored.id);
+        if (queued !== undefined) return { decision: 'queued', jobId: queued, ...answered };
+        return answered.answered === undefined
+          ? { decision: 'ignored', reason: 'no_trigger', ...ignored }
+          : { decision: 'answered', ...answered };
+      }
 
       const repositoryPolicy = policy.forRepository(work.repository);
       if (!repositoryPolicy.accepted || repositoryPolicy.execution === 'denied') {
         yield* Effect.logInfo('Dropped notification denied by repository policy').pipe(
           Effect.annotateLogs({ delivery: stored.id, repository: work.repository }),
         );
-        return yield* advance;
+        yield* advance;
+        return { decision: 'ignored', reason: 'policy_denied', ...answered };
       }
 
       const enqueued = yield* queue.enqueue(
@@ -243,6 +256,11 @@ const processBySource: Record<
             ),
           );
       }
+      return {
+        decision: enqueued.fromThisDelivery ? 'queued' : 'duplicate',
+        jobId: enqueued.jobId,
+        ...answered,
+      };
     }),
 };
 
@@ -260,8 +278,8 @@ export class DeliveryWorker extends Effect.Service<DeliveryWorker>()('DeliveryWo
         ),
       );
       const process = Effect.gen(function* () {
-        yield* processBySource[stored.source](stored);
-        yield* queue.finishDelivery(stored.id, stored.attempts, 'completed');
+        const decision = yield* processBySource[stored.source](stored);
+        yield* queue.finishDelivery(stored.id, stored.attempts, 'completed', undefined, decision);
       });
       // Raced, not forked: qualification outlasts the lease on a slow enough
       // repository, and a renewal that fails means the daemon tick already
